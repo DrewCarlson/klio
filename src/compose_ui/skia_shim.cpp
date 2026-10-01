@@ -422,6 +422,12 @@ extern "C" const char* klio_win_last_error(void) {
     return g_klioWinError.c_str();
 }
 
+// The window loop settled: the events the windows took have shown all their
+// effect, and scripted input's next ones may come (window_events.h).
+extern "C" void klio_script_settled(void) {
+    klioScriptSettled();
+}
+
 [[maybe_unused]] static void klioPresentDump(KlioSurface* surface) {
     const char* dump = std::getenv("KLIO_SKIA_DUMP");
     if (!dump || !surface) return;
@@ -892,6 +898,7 @@ static void klioSdlShow(KlioWindow* kw) {
 // Presents what the caller drew on the window's surface.
 void klio_win_present(KlioWindow* kw) {
     if (!kw || !kw->surface) return;
+    klioScriptFramed(kw->script);
 #if defined(KLIO_GPU)
     if (kw->gpu) {
         if (kw->grContext) kw->grContext->flushAndSubmit(kw->surface->surface.get());
@@ -3958,7 +3965,7 @@ struct KlioTray {
     std::string tooltip;
     KlioMenuUi menu;
     std::deque<KlioEv> events;
-    KlioScriptState script;
+    KlioScriptState script{true};  // a tray keeps its own time
     bool hovering = false;
     std::chrono::steady_clock::time_point hoverSince;
     bool tipShown = false;
@@ -6135,6 +6142,7 @@ static void klioWinPresentLayered(KlioWindow* kw, const SkPixmap& pm) {
 
 void klio_win_present(KlioWindow* kw) {
     if (!kw || !kw->surface) return;
+    klioScriptFramed(kw->script);
     klioPresentDump(kw->surface);
     SkPixmap pm;
     if (!kw->surface->surface->peekPixels(&pm)) return;
@@ -6345,7 +6353,7 @@ struct KlioTray {
     HICON icon = nullptr;
     std::vector<KlioMenuEntry> menuEntries;
     std::deque<KlioEv> events;
-    KlioScriptState script;
+    KlioScriptState script{true};  // a tray keeps its own time
 };
 
 static const UINT KLIO_TRAY_CALLBACK = WM_APP + 1;
@@ -8647,6 +8655,7 @@ KlioSurface* klio_win_surface(KlioWindow* kw) {
 
 void klio_win_present(KlioWindow* kw) {
     if (!kw) return;
+    klioScriptFramed(kw->script);
 #if defined(KLIO_METAL)
     if (kw->grContext && kw->metalLayer) {
         if (!kw->surface || !kw->drawable) return;
@@ -8899,7 +8908,7 @@ struct KlioTray {
     id target = nil;     // KlioTrayTarget
     std::deque<KlioEv> events;
     std::vector<KlioMenuEntry> menuEntries;
-    KlioScriptState script;
+    KlioScriptState script{true};  // a tray keeps its own time
 };
 
 // A tray's clicks and menu choices: a left click shows its menu, a right one

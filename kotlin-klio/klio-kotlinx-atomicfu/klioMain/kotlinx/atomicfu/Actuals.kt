@@ -26,6 +26,7 @@ actual fun atomic(initial: Boolean, trace: TraceBase): AtomicBoolean = AtomicBoo
 actual fun atomic(initial: Boolean): AtomicBoolean = AtomicBoolean(initial)
 
 actual class AtomicRef<T> internal constructor(initial: T) {
+    @kotlin.concurrent.Volatile
     actual var value: T = initial
     actual inline operator fun getValue(thisRef: Any?, property: KProperty<*>): T = value
     actual inline operator fun setValue(thisRef: Any?, property: KProperty<*>, value: T) { this.value = value }
@@ -45,6 +46,7 @@ actual class AtomicRef<T> internal constructor(initial: T) {
 }
 
 actual class AtomicBoolean internal constructor(initial: Boolean) {
+    @kotlin.concurrent.Volatile
     actual var value: Boolean = initial
     actual inline operator fun getValue(thisRef: Any?, property: KProperty<*>): Boolean = value
     actual inline operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Boolean) { this.value = value }
@@ -64,6 +66,7 @@ actual class AtomicBoolean internal constructor(initial: Boolean) {
 }
 
 actual class AtomicInt internal constructor(initial: Int) {
+    @kotlin.concurrent.Volatile
     actual var value: Int = initial
     actual inline operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = value
     actual inline operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Int) { this.value = value }
@@ -98,6 +101,7 @@ actual class AtomicInt internal constructor(initial: Int) {
 }
 
 actual class AtomicLong internal constructor(initial: Long) {
+    @kotlin.concurrent.Volatile
     actual var value: Long = initial
     actual operator fun getValue(thisRef: Any?, property: KProperty<*>): Long = value
     actual operator fun setValue(thisRef: Any?, property: KProperty<*>, value: Long) { this.value = value }

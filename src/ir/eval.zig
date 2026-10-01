@@ -30,6 +30,9 @@ pub const wallCapAbandon = ev_diag.wallCapAbandon;
 pub const nowMonotonicMs = ev_diag.nowMonotonicMs;
 pub const op_route_names = ev_diag.op_route_names;
 pub const opProfDump = ev_diag.opProfDump;
+pub const jitStatsDump = @import("eval/baseline.zig").statsDump;
+pub const jitDefaultOn = @import("eval/baseline.zig").defaultOn;
+pub const frameAuditSummary = @import("eval/state.zig").frameAuditSummary;
 pub const extAuditRow = ev_diag.extAuditRow;
 pub const extAuditTake = ev_diag.extAuditTake;
 pub const callStatsDump = ev_diag.callStatsDump;
@@ -117,7 +120,6 @@ pub const freeSuspendStateOpaque = ev_snapshot.freeSuspendStateOpaque;
 
 const ev_frame = @import("eval/frame.zig");
 
-pub const RegMask = ev_frame.RegMask;
 pub const Frame = ev_frame.Frame;
 
 const ev_enter = @import("eval/enter.zig");
@@ -192,6 +194,13 @@ test {
     testing.refAllDecls(@import("eval/state.zig"));
     testing.refAllDecls(@import("eval/stream.zig"));
     testing.refAllDecls(@import("eval/tests.zig"));
+    testing.refAllDecls(@import("eval/baseline_test.zig"));
+    testing.refAllDecls(@import("eval/intrinsics.zig"));
+    testing.refAllDecls(@import("eval/kinds.zig"));
+    testing.refAllDecls(@import("eval/opt/graph.zig"));
+    testing.refAllDecls(@import("eval/opt/build.zig"));
+    testing.refAllDecls(@import("eval/opt/regalloc.zig"));
+    testing.refAllDecls(@import("eval/opt/passes.zig"));
     testing.refAllDecls(@import("eval/values.zig"));
 }
 

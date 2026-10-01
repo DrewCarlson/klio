@@ -18,9 +18,9 @@ const ev_state = @import("state.zig");
 const EvalResult = ev_flow.EvalResult;
 const errResult = ev_flow.errResult;
 
-/// The host for ir's own tests and the bare `eval` entry: natives and closures are
-/// unsupported, and a resolved function runs recursively. The evaluator is generic over
-/// the host type.
+/// The host for ir's own tests and the bare `eval` entry: natives are unsupported, a
+/// closure over a function literal is made only where a run state was given, and a
+/// resolved function runs recursively. The evaluator is generic over the host type.
 pub const NullHost = struct {
     /// The run state code lowered from sema reads; null until a test sets
     /// one, and every static, singleton and construction then fails.
@@ -31,6 +31,10 @@ pub const NullHost = struct {
     /// Whether the parked frames were on the thread's resume root when the
     /// resume value was asked for.
     resume_rooted: bool = false,
+    /// The module of the closures it made, whose function each closure's record is.
+    closure_module: ?*const Module = null,
+    /// The span of the frame that made the last host call.
+    native_span: ?ir.Span = null,
 
     pub fn resolvedState(self: *NullHost) ?ir.resolved.StateRef {
         return self.resolved_state;
@@ -44,8 +48,9 @@ pub const NullHost = struct {
     }
 
     pub fn callNative(self: *NullHost, allocator: Allocator, id: ir.NativeId, args: []const Value) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, args };
+        _ = .{ allocator, args };
         _ = id;
+        if (ev_state.evtlsPtr().frame_chain) |fr| self.native_span = fr.span();
         return errResult(.{ .Unsupported = "Host.call_native" });
     }
 
@@ -63,14 +68,23 @@ pub const NullHost = struct {
         return ev_enter.evalWith(NullHost, allocator, module, func, list, self);
     }
 
+    /// A closure over function literal `func` of the one module its closures come from, its
+    /// record the function itself.
     pub fn makeResolvedClosure(self: *NullHost, allocator: Allocator, module: *const Module, func: FuncId, captures: []const Value, kind: ir.resolved.Callable) Allocator.Error!EvalResult {
-        _ = .{ self, allocator, module, func, captures, kind };
-        return errResult(.{ .Unsupported = "Host.make_resolved_closure" });
+        if (self.resolved_state == null or kind != .lambda) return errResult(.{ .Unsupported = "Host.make_resolved_closure" });
+        if (self.closure_module) |m| if (m != module) return errResult(.{ .Unsupported = "Host.make_resolved_closure: another module" });
+        const f = module.funcById(func) orelse return errResult(.{ .Unsupported = "Host.make_resolved_closure: no such function" });
+        self.closure_module = module;
+        const ref = try runtime.IrClosureRef.initTrailing(allocator, .{ .id = 0, .captures = &.{}, .body = @ptrCast(f) }, captures.len);
+        @memcpy(ref.cell.data.captures, captures);
+        return .{ .ok = .{ .IrClosure = ref } };
     }
 
     pub fn resolvedClosure(self: *NullHost, v: *const Value) ?ir.resolved.ClosureBody {
-        _ = .{ self, v };
-        return null;
+        if (v.* != .IrClosure) return null;
+        const module = self.closure_module orelse return null;
+        const body = v.IrClosure.asPtrConst().body orelse return null;
+        return .{ .id = 0, .func = @ptrCast(@alignCast(body)), .module = module, .kind = .lambda };
     }
 };
 

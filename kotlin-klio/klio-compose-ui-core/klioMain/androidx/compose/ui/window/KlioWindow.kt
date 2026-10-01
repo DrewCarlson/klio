@@ -296,6 +296,9 @@ private fun runApplication(content: @Composable ApplicationScope.() -> Unit): Bo
                 else __composeui_appWait(timeout)
             }
         } else {
+            // Nothing queued, no frame wanted and no window to draw: the events
+            // the windows took have shown all their effect.
+            if (!clock.hasTasks && !driver.wantsFrame && live.none { it.needsRender }) __composeui_scriptSettled()
             // The first window waits for input; the others take what came.
             var wait = timeout
             for (win in live) {
@@ -1244,6 +1247,10 @@ private const val WIN_MINIMIZED = 4
 private const val WIN_PLACEMENT = 5
 private const val WIN_FRONT = 6
 private const val WIN_TRANSPARENT = 7
+
+// The window loop settled: scripted input's next events may come.
+internal fun __composeui_scriptSettled(): Unit =
+    error("intrinsic androidx.compose.ui.window.__composeui_scriptSettled not installed")
 
 // Sets one of a window's properties (WIN_*).
 internal fun __composeui_winSetFlag(handle: Long, which: Int, value: Int): Long =

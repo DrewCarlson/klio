@@ -125,7 +125,7 @@ fn identityOf(v: Value) u64 {
         .Instance => |inst| blk: {
             const g = inst.borrow();
             defer g.deinit();
-            break :blk g.get().identity;
+            break :blk g.get().identityOf();
         },
         .Array => |arr| arr.identity(),
         .String => |s| @intFromPtr(s.cell),

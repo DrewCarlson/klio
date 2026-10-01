@@ -672,6 +672,27 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.append"));
     for (ctx.args[1..]) |v| {
         if (try appendOverflowGuard(ctx, sb, &v)) |oom| return oom;
+        // A string's bytes and a number's digits go straight into the
+        // buffer, with nothing rendered apart first.
+        var digits: [20]u8 = undefined;
+        const direct: ?[]const u8 = switch (v) {
+            .Int => |x| runtime.decimal(&digits, x),
+            .Long => |x| runtime.decimal(&digits, x),
+            else => null,
+        };
+        if (direct != null or v == .String) {
+            const sg = if (v == .String) v.String.borrow() else null;
+            defer if (sg) |x| x.deinit();
+            const piece = direct orelse sg.?.get().bytes;
+            const g = sb.borrowMut();
+            defer g.deinit();
+            const buf = g.get();
+            const before_ptr = buf.items.ptr;
+            const before_len = buf.items.len;
+            try buf.appendSlice(a, piece);
+            runtime.sbMemoAppended(@intFromPtr(sb.cell), before_ptr, before_len, buf.items, piece);
+            continue;
+        }
         const piece = try renderPiece(ctx, v);
         defer a.free(piece);
         // The memo follows the append, so reading the length after each
@@ -948,13 +969,25 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
         return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     }
 
+    const target: usize = @intCast(new_len.?);
+    {
+        // Where every character is one byte, as ASCII's are, the bytes are
+        // the UTF-16 units: cut or pad them in place.
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (target == 0 or sbMemoFor(sb, buf.items).ascii) {
+            runtime.sbMemoInvalidate(@intFromPtr(sb.cell));
+            if (target <= buf.items.len) buf.shrinkRetainingCapacity(target) else try buf.appendNTimes(a, 0, target - buf.items.len);
+            return ok(.Unit);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     const units = try bufUnits(a, buf.items);
     defer a.free(units);
     const cur: usize = units.len;
-    const target: usize = @intCast(new_len.?);
     var out: std.ArrayList(u16) = .empty;
     defer out.deinit(a);
     if (target <= cur) {

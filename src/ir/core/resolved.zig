@@ -249,6 +249,10 @@ pub const ClassRt = struct {
     /// A `Throwable`: an instance takes the stack trace of its
     /// construction, as the JVM's `fillInStackTrace` does.
     throwable: bool = false,
+    /// Whether an instance keeps `Any`'s `hashCode` and `equals`, so a hash
+    /// map finds it by identity (`eval/intrinsics.zig`): 0 before the first
+    /// ask, 1 no, 2 yes.
+    identity_keyed: std.atomic.Value(u8) = .init(0),
 };
 
 /// A vtable entry: the root a slot is for and the class's implementation,
@@ -307,6 +311,13 @@ pub const NativeRt = struct {
     /// the JVM leaves open: `ArrayList`, `HashMap`) runs a Kotlin receiver's
     /// own override of that slot instead.
     slot: u32 = NONE,
+    /// The stdlib function a call runs straight, with nothing around it, found on the
+    /// first such call and kept (the VM's `callNativeDirect`): 0 before it, 1 for a native
+    /// that has none, else the function.
+    direct: std.atomic.Value(usize) = .init(0),
+    /// What the native is as a few instructions (`eval/intrinsics.zig`), found on the first
+    /// ask and kept: 0 before it.
+    intrinsic: std.atomic.Value(u8) = .init(0),
 };
 
 /// The binding's tables a native is found in: by declaration FQN or host
@@ -459,17 +470,6 @@ pub const ResolvedState = struct {
     /// By ClassId: the objects whose initialization threw, with what it
     /// threw, which every later use throws for.
     failed_objects: std.AutoHashMapUnmanaged(u32, Value) = .empty,
-    /// The identity the last instance took; `takeIdentity` advances it.
-    next_identity: std.atomic.Value(u64) = .init(0),
-
-    /// The next instance's identity. A counter no tracer reads, so it takes
-    /// neither the state's lock nor its write barrier: under the barrier,
-    /// every instance made would have the next collection retrace the whole
-    /// state, statics and singletons and all.
-    pub fn takeIdentity(self: *ResolvedState) u64 {
-        return self.next_identity.fetchAdd(1, .monotonic) + 1;
-    }
-
     /// Static `i`, copied whole. The collector never runs inside
     /// `storeStatic`, which holds no safe point.
     pub fn loadStatic(self: *const ResolvedState, i: usize) Value {
@@ -729,9 +729,9 @@ pub fn seedValue(seed: SlotSeed) Value {
 
 /// An instance of `class` with every slot holding its seed, before any
 /// constructor runs. The caller owns the one reference.
-pub fn instantiate(a: Allocator, r: *const Resolved, class: ClassId, identity: u64) Allocator.Error!Value {
+pub fn instantiate(a: Allocator, r: *const Resolved, class: ClassId) Allocator.Error!Value {
     const rt = &r.classes[class.int()];
-    const inst = try InstanceData.newTrailing(a, rt.def.clone(), class.int(), rt.seeds.len, identity);
+    const inst = try InstanceData.newTrailing(a, rt.def.clone(), class.int(), rt.seeds.len);
     for (rt.seeds, inst.cell.data.slots) |seed, *v| v.* = seedValue(seed);
     return .{ .Instance = inst };
 }
@@ -797,20 +797,6 @@ test "a static store records a barrier over that static alone, and a scalar none
     ResolvedState.traceStaticsRange(hdr, &m, 2, 2);
     try std.testing.expectEqual(@as(usize, 77), text.cell.hdr.gc_mark);
     _ = s.storeStatic(2, .Null);
-}
-
-test "an identity is taken without the state's lock or barrier" {
-    const a = std.testing.allocator;
-    const r: Resolved = .{};
-    const st = try stateNew(a, &r);
-    defer st.deinit();
-    const hdr = &st.cell.hdr;
-    defer runtime.gc.forgetRanges(&.{.{ .start = @intFromPtr(hdr), .len = @sizeOf(runtime.gc.GcHeader) }});
-    hdr.gc_gen = 1;
-    hdr.gc_remembered = false;
-    try std.testing.expectEqual(@as(u64, 1), st.cell.data.takeIdentity());
-    try std.testing.expectEqual(@as(u64, 2), st.cell.data.takeIdentity());
-    try std.testing.expect(!hdr.gc_remembered);
 }
 
 test "a primitive value's class comes from the host table" {

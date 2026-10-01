@@ -91,6 +91,9 @@ pub const FrameSnapshot = struct {
     block: BlockId,
     /// Index of the *next* instruction to run within `block.insts`.
     inst_idx: usize,
+    /// The span `block` found as it was entered (`Frame.cur_span`), for a block whose entry
+    /// span differs by path.
+    span: ?ir.Span = null,
     /// Registers live after the suspension point; resume recreates the full file, filling dead slots with Unit.
     regs: SnapshotRegisters,
     params: []Value,
@@ -350,6 +353,10 @@ pub fn suspendLiveRegs(func: *const Func, block: BlockId, inst_idx: usize) Alloc
     return owned;
 }
 
+/// The registers a suspended frame keeps: those live where it goes on at `block`:`next_inst`,
+/// `live` when its frame map answers (`Frame.liveAt`, which reads the code as its streams run
+/// it), else `suspendLiveRegs`; the whole file when that would not be smaller, or when a try
+/// region is active (`sparse_ok` false).
 pub fn snapshotRegisters(
     allocator: Allocator,
     func: *const Func,
@@ -358,9 +365,20 @@ pub fn snapshotRegisters(
     resume_reg: ?Reg,
     regs: []const Value,
     sparse_ok: bool,
+    live: ?[]const u64,
 ) Allocator.Error!SnapshotRegisters {
     if (sparse_ok) {
-        const live_ids = try suspendLiveRegs(func, block, next_inst);
+        var from_map: [512]u32 = undefined;
+        const live_ids: []const u32 = if (live) |l| ids: {
+            var k: usize = 0;
+            for (0..@min(regs.len, @as(usize, func.n_locals))) |r| {
+                if (l[r >> 6] & (@as(u64, 1) << @as(u6, @truncate(r))) == 0) continue;
+                if (k == from_map.len) break :ids try suspendLiveRegs(func, block, next_inst);
+                from_map[k] = @intCast(r);
+                k += 1;
+            }
+            break :ids from_map[0..k];
+        } else try suspendLiveRegs(func, block, next_inst);
         var count: usize = 0;
         for (live_ids) |id| {
             if (id >= regs.len) continue;

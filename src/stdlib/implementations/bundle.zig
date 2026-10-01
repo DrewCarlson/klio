@@ -65,9 +65,7 @@ pub fn bundle_read_bytes(ctx: *CallCtx) Allocator.Error!EvalResult {
     switch (res) {
         .err => |e| return e,
         .bytes => |bytes| {
-            var pb = PrimBuf{ .kind = .Byte };
-            try pb.bytes.appendSlice(ctx.allocator, bytes);
-            return ok(.{ .Array = runtime.ArrayData.scalars(try ObjRef(PrimBuf).initOwned(ctx.allocator, pb), .Byte) });
+            return ok(.{ .Array = runtime.ArrayData.scalars(try PrimBuf.initBytes(ctx.allocator, .Byte, bytes), .Byte) });
         },
     }
 }

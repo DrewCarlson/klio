@@ -59,7 +59,9 @@ inline fn classIndex(size: usize) usize {
 
 const FreeCell = struct { next: ?*FreeCell };
 
-const SlabHeader = struct {
+/// Laid out as written: a region block keeps its tag where this keeps
+/// `class_idx` (`region_tag`).
+const SlabHeader = extern struct {
     class_idx: u32,
     /// The heap the slab belongs to; a free through another heap's allocator
     /// is a caller mixing allocators, caught in a debug build.
@@ -129,6 +131,10 @@ pub const Heap = struct {
     released: bool = false,
     /// Bytes mapped by this heap now.
     mapped: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// Ranges given back while the mutators run (`unmapLater`), aged out by
+    /// the reclaim passes.
+    deferred: ?*Deferred = null,
+    deferred_lock: SpinLock = .{},
 
     pub fn allocator(h: *Heap) Allocator {
         return .{ .ptr = h, .vtable = &vtable };
@@ -535,6 +541,41 @@ pub fn censusReport() void {
     }
 }
 
+/// A range the process heap gave back while the mutators run, kept mapped
+/// until a reclaim pass has aged it: a thread between two safe points may be
+/// reading a buffer another thread replaced and freed (a list's read with no
+/// lock), and a stop falls between two passes, as it does for spare slabs.
+/// Its link and age live in the range itself.
+const Deferred = struct { next: ?*Deferred, len: usize, idle_passes: u32 };
+
+fn unmapLater(h: *Heap, ptr: [*]u8, size: usize) void {
+    if (h != &main_heap) return unmapRaw(h, ptr, size);
+    const d: *Deferred = @ptrCast(@alignCast(ptr));
+    h.deferred_lock.lock();
+    defer h.deferred_lock.unlock();
+    d.* = .{ .next = h.deferred, .len = size, .idle_passes = 0 };
+    h.deferred = d;
+}
+
+fn reclaimDeferred(h: *Heap, idle_passes: u32) void {
+    h.deferred_lock.lock();
+    defer h.deferred_lock.unlock();
+    var keep: ?*Deferred = null;
+    var d = h.deferred;
+    while (d) |x| {
+        const next = x.next;
+        x.idle_passes +|= 1;
+        if (x.idle_passes >= idle_passes) {
+            unmapRaw(h, @ptrCast(x), x.len);
+        } else {
+            x.next = keep;
+            keep = x;
+        }
+        d = next;
+    }
+    h.deferred = keep;
+}
+
 fn unmapRaw(h: *Heap, ptr: [*]u8, size: usize) void {
     if (trace_enabled) traceForget(@intFromPtr(ptr));
     if (h.track_regions) regionsRemove(h, @intFromPtr(ptr), size);
@@ -607,7 +648,7 @@ fn allocLarge(h: *Heap, len: usize) ?[*]u8 {
 
 fn freeLarge(h: *Heap, ptr: [*]u8, len: usize) void {
     const ci = largeClass(len) orelse {
-        unmapRaw(h, ptr, pageUp(len));
+        unmapLater(h, ptr, pageUp(len));
         return;
     };
     const lc = &h.large_classes[ci];
@@ -667,6 +708,37 @@ fn mapAligned(h: *Heap, len: usize) ?usize {
 // trims. The reserve's unused tail is mapped but never touched, so it holds
 // address space and no memory; a slab unmapped later splits the region.
 const RESERVE_SLABS: usize = 16;
+
+/// The span of a region block (`region.zig`), which the process heap's
+/// reserve carves like a slab.
+pub const block_size = SLAB;
+
+/// A region block's first word, where a slab's header keeps its class index,
+/// which is never this. A buffer the region bumped (`gc.buffer_allocator`) is
+/// small, so its block, masked from its address, reads this, and the heap
+/// leaves it to the collector: freeing one does nothing, and it never resizes
+/// in place.
+pub const region_tag: u32 = 0xFFFF_FFFF;
+
+comptime {
+    std.debug.assert(@offsetOf(SlabHeader, "class_idx") == 0);
+}
+
+inline fn regionBuffer(ptr: [*]u8) bool {
+    return slabOf(ptr).class_idx == region_tag;
+}
+
+/// A fresh `block_size` block at a `block_size` boundary, zero-filled, for
+/// the region heap. It is never freed through the allocator.
+pub fn mapBlock() ?usize {
+    const s = mapSlabRegion(&main_heap) orelse return null;
+    return @intFromPtr(s);
+}
+
+/// Whether `a` allocates from the process heap.
+pub inline fn isMainHeap(a: Allocator) bool {
+    return a.ptr == @as(*anyopaque, @ptrCast(&main_heap));
+}
 
 fn mapSlabRegion(h: *Heap) ?*SlabHeader {
     while (true) {
@@ -754,7 +826,7 @@ fn noteCellsReturned(h: *Heap, cs: *ClassState, slab: *SlabHeader, was_full: boo
             cs.spare = slab;
             cs.spare_count += 1;
         } else {
-            unmapRaw(h, @ptrCast(slab), SLAB);
+            unmapLater(h, @ptrCast(slab), SLAB);
         }
     }
 }
@@ -1209,6 +1281,7 @@ pub fn reclaimAll() void {
 }
 
 fn reclaimWith(h: *Heap, idle_passes: u32) void {
+    reclaimDeferred(h, idle_passes);
     reclaimLarge(h, idle_passes);
     const pg = std.heap.pageSize();
     if (SLAB / pg > MAX_PAGES) return; // runtime page larger than the scan bound
@@ -1269,6 +1342,9 @@ fn resizeInner(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize,
     const h = heapOf(ctx);
     if (h.released) return false;
     if (isSmall(buf.len, alignment)) {
+        // A region buffer moves to grow or shrink: in place, a list handing out its
+        // slice (`toOwnedSlice`) would hand out lines only its trace marks.
+        if (regionBuffer(buf.ptr)) return false;
         // `free` keys on the requested length, so the class must not change.
         if (!isSmall(new_len, alignment)) return false;
         return classIndex(new_len) == classIndex(buf.len);
@@ -1284,7 +1360,7 @@ fn resizeInner(ctx: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize,
     // worst case and settled smaller neither copies nor remaps. A block
     // shrinking out of the classes would change what `free` does with it.
     if (largeClass(buf.len) == null and largeClass(new_len) != null) return false;
-    unmapRaw(h, buf.ptr + new_extent, old_extent - new_extent);
+    unmapLater(h, buf.ptr + new_extent, old_extent - new_extent);
     return true;
 }
 
@@ -1302,6 +1378,7 @@ fn free(ctx: *anyopaque, buf: []u8, alignment: Alignment, _: usize) void {
     const h = heapOf(ctx);
     // A container the released phase left behind may still deinit.
     if (@atomicLoad(bool, &h.released, .acquire)) return;
+    if (isSmall(buf.len, alignment) and regionBuffer(buf.ptr)) return;
     if (census_enabled) censusForget(@intFromPtr(buf.ptr));
     if (isSmall(buf.len, alignment)) {
         freeSmall(h, buf.ptr);
@@ -1544,8 +1621,30 @@ test "slab parks a freed large block for its class and the reclaim pass ages it 
     try T.expectEqual(@as(u32, 1), main_heap.large_classes[small_ci].count);
     reclaimAll();
     try T.expectEqual(@as(u32, 0), main_heap.large_classes[small_ci].count);
-    // Above the classes a block maps and unmaps directly.
+    // Above the classes a block maps directly, and its free unmaps it once the
+    // reclaim passes have aged it (`unmapLater`).
     try T.expectEqual(@as(?usize, null), largeClass(LARGE_MAX + 1));
     const huge = try a.alloc(u8, LARGE_MAX + 1);
     a.free(huge);
+    reclaimAll();
+}
+
+test "a range the process heap gives back stays mapped until two reclaim passes have aged it" {
+    const a = allocator;
+    const T = std.testing;
+    reclaimAll();
+    const before = unmap_calls.load(.monotonic);
+    const huge = try a.alloc(u8, LARGE_MAX + 1);
+    @memset(huge, 3);
+    a.free(huge);
+    // A thread that read the buffer's address before the free may still read it,
+    // whatever the free left there.
+    const last: *volatile u8 = &huge[huge.len - 1];
+    _ = last.*;
+    try T.expectEqual(before, unmap_calls.load(.monotonic));
+    reclaimDormant();
+    _ = last.*;
+    try T.expectEqual(before, unmap_calls.load(.monotonic));
+    reclaimDormant();
+    try T.expectEqual(before + 1, unmap_calls.load(.monotonic));
 }

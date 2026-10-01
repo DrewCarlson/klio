@@ -17,6 +17,7 @@ const name = @import("name.zig");
 const env = @import("env.zig");
 const locals = @import("locals.zig");
 const class_bodies = @import("classes.zig");
+const control = @import("control.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -564,6 +565,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             return if (x.op == .Neq) negate(b, eq) else eq;
         },
         .In, .NotIn => {
+            if (try inRange(b, x.lhs, x.rhs)) |r| return if (x.op == .NotIn) negate(b, r) else r;
             // `x in c` is `c.contains(x)`: the container is evaluated
             // first, as kotlinc does.
             const from = locals.mark(b);
@@ -703,6 +705,57 @@ pub fn negate(b: *Builder, v: Reg) Error!Reg {
     const dst = b.newReg();
     try b.emit(.{ .Not = .{ .dst = dst, .src = v } });
     return dst;
+}
+
+/// `x in r` for `r` an Int, Long or Char range written as `a..b`, `a..<b` or
+/// `a until b` over operands of `x`'s type: two compares, as kotlinc compiles
+/// it, with no range made and no call. The range's bounds are evaluated
+/// first, then `x`, the order the call form keeps; null for any other
+/// container. A `downTo` progression has no `contains` of its own, so
+/// membership in one iterates it and stays a call.
+fn inRange(b: *Builder, elem: *const ast.Expr, container: *const ast.Expr) Error!?Reg {
+    const s = b.p.s;
+    const et = b.exprType(elem.id());
+    if (s.types.isNullable(et)) return null;
+    const prim = primOf(s, et) orelse return null;
+    if (prim != .int and prim != .long and prim != .char) return null;
+    const Kind = enum { up_to, up_until };
+    var kind: Kind = undefined;
+    var lo_e: *const ast.Expr = undefined;
+    var hi_e: *const ast.Expr = undefined;
+    switch (container.*) {
+        .Binary => |r| {
+            if (r.op != .Range and r.op != .RangeUntil) return null;
+            const rec = try b.call(container.id());
+            if (!control.primRangeMember(s, rec.callee, prim, if (r.op == .Range) "rangeTo" else "rangeUntil")) return null;
+            kind = if (r.op == .Range) .up_to else .up_until;
+            lo_e = r.lhs;
+            hi_e = r.rhs;
+        },
+        .Call => |c| {
+            if (!c.is_infix or c.args.len != 2) return null;
+            const rec = try b.call(container.id());
+            if (!std.mem.eql(u8, s.str(s.syms.name(rec.callee)), "until")) return null;
+            if (!control.rangesExtension(s, rec.callee, prim)) return null;
+            kind = .up_until;
+            lo_e = &c.args[0];
+            hi_e = &c.args[1];
+        },
+        else => return null,
+    }
+    const lo = try body.lowerExpr(b, lo_e);
+    const hi = try body.lowerExpr(b, hi_e);
+    const x = try body.lowerExpr(b, elem);
+    const result = b.newReg();
+    try b.emit(.{ .BinOp = .{ .dst = result, .op = .LessEq, .lhs = lo, .rhs = x } });
+    const upper = try b.newBlock();
+    const join = try b.newBlock();
+    b.terminate(.{ .Branch = .{ .cond = result, .t = upper, .f = join } });
+    b.switchTo(upper);
+    try b.emit(.{ .BinOp = .{ .dst = result, .op = if (kind == .up_until) .Less else .LessEq, .lhs = x, .rhs = hi } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    return result;
 }
 
 /// `a && b`, `a || b`: `b` runs only when `a` does not decide.

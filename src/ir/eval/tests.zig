@@ -194,6 +194,57 @@ test "a resume value is made while the parked frames are rooted" {
     try testing.expect(ev_state.evtlsPtr().resuming == null);
 }
 
+test "a resumed frame finds its block's entry span: the one every path leaves, or the one it parked with where paths leave two" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    const file = @import("span").FileId.from(2);
+    const s1: ir.Span = .{ .file = file, .start = 1, .end = 5 };
+    const s2: ir.Span = .{ .file = file, .start = 9, .end = 14 };
+    // b0 (s1) and b1 (s2) both go on to b2, which calls the host before any statement of
+    // its own: a frame parked there and resumed stands in the span it entered b2 with. b3,
+    // which only b1 goes on to, finds s2 wherever the frame came from.
+    const b0 = [_]Inst{.{ .Trace = .{ .span = s1 } }};
+    const b1 = [_]Inst{.{ .Trace = .{ .span = s2 } }};
+    const call = [_]Inst{.{ .CallNative = .{ .dst = .from(0), .native = .from(0), .args = .from(0), .n_args = 0, .direct = true } }};
+    const blocks = [_]ir.Block{
+        .{ .id = .from(0), .insts = @constCast(&b0), .terminator = .{ .Branch = .{ .cond = .from(0), .t = .from(1), .f = .from(2) } } },
+        .{ .id = .from(1), .insts = @constCast(&b1), .terminator = .{ .Branch = .{ .cond = .from(0), .t = .from(2), .f = .from(3) } } },
+        .{ .id = .from(2), .insts = @constCast(&call), .terminator = .{ .Return = .from(0) } },
+        .{ .id = .from(3), .insts = @constCast(&call), .terminator = .{ .Return = .from(0) } },
+    };
+    try m.funcs.append(testing.allocator, .{
+        .id = .from(0),
+        .name = "resumeSpan",
+        .fqn = "test.resumeSpan",
+        .params = &.{},
+        .return_ty = type_int,
+        .n_locals = 1,
+        .blocks = @constCast(&blocks),
+        .entry = .from(0),
+        .is_suspend = true,
+    });
+    for ([_]struct { block: u32, saved: ?ir.Span }{ .{ .block = 2, .saved = s2 }, .{ .block = 3, .saved = null } }) |c| {
+        var state = SuspendState{ .token = 1 };
+        try state.frames.append(testing.allocator, .{
+            .func = .from(0),
+            .module = null,
+            .block = .from(c.block),
+            .inst_idx = 0,
+            .span = c.saved,
+            .regs = .{ .dense = try testing.allocator.dupe(Value, &.{Value.Unit}) },
+            .params = try testing.allocator.alloc(Value, 0),
+            .captures = try testing.allocator.alloc(Value, 0),
+            .try_stack = try testing.allocator.alloc(TryFrame, 0),
+            .is_lambda = false,
+            .resume_reg = null,
+        });
+        var host = nullHost();
+        _ = try resumeContinuation(NullHost, testing.allocator, &m, &state, .Unit, &host);
+        state.frames = .empty;
+        try testing.expectEqual(@as(?ir.Span, s2), host.native_span);
+    }
+}
+
 test "mixed signed comparisons widen to Double, then Float, then Long" {
     const nan = std.math.nan(f32);
     const cases = [_]struct { op: BinOp, l: Value, r: Value, want: bool }{
@@ -334,4 +385,28 @@ test "an operation with a constant operand its op carries answers as applyBinop 
     const bits = ir.bc.kBits(k);
     const v = ev_exec.kValue(ir.bc.kWord(.{ .reg = 0, .value = k, .op = .Add }), @truncate(bits), @truncate(bits >> 32));
     try testing.expect(v == .Double and std.math.signbit(v.Double));
+}
+
+test "a string concatenation made in one allocation reads as rendering both sides would, its length and ASCII-ness included" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sides: std.ArrayList(Value) = .empty;
+    for ([_][]const u8{ "", "v=", "日本", "a😀" }) |w| try sides.append(a, .{ .String = try runtime.strInit(a, w) });
+    try sides.appendSlice(a, &.{
+        .{ .Int = -7 },     .{ .Long = std.math.minInt(i64) }, .{ .ULong = std.math.maxInt(u64) }, .{ .Bool = true },
+        .Null,              .{ .Char = 'x' },                  .{ .Short = -3 },                     .{ .UByte = 200 },
+    });
+    for (sides.items) |*l| for (sides.items) |*r| {
+        const s = (try ev_values.concatInPlace(a, l, r)) orelse return error.TestUnexpectedResult;
+        const want = try std.mem.concat(a, u8, &.{ try ev_values.renderValue(a, l), try ev_values.renderValue(a, r) });
+        const d = s.asPtrConst();
+        try testing.expectEqualStrings(want, d.bytes);
+        const m = runtime.strMeta(want);
+        try testing.expectEqual(m.u16_len, d.u16_len);
+        try testing.expectEqual(m.ascii, d.ascii);
+    };
+    // A Char past ASCII and a Double are rendered.
+    try testing.expect((try ev_values.concatInPlace(a, &Value{ .Char = 0xE9 }, &sides.items[0])) == null);
+    try testing.expect((try ev_values.concatInPlace(a, &Value{ .Double = 1.5 }, &sides.items[0])) == null);
 }

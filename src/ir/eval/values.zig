@@ -190,6 +190,52 @@ pub fn renderValue(allocator: Allocator, v: *const Value) Allocator.Error![]cons
     };
 }
 
+/// One side of a string concatenation as its text: a string's own bytes, a number's,
+/// a Boolean's, `null`'s or an ASCII Char's written to `buf`, as `renderValue` renders them.
+const Piece = struct { bytes: []const u8, u16_len: u32, ascii: bool };
+
+fn concatPiece(v: *const Value, buf: *[24]u8) ?Piece {
+    const text: []const u8 = switch (v.*) {
+        .String => |s| {
+            const d = s.asPtrConst();
+            return .{ .bytes = d.bytes, .u16_len = d.u16_len, .ascii = d.ascii };
+        },
+        .Int => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .Long => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .Short => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .Byte => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .UInt => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .ULong => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .UShort => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .UByte => |x| std.fmt.bufPrint(buf, "{d}", .{x}) catch return null,
+        .Bool => |b| if (b) "true" else "false",
+        .Null => "null",
+        .Char => |c| if (c < 0x80) blk: {
+            buf[0] = @intCast(c);
+            break :blk buf[0..1];
+        } else return null,
+        else => return null,
+    };
+    return .{ .bytes = text, .u16_len = @intCast(text.len), .ascii = true };
+}
+
+/// `l + r` as strings made in one allocation, the sides read in place (`concatPiece`); null
+/// when either side needs `renderValue`.
+pub fn concatInPlace(allocator: Allocator, l: *const Value, r: *const Value) Allocator.Error!?runtime.StringRef {
+    var lb: [24]u8 = undefined;
+    var rb: [24]u8 = undefined;
+    const lp = concatPiece(l, &lb) orelse return null;
+    const rp = concatPiece(r, &rb) orelse return null;
+    const ref = try runtime.strInitTrailing(allocator, lp.bytes.len + rp.bytes.len);
+    const d = ref.asPtr();
+    const s = @constCast(d.bytes);
+    @memcpy(s[0..lp.bytes.len], lp.bytes);
+    @memcpy(s[lp.bytes.len..], rp.bytes);
+    d.u16_len = lp.u16_len + rp.u16_len;
+    d.ascii = lp.ascii and rp.ascii;
+    return ref;
+}
+
 /// UTF-16 code-unit cursor over UTF-8: an astral codepoint yields its high surrogate, then the low one.
 const Utf16Cursor = struct {
     it: std.unicode.Utf8Iterator,
@@ -476,6 +522,7 @@ pub fn applyBinop(allocator: Allocator, op: BinOp, l: *const Value, r: *const Va
             if (try rangeValue(allocator, op, l, r)) |v| return ok(v);
         },
         .StringConcat => {
+            if (try concatInPlace(allocator, l, r)) |s| return ok(.{ .String = s });
             const ls = try renderValue(allocator, l);
             defer allocator.free(ls);
             const rs = try renderValue(allocator, r);
@@ -742,6 +789,8 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
                 return buf.getAs(ui, arr.primKind() orelse buf.kind); // fresh scalar
             },
             .boxed => |vl| {
+                // No lock where no count is kept: an array's buffer never moves.
+                if (!runtime.reclaimEnabled()) if (vl.readAt(ui)) |elem| return elem;
                 const g = vl.borrow();
                 defer g.deinit();
                 const items = g.get().items;
@@ -752,9 +801,12 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
+            // No lock for a list that is no view (`readAtMoving`).
+            if (l.backing == null and runtime.lockfreeReads() and !runtime.reclaimEnabled()) {
+                if (l.items.readAtMoving(ui)) |elem| return elem;
+            }
             // A stale subList view must fail fast: the slow path's read guard
             // throws ConcurrentModificationException.
-            if (recv.sublistViewStale()) return null;
             // An array `.asList()` view re-reads its scalar source so a later
             // array write shows through on this indexed load.
             recv.refreshArrayView();

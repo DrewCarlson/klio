@@ -8,6 +8,9 @@ const Allocator = std.mem.Allocator;
 
 const Value = runtime.Value;
 
+/// A frame's position at a block's start, before anything in it has run.
+pub const block_start = ir.framemap.block_start;
+
 const BlockId = ir.BlockId;
 const Func = ir.Func;
 const Module = ir.Module;
@@ -30,61 +33,26 @@ const noteExt = ev_state.noteExt;
 const regsAlloc = ev_state.regsAlloc;
 const stwAuditOn = ev_state.stwAuditOn;
 
-/// Which register slots a frame has actually written. A no-fill frame's window keeps whatever an
-/// earlier frame left in it, so the collector and anything that materializes the file must know
-/// which slots are live. One byte per register holding the use of the frame that wrote it, so a
-/// write marks its slot with one store, and a new use of a pooled frame starts with nothing
-/// written by taking the next use instead of clearing the bytes.
-pub const RegMask = struct {
-    pub const CAP: usize = ir.FRAME_FILL_WORDS * 64;
+/// What a frame writes `Unit` to as it opens (`bc.FuncStreams.fill`): the registers a read
+/// may find unwritten on some path to it, so that every register live where the frame stands
+/// holds a value there; every register for a function no frame map covers, and under the
+/// reclaim backend, which releases a register's old occupant on every write.
+pub const Fill = struct {
+    all: bool,
+    regs: []const u32 = &.{},
 
-    /// `use` once register `i` is written in this use; an older use's mark otherwise.
-    b: [CAP]u8 = undefined,
-    /// The mark this use's writes leave, never 0; the bytes hold no mark above it.
-    use: u8 = 0,
-    /// Every slot holds a value: the window was filled, or its file was materialized.
-    filled: bool = true,
+    pub const everything: Fill = .{ .all = true };
 
-    /// A mask whose bytes may hold anything, as a frame fresh from an allocation has: no use has
-    /// written any.
-    pub fn clear(self: *RegMask) void {
-        @memset(&self.b, 0);
-        self.use = 0;
+    pub inline fn of(fs: *const ir.bc.FuncStreams) Fill {
+        return .{ .all = fs.open.fill_all, .regs = fs.fill };
     }
 
-    /// The next use of the frame, over a window filled or not: when the use counter wraps, the
-    /// bytes are cleared, so none holds the new mark.
-    pub inline fn reset(self: *RegMask, filled: bool) void {
-        self.filled = filled;
-        if (filled) return;
-        self.use +%= 1;
-        if (self.use == 0) {
-            @memset(&self.b, 0);
-            self.use = 1;
+    pub inline fn apply(self: Fill, window: []Value) void {
+        if (self.all) {
+            for (window) |*v| v.* = .Unit;
+            return;
         }
-    }
-
-    pub inline fn isAll(self: *const RegMask) bool {
-        return self.filled;
-    }
-
-    /// A slot past the tracked range belongs to an eagerly filled frame, so it reads as written.
-    pub inline fn has(self: *const RegMask, i: usize) bool {
-        return self.filled or i >= CAP or self.b[i] == self.use;
-    }
-
-    pub inline fn set(self: *RegMask, i: usize) void {
-        if (i < CAP) self.b[i] = self.use;
-    }
-
-    /// `set` for an index below the frame function's register count. A function with more
-    /// than `CAP` registers gets a filled frame, so the byte a larger index wraps to is unread.
-    pub inline fn setInWindow(self: *RegMask, i: usize) void {
-        self.b[i & (CAP - 1)] = self.use;
-    }
-
-    pub inline fn setAll(self: *RegMask) void {
-        self.filled = true;
+        for (self.regs) |r| window[r] = .Unit;
     }
 };
 
@@ -96,10 +64,9 @@ pub const RegMask = struct {
 pub const Frame = struct {
     module: *const Module,
     func: *const Func,
+    /// The registers: those live where the frame stands hold values (`at_block`, `at_idx`);
+    /// the rest may hold anything an earlier frame left in the window.
     regs: []Value,
-    /// Which register slots hold a real value: all-ones for an eagerly Unit-filled window, one bit per write
-    /// for a no-fill frame. The collector reads only set slots; `materializeRegs` fills the rest.
-    wmask: RegMask = .{},
     params: []const Value,
     captures: []const Value,
     /// Where this thread's value stack stood before the frame's argument area and window were pushed;
@@ -126,9 +93,14 @@ pub const Frame = struct {
     /// The per-thread evaluator state, resolved once when the frame is built: macOS reaches a thread-local
     /// through a call the compiler cannot hoist, so every access site would otherwise pay its own.
     tls: *EvalTls,
-    /// The span a block exit left in effect: the last `Trace` of a block that completed.
+    /// The span the frame's block found as it was entered, for a block whose entry span
+    /// differs by path (`spanmap.EntrySpan.dyn`): the edges into such a block, and the frame
+    /// loop's routes into a catch or a finally, leave it here.
     cur_span: ?ir.Span = null,
-    /// Where the frame stands at the instruction that may observe a span: an escape, a call or a throw.
+    /// Where the frame stands: the instruction a call, a throw, a host call or a safe point
+    /// observes it at, recorded before any of them can, or `block_start`. A collection, a
+    /// stack capture and a suspension read what they need from the function's tables at this
+    /// position (`FuncStreams.frameMap`); a fresh frame stands at its entry block's start.
     at_block: u32 = 0,
     at_idx: u32 = 0,
 
@@ -147,27 +119,23 @@ pub const Frame = struct {
     ) Allocator.Error!void {
         if (parent.call_hooks_on and (missTraceWant() != null or cvTraceOn() or parent.frame_count_on)) entryDiag(ev, func, params);
         const mark = area orelse ev.vstack.mark();
-        // The reclaim backend releases a register's previous occupant on every write, so its frames stay filled.
-        const no_fill = !runtime.reclaimEnabled() and noFill(module, func);
+        const fill = if (runtime.reclaimEnabled()) Fill.everything else fillOf(module, func);
         const n = func.n_locals;
         const window = ev.vstack.push(ev, n) catch |e| {
             ev.vstack.restore(mark);
             return e;
         };
-        if (!no_fill) {
-            @memset(window, .Unit);
-            if (parent.frame_count_on) {
-                parent.regs_fill_slots += n;
-                fillCensusBump(func.id.int(), n);
-            }
+        fill.apply(window);
+        if (parent.frame_count_on) {
+            const k: u32 = if (fill.all) n else @intCast(fill.regs.len);
+            parent.regs_fill_slots += k;
+            fillCensusBump(func.id.int(), k);
         }
-        // A frame built here may be fresh from the Zig stack or an allocation, its mask anything.
-        self.wmask.clear();
-        self.init(ev, allocator, module, func, window, params, captures, mark, !no_fill);
+        self.initFields(ev, allocator, module, func, window, params, captures, mark);
     }
 
-    /// `enter` for a call the stream loop opens, on an activation whose mask a use has set up: the loop has checked the diagnostic hooks, and
-    /// the run's reclaim flag is known where it is compiled.
+    /// `enter` for a call the stream loop opens: the loop has checked the diagnostic hooks,
+    /// and the run's reclaim flag is known where it is compiled.
     pub inline fn enterStream(
         self: *Frame,
         ev: *EvalTls,
@@ -177,24 +145,28 @@ pub const Frame = struct {
         params: []const Value,
         captures: []const Value,
         area: ?VsMark,
-        func_no_fill: bool,
+        fill: Fill,
         comptime reclaim: bool,
     ) Allocator.Error!void {
         const mark = area orelse ev.vstack.mark();
-        const no_fill = !reclaim and func_no_fill;
         const window = ev.vstack.push(ev, func.n_locals) catch |e| {
             ev.vstack.restore(mark);
             return e;
         };
-        if (!no_fill) @memset(window, .Unit);
-        self.init(ev, allocator, module, func, window, params, captures, mark, !no_fill);
+        (if (reclaim) Fill.everything else fill).apply(window);
+        self.initFields(ev, allocator, module, func, window, params, captures, mark);
     }
 
-    /// `enterStream` over a `window` the caller took from the value stack, on a frame whose mask's
-    /// use counter is below its last value: nothing here can fail, allocate or clear the mask.
-    /// A function not shown to write each register before reading it gets its window filled with
-    /// `Unit`, one tag at a time, which compiles to stores rather than a call.
-    pub inline fn enterWindow(
+    /// `enterStream` for the frame of an activation the thread's pool gave back, over a
+    /// `window` the caller took from the value stack: nothing here can fail or allocate. A
+    /// pooled frame has no heap block and no finally pending (every return that pools one
+    /// tears them down first, and a fresh activation starts without them), owns none of its
+    /// parameters (only a frame rebuilt on a resume does, and none is pooled) and is its
+    /// pool's thread's (`actFree`), so those fields stand as they are; the span only a
+    /// function whose entry block reads it (`clear_span`) needs cleared. The call's closure,
+    /// owning module and the frame below it come in here rather than after, so no field is
+    /// written twice.
+    pub inline fn enterPooledWindow(
         self: *Frame,
         ev: *EvalTls,
         allocator: Allocator,
@@ -204,22 +176,35 @@ pub const Frame = struct {
         params: []const Value,
         captures: []const Value,
         mark: VsMark,
-        no_fill: bool,
+        fill: Fill,
+        closure: ?runtime.IrClosureRef,
+        module_arc: ?*const Module,
+        gc_link: ?*Frame,
+        clear_span: bool,
     ) void {
-        std.debug.assert(self.wmask.use != std.math.maxInt(u8));
-        self.initFields(ev, allocator, module, func, window, params, captures, mark);
-        if (no_fill) {
-            self.wmask.filled = false;
-            self.wmask.use += 1;
-        } else {
-            for (window) |*v| v.* = .Unit;
-            self.wmask.filled = true;
-        }
+        std.debug.assert(self.heap.len == 0 and self.pending == null and !self.owns_params_caps and self.tls == ev);
+        // A field added to `Frame` is set here too, or stands as a pooled frame leaves it.
+        comptime std.debug.assert(std.meta.fields(Frame).len == 17);
+        self.module = module;
+        self.func = func;
+        self.regs = window;
+        self.params = params;
+        self.captures = captures;
+        self.vs_mark = mark;
+        self.module_arc = module_arc;
+        self.allocator = allocator;
+        self.gc_link = gc_link;
+        self.closure = closure;
+        if (clear_span) self.cur_span = null;
+        self.at_block = func.entry.int();
+        self.at_idx = block_start;
+        fill.apply(window);
     }
 
-    /// Every field of a fresh frame over `window`. Written one by one: a struct literal would copy
-    /// the mask's bytes, which only the registers a no-fill window writes are read from.
-    inline fn init(
+    /// `enterPooledWindow` for a call whose shape a compiled site recorded: no captures,
+    /// closure or owning module, no register filled, the span left as it stands, and the
+    /// entry block given rather than read from `func`.
+    pub inline fn enterPooledShaped(
         self: *Frame,
         ev: *EvalTls,
         allocator: Allocator,
@@ -227,15 +212,28 @@ pub const Frame = struct {
         func: *const Func,
         window: []Value,
         params: []const Value,
-        captures: []const Value,
         mark: VsMark,
-        filled: bool,
+        gc_link: ?*Frame,
+        entry_block: u32,
     ) void {
-        self.initFields(ev, allocator, module, func, window, params, captures, mark);
-        self.wmask.reset(filled);
+        std.debug.assert(self.heap.len == 0 and self.pending == null and !self.owns_params_caps and self.tls == ev);
+        // A field added to `Frame` is set here too, or stands as a pooled frame leaves it.
+        comptime std.debug.assert(std.meta.fields(Frame).len == 17);
+        self.module = module;
+        self.func = func;
+        self.regs = window;
+        self.params = params;
+        self.captures = &.{};
+        self.vs_mark = mark;
+        self.module_arc = null;
+        self.allocator = allocator;
+        self.gc_link = gc_link;
+        self.closure = null;
+        self.at_block = entry_block;
+        self.at_idx = block_start;
     }
 
-    /// `init` but for the mask.
+    /// Every field of a fresh frame over `window`.
     inline fn initFields(
         self: *Frame,
         ev: *EvalTls,
@@ -248,24 +246,26 @@ pub const Frame = struct {
         mark: VsMark,
     ) void {
         // A field added to `Frame` is set here too.
-        comptime std.debug.assert(std.meta.fields(Frame).len == 18);
-        self.module = module;
-        self.func = func;
-        self.regs = window;
-        self.params = params;
-        self.captures = captures;
-        self.vs_mark = mark;
-        self.heap = &.{};
-        self.module_arc = null;
-        self.allocator = allocator;
-        self.owns_params_caps = false;
-        self.gc_link = null;
-        self.closure = null;
-        self.pending = null;
-        self.tls = ev;
-        self.cur_span = null;
-        self.at_block = 0;
-        self.at_idx = 0;
+        comptime std.debug.assert(std.meta.fields(Frame).len == 17);
+        self.* = .{
+            .module = module,
+            .func = func,
+            .regs = window,
+            .params = params,
+            .captures = captures,
+            .vs_mark = mark,
+            .heap = &.{},
+            .module_arc = null,
+            .allocator = allocator,
+            .owns_params_caps = false,
+            .gc_link = null,
+            .closure = null,
+            .pending = null,
+            .tls = ev,
+            .cur_span = null,
+            .at_block = func.entry.int(),
+            .at_idx = block_start,
+        };
     }
 
     /// `deinitIn` for a frame the stream loop closes, on the stack of `ev`.
@@ -429,8 +429,6 @@ pub const Frame = struct {
     pub inline fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.len) try self.growRegs(idx);
-        // A no-fill frame's indices are below `RegMask.CAP` by `frameDefBeforeUse`.
-        self.wmask.set(idx);
         if (runtime.reclaimEnabled()) {
             const old = self.regs[idx];
             self.regs[idx] = v;
@@ -440,12 +438,9 @@ pub const Frame = struct {
         }
     }
 
-    /// A write past the window: the registers move to the heap, the new slots Unit and written.
+    /// A write past the window: the registers move to the heap, the new slots Unit.
     fn growRegs(self: *Frame, idx: usize) Allocator.Error!void {
-        const old_len = self.regs.len;
         try self.toHeap(self.tls, idx + 1);
-        var i = old_len;
-        while (i < self.regs.len) : (i += 1) self.wmask.set(i);
     }
 
     /// Record the frame's position before an instruction that may observe a span.
@@ -454,43 +449,104 @@ pub const Frame = struct {
         self.at_idx = @intCast(idx);
     }
 
-    /// The span of the statement the frame stands in: the last `Trace` before its position in its
-    /// block, else the one the blocks before it left in effect.
+    /// The span of the statement the frame stands in.
     pub fn span(self: *const Frame) ?ir.Span {
-        if (self.at_block < self.func.blocks.len) {
-            const insts = self.func.blocks[self.at_block].insts;
-            var i: usize = @min(self.at_idx, insts.len);
-            while (i > 0) {
-                i -= 1;
-                switch (insts[i]) {
-                    .Trace => |t| return t.span,
-                    else => {},
-                }
+        if (self.at_block >= self.func.blocks.len) return self.cur_span;
+        return self.spanAt(self.at_block, self.at_idx);
+    }
+
+    /// The span of a frame standing at instruction `idx` of block `blk` (or its start): the
+    /// last `Trace` before it in the block, else the block's entry span.
+    pub fn spanAt(self: *const Frame, blk: u32, idx: u32) ?ir.Span {
+        const insts = self.func.blocks[blk].insts;
+        var i: usize = if (idx == block_start) 0 else @min(idx, insts.len);
+        while (i > 0) {
+            i -= 1;
+            switch (insts[i]) {
+                .Trace => |t| return t.span,
+                else => {},
             }
         }
+        return self.entrySpan(blk);
+    }
+
+    /// The span block `blk`'s entry finds (`FuncStreams.entry_spans`): the one every path
+    /// into it leaves, the first statement of one that opens with it, else the one its
+    /// entering edge left in the frame.
+    pub fn entrySpan(self: *const Frame, blk: u32) ?ir.Span {
+        const memo = self.func.bc_memo.load(.acquire);
+        if (memo > 1) {
+            const fs: *const ir.bc.FuncStreams = @ptrFromInt(memo);
+            if (blk < fs.entry_spans.len) switch (fs.entry_spans[blk]) {
+                .known => |sp| return sp,
+                .opens => return self.func.blocks[blk].insts[0].Trace.span,
+                .dyn => {},
+            };
+        }
         return self.cur_span;
+    }
+
+    /// Leaves in `cur_span` the span a block the frame loop routes to from block `blk` (a
+    /// throw's handler, a finally) finds: the one where the frame stands in `blk`.
+    pub fn leaveSpanFrom(self: *Frame, blk: u32) void {
+        self.cur_span = if (self.at_block == blk) self.spanAt(blk, self.at_idx) else self.entrySpan(blk);
     }
 
     pub fn block(self: *const Frame, b: BlockId) *const ir.Block {
         return &self.func.blocks[b.int()];
     }
 
-    /// Fill every not-yet-written slot with `Unit` and saturate the mask before the file escapes the masked
-    /// world (suspension snapshot, C-native surface, resume rebuild). No-op once saturated.
+    /// `Unit` in every register not live where the frame stands, so a copy of the whole file
+    /// (a suspension's snapshot) holds only values: a register not live there may hold
+    /// anything, and the frame reads none of them before writing it.
     pub fn materializeRegs(self: *Frame) void {
-        if (self.wmask.isAll()) return;
-        for (self.regs, 0..) |*v, i| {
-            if (!self.wmask.has(i)) v.* = .Unit;
+        const n = @min(self.regs.len, @as(usize, self.func.n_locals));
+        var buf: [16]u64 = undefined;
+        const live = self.liveSet(&buf) orelse return;
+        for (self.regs[0..n], 0..) |*v, i| {
+            if (live[i >> 6] & (@as(u64, 1) << @as(u6, @truncate(i))) == 0) v.* = .Unit;
         }
-        self.wmask.setAll();
+    }
+
+    /// The registers live where the frame stands (`FuncStreams.frameMap`), in `buf` or, for a
+    /// frame of more than 512 registers, the heap (which the next call frees; the collector
+    /// asks once per frame). Null for a function no map covers, whose frames are filled whole
+    /// and hold values in every register.
+    pub fn liveSet(self: *const Frame, buf: *[16]u64) ?[]const u64 {
+        return self.liveAt(self.at_block, self.at_idx, buf);
+    }
+
+    /// `liveSet` at instruction `idx` of block `blk` (or its start, `block_start`).
+    pub fn liveAt(self: *const Frame, blk: u32, idx: u32, buf: *[16]u64) ?[]const u64 {
+        const memo = self.func.bc_memo.load(.acquire);
+        if (memo <= 1) return null;
+        const fs: *const ir.bc.FuncStreams = @ptrFromInt(memo);
+        if (fs.open.fill_all) return null;
+        const fm = fs.frameMap() orelse return null;
+        const w = fm.words;
+        const set = if (2 * w <= buf.len) buf[0 .. 2 * w] else big: {
+            if (live_heap.len < 2 * w) {
+                std.heap.c_allocator.free(live_heap);
+                live_heap = std.heap.c_allocator.alloc(u64, 2 * w) catch return null;
+            }
+            break :big live_heap[0 .. 2 * w];
+        };
+        const blocks = self.func.blocks;
+        if (blk >= blocks.len) return null;
+        const pos = if (idx == block_start) block_start else @min(idx, @as(u32, @intCast(blocks[blk].insts.len)));
+        fm.liveBefore(blocks, blk, pos, set[0..w], set[w..]);
+        return set[0..w];
     }
 };
 
-/// Whether a frame of `func` may start unfilled, from its code table; a function with none
-/// (a body not decoded yet, an allocation that failed) is filled.
-fn noFill(module: *const Module, func: *const Func) bool {
-    const fs = ir.bc.funcStreams(func, module.consts.items) orelse return false;
-    return fs.no_fill;
+/// `Frame.liveSet`'s buffer for frames past 512 registers, per thread.
+threadlocal var live_heap: []u64 = &.{};
+
+/// What a frame of `func` fills as it opens, from its code table; a function with none (a
+/// body not decoded yet, an allocation that failed) is filled whole.
+fn fillOf(module: *const Module, func: *const Func) Fill {
+    const fs = ir.bc.funcStreams(func, module.consts.items) orelse return Fill.everything;
+    return Fill.of(fs);
 }
 
 /// The run `args[0..n]` of `frame`'s registers, read in place.
@@ -522,41 +578,3 @@ pub const ArgArea = struct {
         return .{ .vals = vals, .mark = mark };
     }
 };
-
-test "a window write marks its register, and a filled window reads as written past its range" {
-    var m: RegMask = .{};
-    m.clear();
-    m.reset(false);
-    try std.testing.expect(!m.isAll());
-    m.setInWindow(0);
-    m.setInWindow(70);
-    m.setInWindow(RegMask.CAP - 1);
-    try std.testing.expect(m.has(0) and m.has(70) and m.has(RegMask.CAP - 1));
-    try std.testing.expect(!m.has(1) and !m.has(69) and !m.has(71));
-    try std.testing.expect(m.has(RegMask.CAP + 3));
-    m.setAll();
-    try std.testing.expect(m.isAll() and m.has(1));
-    var filled: RegMask = .{};
-    filled.clear();
-    filled.reset(true);
-    filled.setInWindow(RegMask.CAP + 5);
-    try std.testing.expect(filled.isAll() and filled.has(3));
-}
-
-test "a pooled frame's next use sees none of an earlier use's writes, the counter's wrap included" {
-    var m: RegMask = .{};
-    m.clear();
-    m.reset(false);
-    m.setInWindow(4);
-    m.reset(false);
-    try std.testing.expect(!m.has(4));
-    m.setInWindow(5);
-    // Through every other mark and the wrap: no write of an earlier use reads as this one's.
-    var k: usize = 0;
-    while (k < 300) : (k += 1) {
-        m.reset(false);
-        try std.testing.expect(!m.has(4) and !m.has(5));
-    }
-    m.setInWindow(4);
-    try std.testing.expect(m.has(4) and !m.has(5));
-}

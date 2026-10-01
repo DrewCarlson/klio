@@ -29,6 +29,11 @@ const Current = struct { fqn: ?[]const u8 = null };
 
 const current_tls = tls_fast.PerThread(Current);
 
+/// Whether the tracker wraps the allocator: only then does an intrinsic's name matter.
+pub inline fn active() bool {
+    return initialized;
+}
+
 pub inline fn currentFqn() ?[]const u8 {
     return current_tls.get().fqn;
 }

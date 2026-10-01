@@ -1,0 +1,16 @@
+-1: in 0..5=false in 0..<5=false in 0 until 5=false in 5 downTo 0=false !in 0..5=true
+0: in 0..5=true in 0..<5=true in 0 until 5=true in 5 downTo 0=true !in 0..5=false
+3: in 0..5=true in 0..<5=true in 0 until 5=true in 5 downTo 0=true !in 0..5=false
+5: in 0..5=true in 0..<5=false in 0 until 5=false in 5 downTo 0=true !in 0..5=false
+6: in 0..5=false in 0..<5=false in 0 until 5=false in 5 downTo 0=false !in 0..5=true
+3 in 5..0: false, 3 in 0 downTo 5: false
+1099511627775 in 0..big=true in 0 until big=true !in 1..<big=false
+1099511627776 in 0..big=true in 0 until big=false !in 1..<big=true
+1099511627777 in 0..big=false in 0 until big=false !in 1..<big=true
+a: in a..m=true in b until z=false !in z downTo n=true
+m: in a..m=true in b until z=true !in z downTo n=true
+z: in a..m=false in b until z=false !in z downTo n=false
+A: in a..m=false in b until z=false !in z downTo n=true
+order: abe -> true
+order: abe -> false
+sum in bounds: 108

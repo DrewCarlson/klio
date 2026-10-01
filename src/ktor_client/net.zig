@@ -86,6 +86,11 @@ pub fn int(v: i64) EvalResult {
     return .{ .ok = Value.newInt(v) };
 }
 
+/// A `Long` answer, as a native Kotlin declares `: Long` (a handle) returns it.
+pub fn long(v: i64) EvalResult {
+    return .{ .ok = Value.newLong(v) };
+}
+
 pub fn typeErr(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
@@ -153,15 +158,11 @@ fn byteArrayCopy(ctx: *const CallCtx, i: usize, out: []u8) ?[]u8 {
 }
 
 pub fn newByteArray(a: Allocator, bytes: []const u8) Allocator.Error!Value {
-    var pb = runtime.PrimBuf{ .kind = .Byte };
-    try pb.bytes.appendSlice(a, bytes);
-    return .{ .Array = runtime.ArrayData.scalars(try runtime.ObjRef(runtime.PrimBuf).initOwned(a, pb), .Byte) };
+    return .{ .Array = runtime.ArrayData.scalars(try runtime.PrimBuf.initBytes(a, .Byte, bytes), .Byte) };
 }
 
 fn newIntArray(a: Allocator, ints: []const i32) Allocator.Error!Value {
-    var pb = runtime.PrimBuf{ .kind = .Int };
-    try pb.bytes.appendSlice(a, std.mem.sliceAsBytes(ints));
-    return .{ .Array = runtime.ArrayData.scalars(try runtime.ObjRef(runtime.PrimBuf).initOwned(a, pb), .Int) };
+    return .{ .Array = runtime.ArrayData.scalars(try runtime.PrimBuf.initBytes(a, .Int, std.mem.sliceAsBytes(ints)), .Int) };
 }
 
 fn fdArg(ctx: *const CallCtx, i: usize) sock.Fd {

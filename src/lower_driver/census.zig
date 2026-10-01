@@ -53,9 +53,9 @@ pub const Result = struct {
 /// bodyless declarations through `natives`, and returns what failed. `map`
 /// locates spans; `records` is `sema.output.build(s).files`.
 pub fn run(a: Allocator, s: *sema.Sema, map: *const span.SourceMap, records: []const sema.output.FileRecords, layers: []const bridge.Layer, files: []const u32, binding: @import("pipeline.zig").Binding) !Result {
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = records, .layers = layers, .files = files });
     const prog = try lower.lowerProgram(a, s, br);
 

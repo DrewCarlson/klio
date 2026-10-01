@@ -45,10 +45,19 @@ pub fn callStdlibBorrowed(self: *VmHost, allocator: Allocator, fqn: []const u8, 
         .host = intrinsic.intrinsicHost(),
         .allocator = allocator,
     };
-    const prev_fqn_lt = runtime.leaktrack.currentFqn();
-    runtime.leaktrack.setCurrentFqn(fqn);
+    const track = runtime.leaktrack.active();
+    const prev_fqn_lt = if (track) runtime.leaktrack.currentFqn() else null;
+    if (track) runtime.leaktrack.setCurrentFqn(fqn);
     const r = try func(&ctx);
-    runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
+    if (track) runtime.leaktrack.setCurrentFqn(prev_fqn_lt);
+    return switch (r) {
+        .ok => |v| .{ .ok = v },
+        .err => |e| .{ .err = runtimeErrorToEval(allocator, e) },
+    };
+}
+
+/// A stdlib native's result as the VM's: its error mapped as `callStdlibBorrowed` maps it.
+pub fn evalResultOf(allocator: Allocator, r: runtime.EvalResult) EvalResult {
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| .{ .err = runtimeErrorToEval(allocator, e) },

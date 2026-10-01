@@ -149,7 +149,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
         .ArrayGet => |x| return ev_resolved.execArrayGet(H, allocator, frame, x, host),
         .ArraySet => |x| return ev_resolved.execArraySet(H, allocator, frame, x, host),
         .NewArray => |x| return ev_resolved.execNewArray(H, allocator, frame, x, host),
-        .BoxValue => |x| return ev_resolved.execBoxValue(H, allocator, frame, x, host),
+        .BoxValue => |x| return ev_resolved.execBoxValue(allocator, frame, x),
         .UnboxValue => |x| return ev_resolved.execUnboxValue(H, allocator, frame, x),
         .LoadCapture => |lc| {
             const v = if (lc.idx < frame.captures.len) frame.captures[lc.idx] else Value.Unit;
@@ -229,6 +229,7 @@ pub fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Val
     }
     switch (bo.op) {
         .StringConcat => {
+            if (try ev_values.concatInPlace(allocator, &l, &r)) |s| return ok(.{ .String = s });
             const ls = try renderValue(allocator, &l);
             const rs = try renderValue(allocator, &r);
             const combined = try std.mem.concat(allocator, u8, &.{ ls, rs });

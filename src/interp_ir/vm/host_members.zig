@@ -267,7 +267,7 @@ fn boxedEquality(v: *const Value) bool {
 /// `Any.equals`: an instance is equal only to itself; a map entry by its
 /// key and value; a function value by what it references; any other host
 /// value by its kind's own equality.
-fn anyEquals(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
+pub fn anyEquals(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
     const self = vm(h);
     if (args.len < 2) return internal(a, "`equals` without an argument", .{});
     const recv = &args[0];
@@ -289,13 +289,13 @@ fn anyEquals(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!E
 
 /// `Any.hashCode`: an instance's identity; a host value's hash by its kind,
 /// its elements' through their own `hashCode`.
-fn anyHashCode(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
+pub fn anyHashCode(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!EvalResult {
     const recv = &args[0];
     switch (recv.*) {
         .Instance => |inst| {
             const g = inst.borrow();
             defer g.deinit();
-            return .{ .ok = Value.newInt(@bitCast(g.get().identity)) };
+            return .{ .ok = Value.newInt(@bitCast(g.get().identityOf())) };
         },
         // A live entry whose map changed shape fails, as any access to it does.
         .MapEntry => return component("hashCode")(h, a, args),
@@ -316,7 +316,7 @@ fn anyToString(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error
             defer g.deinit();
             const cg = g.get().class.borrow();
             defer cg.deinit();
-            const text = try std.fmt.allocPrint(a, "{s}@{x}", .{ cg.get().fqn, g.get().identity });
+            const text = try std.fmt.allocPrint(a, "{s}@{x}", .{ cg.get().fqn, g.get().identityOf() });
             return .{ .ok = .{ .String = try runtime.strInitOwned(a, text) } };
         },
         .Class => |c| {
@@ -572,182 +572,184 @@ fn threadNoOp(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Error!
 
 // ----------------------------------------------------------------- table --
 
-const Entry = struct { []const u8, HostFn };
+/// A member's key, its host function, and the stdlib function that runs it when it is one
+/// (`native`), which a call can run straight (`directOf`).
+const Entry = struct { []const u8, HostFn, ?StdlibFn };
 
 /// The collection classes' members: each is the stdlib native of the
 /// interface member it overrides.
 const list_members = [_]Entry{
-    .{ "get kotlin.collections.ArrayList.size", native("kotlin.collections.MutableList.size", coll.coll_list_size) },
-    .{ "kotlin.collections.ArrayList.isEmpty", native("kotlin.collections.MutableList.isEmpty", coll.coll_list_is_empty) },
-    .{ "kotlin.collections.ArrayList.contains", native("kotlin.collections.MutableList.contains", coll.coll_list_contains) },
-    .{ "kotlin.collections.ArrayList.containsAll", native("kotlin.collections.MutableList.containsAll", coll.coll_list_contains_all) },
-    .{ "kotlin.collections.ArrayList.get", native("kotlin.collections.MutableList.get", coll.coll_list_get) },
-    .{ "kotlin.collections.ArrayList.indexOf", native("kotlin.collections.MutableList.indexOf", coll.coll_list_index_of) },
-    .{ "kotlin.collections.ArrayList.lastIndexOf", native("kotlin.collections.MutableList.lastIndexOf", coll.coll_list_last_index_of) },
-    .{ "kotlin.collections.ArrayList.iterator", iterableIterator },
-    .{ "kotlin.collections.ArrayList.listIterator", listIterator },
-    .{ "kotlin.collections.ArrayList.add", native("kotlin.collections.MutableList.add", coll.coll_mut_list_add) },
-    .{ "kotlin.collections.ArrayList.remove", native("kotlin.collections.MutableList.remove", coll.coll_mut_list_remove) },
-    .{ "kotlin.collections.ArrayList.addAll", native("kotlin.collections.MutableList.addAll", coll.coll_mut_list_add_all) },
-    .{ "kotlin.collections.ArrayList.removeAll", native("kotlin.collections.MutableList.removeAll", coll.coll_mut_list_remove_all) },
-    .{ "kotlin.collections.ArrayList.retainAll", native("kotlin.collections.MutableList.retainAll", coll.coll_mut_list_retain_all) },
-    .{ "kotlin.collections.ArrayList.clear", native("kotlin.collections.MutableList.clear", coll.coll_mut_list_clear) },
-    .{ "kotlin.collections.ArrayList.set", native("kotlin.collections.MutableList.set", coll.coll_mut_list_set) },
-    .{ "kotlin.collections.ArrayList.removeAt", native("kotlin.collections.MutableList.removeAt", coll.coll_mut_list_remove_at) },
-    .{ "kotlin.collections.ArrayList.subList", native("kotlin.collections.MutableList.subList", coll.coll_list_sublist) },
+    .{ "get kotlin.collections.ArrayList.size", native("kotlin.collections.MutableList.size", coll.coll_list_size), coll.coll_list_size },
+    .{ "kotlin.collections.ArrayList.isEmpty", native("kotlin.collections.MutableList.isEmpty", coll.coll_list_is_empty), coll.coll_list_is_empty },
+    .{ "kotlin.collections.ArrayList.contains", native("kotlin.collections.MutableList.contains", coll.coll_list_contains), coll.coll_list_contains },
+    .{ "kotlin.collections.ArrayList.containsAll", native("kotlin.collections.MutableList.containsAll", coll.coll_list_contains_all), coll.coll_list_contains_all },
+    .{ "kotlin.collections.ArrayList.get", native("kotlin.collections.MutableList.get", coll.coll_list_get), coll.coll_list_get },
+    .{ "kotlin.collections.ArrayList.indexOf", native("kotlin.collections.MutableList.indexOf", coll.coll_list_index_of), coll.coll_list_index_of },
+    .{ "kotlin.collections.ArrayList.lastIndexOf", native("kotlin.collections.MutableList.lastIndexOf", coll.coll_list_last_index_of), coll.coll_list_last_index_of },
+    .{ "kotlin.collections.ArrayList.iterator", iterableIterator, null },
+    .{ "kotlin.collections.ArrayList.listIterator", listIterator, null },
+    .{ "kotlin.collections.ArrayList.add", native("kotlin.collections.MutableList.add", coll.coll_mut_list_add), coll.coll_mut_list_add },
+    .{ "kotlin.collections.ArrayList.remove", native("kotlin.collections.MutableList.remove", coll.coll_mut_list_remove), coll.coll_mut_list_remove },
+    .{ "kotlin.collections.ArrayList.addAll", native("kotlin.collections.MutableList.addAll", coll.coll_mut_list_add_all), coll.coll_mut_list_add_all },
+    .{ "kotlin.collections.ArrayList.removeAll", native("kotlin.collections.MutableList.removeAll", coll.coll_mut_list_remove_all), coll.coll_mut_list_remove_all },
+    .{ "kotlin.collections.ArrayList.retainAll", native("kotlin.collections.MutableList.retainAll", coll.coll_mut_list_retain_all), coll.coll_mut_list_retain_all },
+    .{ "kotlin.collections.ArrayList.clear", native("kotlin.collections.MutableList.clear", coll.coll_mut_list_clear), coll.coll_mut_list_clear },
+    .{ "kotlin.collections.ArrayList.set", native("kotlin.collections.MutableList.set", coll.coll_mut_list_set), coll.coll_mut_list_set },
+    .{ "kotlin.collections.ArrayList.removeAt", native("kotlin.collections.MutableList.removeAt", coll.coll_mut_list_remove_at), coll.coll_mut_list_remove_at },
+    .{ "kotlin.collections.ArrayList.subList", native("kotlin.collections.MutableList.subList", coll.coll_list_sublist), coll.coll_list_sublist },
 };
 
 fn setMembers(comptime cls: []const u8) [11]Entry {
     const p = "kotlin.collections." ++ cls ++ ".";
     return .{
-        .{ "get " ++ p ++ "size", native("kotlin.collections.MutableSet.size", coll.coll_set_size) },
-        .{ p ++ "isEmpty", native("kotlin.collections.MutableSet.isEmpty", coll.coll_set_is_empty) },
-        .{ p ++ "contains", native("kotlin.collections.MutableSet.contains", coll.coll_set_contains) },
-        .{ p ++ "containsAll", native("kotlin.collections.MutableSet.containsAll", coll.coll_set_contains_all) },
-        .{ p ++ "iterator", iterableIterator },
-        .{ p ++ "add", native("kotlin.collections.MutableSet.add", coll.coll_mut_set_add) },
-        .{ p ++ "remove", native("kotlin.collections.MutableSet.remove", coll.coll_mut_set_remove) },
-        .{ p ++ "addAll", native("kotlin.collections.MutableSet.addAll", coll.coll_mut_set_add_all) },
-        .{ p ++ "removeAll", native("kotlin.collections.MutableSet.removeAll", coll.coll_mut_set_remove_all) },
-        .{ p ++ "retainAll", native("kotlin.collections.MutableSet.retainAll", coll.coll_mut_set_retain_all) },
-        .{ p ++ "clear", native("kotlin.collections.MutableSet.clear", coll.coll_mut_set_clear) },
+        .{ "get " ++ p ++ "size", native("kotlin.collections.MutableSet.size", coll.coll_set_size), coll.coll_set_size },
+        .{ p ++ "isEmpty", native("kotlin.collections.MutableSet.isEmpty", coll.coll_set_is_empty), coll.coll_set_is_empty },
+        .{ p ++ "contains", native("kotlin.collections.MutableSet.contains", coll.coll_set_contains), coll.coll_set_contains },
+        .{ p ++ "containsAll", native("kotlin.collections.MutableSet.containsAll", coll.coll_set_contains_all), coll.coll_set_contains_all },
+        .{ p ++ "iterator", iterableIterator, null },
+        .{ p ++ "add", native("kotlin.collections.MutableSet.add", coll.coll_mut_set_add), coll.coll_mut_set_add },
+        .{ p ++ "remove", native("kotlin.collections.MutableSet.remove", coll.coll_mut_set_remove), coll.coll_mut_set_remove },
+        .{ p ++ "addAll", native("kotlin.collections.MutableSet.addAll", coll.coll_mut_set_add_all), coll.coll_mut_set_add_all },
+        .{ p ++ "removeAll", native("kotlin.collections.MutableSet.removeAll", coll.coll_mut_set_remove_all), coll.coll_mut_set_remove_all },
+        .{ p ++ "retainAll", native("kotlin.collections.MutableSet.retainAll", coll.coll_mut_set_retain_all), coll.coll_mut_set_retain_all },
+        .{ p ++ "clear", native("kotlin.collections.MutableSet.clear", coll.coll_mut_set_clear), coll.coll_mut_set_clear },
     };
 }
 
 fn mapMembers(comptime cls: []const u8) [12]Entry {
     const p = "kotlin.collections." ++ cls ++ ".";
     return .{
-        .{ "get " ++ p ++ "size", native("kotlin.collections.MutableMap.size", coll.coll_map_size) },
-        .{ p ++ "isEmpty", native("kotlin.collections.MutableMap.isEmpty", coll.coll_map_is_empty) },
-        .{ p ++ "containsKey", native("kotlin.collections.MutableMap.containsKey", coll.coll_map_contains_key) },
-        .{ p ++ "containsValue", native("kotlin.collections.MutableMap.containsValue", coll.coll_map_contains_value) },
-        .{ p ++ "get", native("kotlin.collections.MutableMap.get", coll.coll_map_get) },
-        .{ p ++ "put", native("kotlin.collections.MutableMap.put", coll.coll_mut_map_put) },
-        .{ p ++ "remove", native("kotlin.collections.MutableMap.remove", coll.coll_mut_map_remove) },
-        .{ p ++ "putAll", native("kotlin.collections.MutableMap.putAll", coll.coll_mut_map_put_all) },
-        .{ p ++ "clear", native("kotlin.collections.MutableMap.clear", coll.coll_mut_map_clear) },
-        .{ "get " ++ p ++ "keys", native("kotlin.collections.MutableMap.keys", coll.coll_map_keys) },
-        .{ "get " ++ p ++ "values", native("kotlin.collections.MutableMap.values", coll.coll_map_values) },
-        .{ "get " ++ p ++ "entries", native("kotlin.collections.MutableMap.entries", coll.coll_map_entries) },
+        .{ "get " ++ p ++ "size", native("kotlin.collections.MutableMap.size", coll.coll_map_size), coll.coll_map_size },
+        .{ p ++ "isEmpty", native("kotlin.collections.MutableMap.isEmpty", coll.coll_map_is_empty), coll.coll_map_is_empty },
+        .{ p ++ "containsKey", native("kotlin.collections.MutableMap.containsKey", coll.coll_map_contains_key), coll.coll_map_contains_key },
+        .{ p ++ "containsValue", native("kotlin.collections.MutableMap.containsValue", coll.coll_map_contains_value), coll.coll_map_contains_value },
+        .{ p ++ "get", native("kotlin.collections.MutableMap.get", coll.coll_map_get), coll.coll_map_get },
+        .{ p ++ "put", native("kotlin.collections.MutableMap.put", coll.coll_mut_map_put), coll.coll_mut_map_put },
+        .{ p ++ "remove", native("kotlin.collections.MutableMap.remove", coll.coll_mut_map_remove), coll.coll_mut_map_remove },
+        .{ p ++ "putAll", native("kotlin.collections.MutableMap.putAll", coll.coll_mut_map_put_all), coll.coll_mut_map_put_all },
+        .{ p ++ "clear", native("kotlin.collections.MutableMap.clear", coll.coll_mut_map_clear), coll.coll_mut_map_clear },
+        .{ "get " ++ p ++ "keys", native("kotlin.collections.MutableMap.keys", coll.coll_map_keys), coll.coll_map_keys },
+        .{ "get " ++ p ++ "values", native("kotlin.collections.MutableMap.values", coll.coll_map_values), coll.coll_map_values },
+        .{ "get " ++ p ++ "entries", native("kotlin.collections.MutableMap.entries", coll.coll_map_entries), coll.coll_map_entries },
     };
 }
 
 /// The roots of the slots host iterators answer.
 const iterator_members = [_]Entry{
-    .{ "kotlin.collections.Iterator.hasNext", iterHasNext },
-    .{ "kotlin.collections.Iterator.next", iterNext },
-    .{ "kotlin.collections.MutableIterator.remove", iterMember("remove") },
-    .{ "kotlin.collections.ListIterator.hasPrevious", iterMember("hasPrevious") },
-    .{ "kotlin.collections.ListIterator.previous", iterMember("previous") },
-    .{ "kotlin.collections.ListIterator.nextIndex", iterMember("nextIndex") },
-    .{ "kotlin.collections.ListIterator.previousIndex", iterMember("previousIndex") },
-    .{ "kotlin.collections.MutableListIterator.set", iterMember("set") },
-    .{ "kotlin.collections.MutableListIterator.add", iterMember("add") },
-    .{ "kotlin.collections.ByteIterator.nextByte", iterNext },
-    .{ "kotlin.collections.CharIterator.nextChar", iterNext },
-    .{ "kotlin.collections.ShortIterator.nextShort", iterNext },
-    .{ "kotlin.collections.IntIterator.nextInt", iterNext },
-    .{ "kotlin.collections.LongIterator.nextLong", iterNext },
-    .{ "kotlin.collections.FloatIterator.nextFloat", iterNext },
-    .{ "kotlin.collections.DoubleIterator.nextDouble", iterNext },
-    .{ "kotlin.collections.BooleanIterator.nextBoolean", iterNext },
-    .{ "kotlin.sequences.Sequence.iterator", iterableIterator },
+    .{ "kotlin.collections.Iterator.hasNext", iterHasNext, null },
+    .{ "kotlin.collections.Iterator.next", iterNext, null },
+    .{ "kotlin.collections.MutableIterator.remove", iterMember("remove"), null },
+    .{ "kotlin.collections.ListIterator.hasPrevious", iterMember("hasPrevious"), null },
+    .{ "kotlin.collections.ListIterator.previous", iterMember("previous"), null },
+    .{ "kotlin.collections.ListIterator.nextIndex", iterMember("nextIndex"), null },
+    .{ "kotlin.collections.ListIterator.previousIndex", iterMember("previousIndex"), null },
+    .{ "kotlin.collections.MutableListIterator.set", iterMember("set"), null },
+    .{ "kotlin.collections.MutableListIterator.add", iterMember("add"), null },
+    .{ "kotlin.collections.ByteIterator.nextByte", iterNext, null },
+    .{ "kotlin.collections.CharIterator.nextChar", iterNext, null },
+    .{ "kotlin.collections.ShortIterator.nextShort", iterNext, null },
+    .{ "kotlin.collections.IntIterator.nextInt", iterNext, null },
+    .{ "kotlin.collections.LongIterator.nextLong", iterNext, null },
+    .{ "kotlin.collections.FloatIterator.nextFloat", iterNext, null },
+    .{ "kotlin.collections.DoubleIterator.nextDouble", iterNext, null },
+    .{ "kotlin.collections.BooleanIterator.nextBoolean", iterNext, null },
+    .{ "kotlin.sequences.Sequence.iterator", iterableIterator, null },
     // A sequence builder's scope: the host's, which carries the pending
     // yield between pulls.
-    .{ "kotlin.sequences.SequenceScope.yield", native("kotlin.sequences.SequenceScope.yield", impl.sequence.seq_scope_yield) },
-    .{ "kotlin.sequences.SequenceScope.yieldAll", native("kotlin.sequences.SequenceScope.yieldAll", impl.sequence.seq_scope_yield_all) },
+    .{ "kotlin.sequences.SequenceScope.yield", native("kotlin.sequences.SequenceScope.yield", impl.sequence.seq_scope_yield), impl.sequence.seq_scope_yield },
+    .{ "kotlin.sequences.SequenceScope.yieldAll", native("kotlin.sequences.SequenceScope.yieldAll", impl.sequence.seq_scope_yield_all), impl.sequence.seq_scope_yield_all },
 };
 
 fn arrayMembers(comptime cls: []const u8) [4]Entry {
     const p = "kotlin." ++ cls ++ ".";
     return .{
-        .{ "get " ++ p ++ "size", arraySize },
-        .{ p ++ "get", arrayGet },
-        .{ p ++ "set", arraySet },
-        .{ p ++ "iterator", iterableIterator },
+        .{ "get " ++ p ++ "size", arraySize, null },
+        .{ p ++ "get", arrayGet, null },
+        .{ p ++ "set", arraySet, null },
+        .{ p ++ "iterator", iterableIterator, null },
     };
 }
 
 fn progressionMembers(comptime cls: []const u8) [3]Entry {
     const p = "kotlin.ranges." ++ cls ++ ".";
     return .{
-        .{ "get " ++ p ++ "first", rangeProperty("first") },
-        .{ "get " ++ p ++ "last", rangeProperty("last") },
-        .{ "get " ++ p ++ "step", rangeProperty("step") },
+        .{ "get " ++ p ++ "first", rangeProperty("first"), null },
+        .{ "get " ++ p ++ "last", rangeProperty("last"), null },
+        .{ "get " ++ p ++ "step", rangeProperty("step"), null },
     };
 }
 
 fn numberMembers(comptime cls: []const u8, comptime rem: bool) [if (rem) 8 else 7]Entry {
     const p = "kotlin." ++ cls ++ ".";
     const common = [_]Entry{
-        .{ p ++ "equals", primEquals },
-        .{ p ++ "hashCode", primHashCode },
-        .{ p ++ "plus", arith(.Add) },
-        .{ p ++ "minus", arith(.Sub) },
-        .{ p ++ "times", arith(.Mul) },
-        .{ p ++ "div", arith(.Div) },
-        .{ p ++ "toChar", toChar },
+        .{ p ++ "equals", primEquals, null },
+        .{ p ++ "hashCode", primHashCode, null },
+        .{ p ++ "plus", arith(.Add), null },
+        .{ p ++ "minus", arith(.Sub), null },
+        .{ p ++ "times", arith(.Mul), null },
+        .{ p ++ "div", arith(.Div), null },
+        .{ p ++ "toChar", toChar, null },
     };
-    return if (rem) common ++ [_]Entry{.{ p ++ "rem", arith(.Mod) }} else common;
+    return if (rem) common ++ [_]Entry{.{ p ++ "rem", arith(.Mod), null }} else common;
 }
 
 const other_members = [_]Entry{
-    .{ "kotlin.Any.equals", anyEquals },
-    .{ "kotlin.Any.hashCode", anyHashCode },
-    .{ "kotlin.Any.toString", anyToString },
-    .{ "kotlin.Number.toChar", toChar },
-    .{ "kotlin.Char.equals", primEquals },
-    .{ "kotlin.Char.hashCode", primHashCode },
-    .{ "kotlin.Char.plus", arith(.Add) },
-    .{ "kotlin.Char.minus", arith(.Sub) },
-    .{ "kotlin.Char.toChar", toChar },
-    .{ "kotlin.Boolean.equals", primEquals },
-    .{ "kotlin.Boolean.hashCode", primHashCode },
-    .{ "kotlin.Boolean.not", boolNot },
-    .{ "kotlin.Boolean.and", boolOp(.@"and") },
-    .{ "kotlin.Boolean.or", boolOp(.@"or") },
-    .{ "kotlin.Boolean.xor", boolOp(.xor) },
-    .{ "get kotlin.Pair.first", component("first") },
-    .{ "get kotlin.Pair.second", component("second") },
-    .{ "kotlin.Pair.component1", component("component1") },
-    .{ "kotlin.Pair.component2", component("component2") },
-    .{ "kotlin.Pair.equals", anyEquals },
-    .{ "kotlin.Pair.hashCode", anyHashCode },
-    .{ "kotlin.Pair.copy", pairCopy },
-    .{ "get kotlin.Triple.first", component("first") },
-    .{ "get kotlin.Triple.second", component("second") },
-    .{ "get kotlin.Triple.third", component("third") },
-    .{ "kotlin.Triple.component1", component("component1") },
-    .{ "kotlin.Triple.component2", component("component2") },
-    .{ "kotlin.Triple.component3", component("component3") },
-    .{ "kotlin.Triple.equals", anyEquals },
-    .{ "kotlin.Triple.hashCode", anyHashCode },
-    .{ "kotlin.Triple.copy", pairCopy },
-    .{ "get kotlin.collections.Map.Entry.key", component("key") },
-    .{ "get kotlin.collections.Map.Entry.value", component("value") },
-    .{ "kotlin.collections.MutableMap.MutableEntry.setValue", component("setValue") },
-    .{ "get kotlin.reflect.KClass.simpleName", classProperty("simpleName") },
-    .{ "get kotlin.reflect.KClass.qualifiedName", classProperty("qualifiedName") },
-    .{ "kotlin.reflect.KClass.isInstance", classIsInstance },
-    .{ "kotlin.Comparator.compare", comparatorCompare },
-    .{ "get kotlin.text.MatchResult.value", native("kotlin.text.MatchResult.value", impl.regexp.match_result_value) },
-    .{ "get kotlin.text.MatchResult.range", native("kotlin.text.MatchResult.range", impl.regexp.match_result_range) },
-    .{ "get kotlin.text.MatchResult.groupValues", native("kotlin.text.MatchResult.groupValues", impl.regexp.match_result_group_values) },
-    .{ "get kotlin.text.MatchResult.groups", matchGroups },
-    .{ "kotlin.text.__klioMatchGroupCount", matchGroupCount },
-    .{ "kotlin.text.__klioMatchGroup", matchGroup },
-    .{ "kotlin.text.__klioMatchNamedGroup", matchGroup },
-    .{ "get kotlin.text.MatchResult.destructured", native("kotlin.text.MatchResult.destructured", impl.regexp.match_result_destructured) },
-    .{ "kotlin.text.MatchResult.next", native("kotlin.text.MatchResult.next", impl.regexp.match_result_next) },
-    .{ "get kotlin.text.MatchGroup.value", native("kotlin.text.MatchGroup.value", impl.regexp.match_group_value) },
-    .{ "get kotlin.text.MatchGroup.range", native("kotlin.text.MatchGroup.range", impl.regexp.match_group_range) },
-    .{ "kotlin.text.concatToString", concatToString },
-    .{ "kotlin.collections.toTypedArray", native("kotlin.collections.Collection.toTypedArray", coll.coll_to_typed_array) },
-    .{ "get klio.Thread.name", threadName },
-    .{ "get klio.Thread.isAlive", threadIsAlive },
-    .{ "klio.Thread.join", threadJoin },
-    .{ "klio.Thread.start", threadNoOp },
-    .{ "klio.Thread.interrupt", threadNoOp },
+    .{ "kotlin.Any.equals", anyEquals, null },
+    .{ "kotlin.Any.hashCode", anyHashCode, null },
+    .{ "kotlin.Any.toString", anyToString, null },
+    .{ "kotlin.Number.toChar", toChar, null },
+    .{ "kotlin.Char.equals", primEquals, null },
+    .{ "kotlin.Char.hashCode", primHashCode, null },
+    .{ "kotlin.Char.plus", arith(.Add), null },
+    .{ "kotlin.Char.minus", arith(.Sub), null },
+    .{ "kotlin.Char.toChar", toChar, null },
+    .{ "kotlin.Boolean.equals", primEquals, null },
+    .{ "kotlin.Boolean.hashCode", primHashCode, null },
+    .{ "kotlin.Boolean.not", boolNot, null },
+    .{ "kotlin.Boolean.and", boolOp(.@"and"), null },
+    .{ "kotlin.Boolean.or", boolOp(.@"or"), null },
+    .{ "kotlin.Boolean.xor", boolOp(.xor), null },
+    .{ "get kotlin.Pair.first", component("first"), null },
+    .{ "get kotlin.Pair.second", component("second"), null },
+    .{ "kotlin.Pair.component1", component("component1"), null },
+    .{ "kotlin.Pair.component2", component("component2"), null },
+    .{ "kotlin.Pair.equals", anyEquals, null },
+    .{ "kotlin.Pair.hashCode", anyHashCode, null },
+    .{ "kotlin.Pair.copy", pairCopy, null },
+    .{ "get kotlin.Triple.first", component("first"), null },
+    .{ "get kotlin.Triple.second", component("second"), null },
+    .{ "get kotlin.Triple.third", component("third"), null },
+    .{ "kotlin.Triple.component1", component("component1"), null },
+    .{ "kotlin.Triple.component2", component("component2"), null },
+    .{ "kotlin.Triple.component3", component("component3"), null },
+    .{ "kotlin.Triple.equals", anyEquals, null },
+    .{ "kotlin.Triple.hashCode", anyHashCode, null },
+    .{ "kotlin.Triple.copy", pairCopy, null },
+    .{ "get kotlin.collections.Map.Entry.key", component("key"), null },
+    .{ "get kotlin.collections.Map.Entry.value", component("value"), null },
+    .{ "kotlin.collections.MutableMap.MutableEntry.setValue", component("setValue"), null },
+    .{ "get kotlin.reflect.KClass.simpleName", classProperty("simpleName"), null },
+    .{ "get kotlin.reflect.KClass.qualifiedName", classProperty("qualifiedName"), null },
+    .{ "kotlin.reflect.KClass.isInstance", classIsInstance, null },
+    .{ "kotlin.Comparator.compare", comparatorCompare, null },
+    .{ "get kotlin.text.MatchResult.value", native("kotlin.text.MatchResult.value", impl.regexp.match_result_value), impl.regexp.match_result_value },
+    .{ "get kotlin.text.MatchResult.range", native("kotlin.text.MatchResult.range", impl.regexp.match_result_range), impl.regexp.match_result_range },
+    .{ "get kotlin.text.MatchResult.groupValues", native("kotlin.text.MatchResult.groupValues", impl.regexp.match_result_group_values), impl.regexp.match_result_group_values },
+    .{ "get kotlin.text.MatchResult.groups", matchGroups, null },
+    .{ "kotlin.text.__klioMatchGroupCount", matchGroupCount, null },
+    .{ "kotlin.text.__klioMatchGroup", matchGroup, null },
+    .{ "kotlin.text.__klioMatchNamedGroup", matchGroup, null },
+    .{ "get kotlin.text.MatchResult.destructured", native("kotlin.text.MatchResult.destructured", impl.regexp.match_result_destructured), impl.regexp.match_result_destructured },
+    .{ "kotlin.text.MatchResult.next", native("kotlin.text.MatchResult.next", impl.regexp.match_result_next), impl.regexp.match_result_next },
+    .{ "get kotlin.text.MatchGroup.value", native("kotlin.text.MatchGroup.value", impl.regexp.match_group_value), impl.regexp.match_group_value },
+    .{ "get kotlin.text.MatchGroup.range", native("kotlin.text.MatchGroup.range", impl.regexp.match_group_range), impl.regexp.match_group_range },
+    .{ "kotlin.text.concatToString", concatToString, null },
+    .{ "kotlin.collections.toTypedArray", native("kotlin.collections.Collection.toTypedArray", coll.coll_to_typed_array), coll.coll_to_typed_array },
+    .{ "get klio.Thread.name", threadName, null },
+    .{ "get klio.Thread.isAlive", threadIsAlive, null },
+    .{ "klio.Thread.join", threadJoin, null },
+    .{ "klio.Thread.start", threadNoOp, null },
+    .{ "klio.Thread.interrupt", threadNoOp, null },
 };
 
 const entries = list_members ++ setMembers("HashSet") ++ setMembers("LinkedHashSet") ++
@@ -762,7 +764,32 @@ const entries = list_members ++ setMembers("HashSet") ++ setMembers("LinkedHashS
     numberMembers("Long", true) ++ numberMembers("Float", false) ++ numberMembers("Double", false) ++
     other_members;
 
-const table = std.StaticStringMap(HostFn).initComptime(entries);
+const table = std.StaticStringMap(HostFn).initComptime(blk: {
+    var out: [entries.len]struct { []const u8, HostFn } = undefined;
+    for (entries, &out) |e, *o| o.* = .{ e[0], e[1] };
+    break :blk out;
+});
+
+const direct_pairs = blk: {
+    var n: usize = 0;
+    for (entries) |e| if (e[2] != null) {
+        n += 1;
+    };
+    var out: [n]struct { HostFn, StdlibFn } = undefined;
+    var i: usize = 0;
+    for (entries) |e| if (e[2]) |f| {
+        out[i] = .{ e[1], f };
+        i += 1;
+    };
+    break :blk out;
+};
+
+/// The stdlib function member host function `hf` runs over its arguments as they are, or
+/// null for a member that does more.
+pub fn directOf(hf: HostFn) ?StdlibFn {
+    for (direct_pairs) |p| if (p[0] == hf) return p[1];
+    return null;
+}
 
 // ------------------------------------------------------------ fast paths --
 
@@ -902,4 +929,11 @@ test "every key is a declaration key and names one member" {
     try std.testing.expect(resolve("kotlin.collections.Iterator.hasNext") != null);
     try std.testing.expect(resolve("get kotlin.collections.ArrayList.size") != null);
     try std.testing.expect(resolve("kotlin.collections.ArrayList.size") == null);
+}
+
+test "a member that only runs a stdlib native names it for a direct call; one doing more names none" {
+    try std.testing.expect(directOf(resolve("kotlin.collections.ArrayList.get").?) == coll.coll_list_get);
+    try std.testing.expect(directOf(resolve("get kotlin.collections.HashMap.size").?) == coll.coll_map_size);
+    try std.testing.expect(directOf(resolve("kotlin.Any.hashCode").?) == null);
+    try std.testing.expect(directOf(resolve("kotlin.collections.Iterator.hasNext").?) == null);
 }

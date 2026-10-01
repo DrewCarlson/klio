@@ -247,6 +247,7 @@ const KeyHash = union(enum) {
 fn hostKeyHash(ctx: *CallCtx, key: *const Value) Error!KeyHash {
     if (MapStore.keyHash(key)) |h| return .{ .hash = h };
     if (key.* != .Instance) return .none;
+    if (ctx.host.identityKey(key)) |id| return .{ .hash = @as(u64, id) *% 0x9E3779B97F4A7C15 };
     const r = (try ctx.host.callWellKnown(key, .hash_code, &.{}, ctx.out)) orelse return .none;
     return switch (r) {
         .ok => |v| if (v == .Int) .{ .hash = @as(u64, @as(u32, @bitCast(v.Int))) *% 0x9E3779B97F4A7C15 } else .none,
@@ -263,6 +264,7 @@ const Eq = union(enum) {
 /// Whether stored key `k` equals instance `key`, by `k.equals(key)` as the
 /// map's lookup asks it.
 fn instanceKeyEq(ctx: *CallCtx, k: *const Value, key: *const Value) Error!Eq {
+    if (ctx.host.identityKey(k) != null) return if (key.* == .Instance and runtime.ObjRef(runtime.InstanceData).ptrEq(k.Instance, key.Instance)) .yes else .no;
     if (try ctx.host.callWellKnown(k, .equals, &.{key.*}, ctx.out)) |m| switch (m) {
         .ok => |v| if (v == .Bool) return if (v.Bool) .yes else .no,
         .err => return .{ .thrown = m },
@@ -297,7 +299,9 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
         .none => return instanceKeyScan(ctx, entries, &key, 0, null),
         .thrown => |e| return .{ .thrown = e },
     };
-    const a = ctx.allocator;
+    // A bucket holds a few candidates: kept on the stack.
+    var sfa = std.heap.stackFallback(512, ctx.allocator);
+    const a = sfa.get();
     var at: std.ArrayList(u32) = .empty;
     defer at.deinit(a);
     var keys: std.ArrayList(Value) = .empty;
@@ -307,7 +311,7 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
     const hashed = blk: {
         const g = entries.borrowMut();
         defer g.deinit();
-        try g.get().bucketOf(a, h, &at);
+        try g.get().bucketOf(ctx.allocator, h, &at, a);
         for (at.items) |i| try keys.append(a, g.get().pairs.items[i].key);
         break :blk g.get().hashedLen();
     };

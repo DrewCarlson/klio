@@ -65,6 +65,41 @@ the current IR and stream frames from the archived emitters
 (`archive/jit/`, `docs/design/JIT-DESIGN.md`), measured against the JVM with
 its JIT (the plan's last table: 2.3x to 10.6x on the compose frames).
 
+## The heap campaign
+
+`heap.md`: allocation as cheap as the JVM's with the JIT on and off, and a
+collector whose cost follows the live set, with objects that never move and
+the JVM's sharing between threads unchanged. Done: a mutator's cells are
+bumped out of 128-byte lines in 256 KB blocks, a trace marks the lines its
+cell overlaps and a sweep reuses the rest, and only a cell with something
+outside it to free is on the collector's lists; a primitive array is one
+allocation. Next: a list's and a map's backing arrays in region memory, a
+smaller header, and a compiled `new` that bumps in line.
+
+## The frame campaign
+
+`frames.md`: a frame known from its position, as the JVM knows one. A
+call costs 25 to 40 ns interpreted and is 28% of klio's own time on the
+compose frames, almost all of it bookkeeping: a pooled activation and a
+collector chain, a write mark per register store, a span stored at every
+block's exit, a try stack pushed at every try region. The plan reads all
+of it from tables keyed by the frame's position (liveness maps, static
+spans, static try contexts), puts frames on the thread's value stack as a
+header and registers, and runs compiled code on the same frames with
+direct calls, which lets the optimizing tier compile whole functions.
+Done: `frames/maps`, `frames/nomask`, `frames/spans`, `frames/trys`,
+`frames/record`, `frames/calls`; `frames/stack` measured and dropped.
+Next: `frames/jit`.
+
+## Typed storage
+
+`typed-storage.md`: registers, fields and elements laid out by their static
+type (raw `Int`, `Long`, `Double`, eight-byte references), the tagged
+16-byte `Value` only for `Any`, type parameters and nullable primitives. A
+`Point(x, y)` goes from 112 bytes to about 40, and no operand whose type is
+known is tag-checked. Follows the frame campaign, whose liveness maps are
+the reference maps typed frames need.
+
 ## Deferred fronts
 
 Not in the active plan. Each reopens only with the trigger named on it;

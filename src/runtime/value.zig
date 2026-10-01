@@ -122,14 +122,35 @@ pub const StringData = struct {
     /// marker elides the reader lock; see `objcell.LockFor`.
     pub const objref_immutable = true;
 
+    /// A string made in one allocation keeps its bytes after its cell (`strInitTrailing`).
+    pub const Trailing = u8;
+
+    pub fn adoptTrailing(self: *StringData, elems: []u8) void {
+        self.bytes = elems;
+    }
+
+    /// The bytes after the cell that go with it when it is freed.
+    pub fn trailingBytes(self: *const StringData) usize {
+        return if (self.inCell()) self.bytes.len else 0;
+    }
+
+    /// Whether the bytes are the ones after the string's own cell, which go with it.
+    fn inCell(self: *const StringData) bool {
+        const cell: *const StringRef.Cell = @alignCast(@fieldParentPtr("data", self));
+        return self.bytes.ptr == @as([*]const u8, @ptrCast(cell)) + @sizeOf(StringRef.Cell);
+    }
+
     pub fn gcFinalize(self: *StringData, a: std.mem.Allocator) void {
-        a.free(self.bytes);
+        if (!self.inCell()) a.free(self.bytes);
+    }
+    pub fn gcNeedsFinalize(self: *const StringData) bool {
+        return self.bytes.len != 0 and !self.inCell();
     }
     pub fn deinit(self: *StringData, a: std.mem.Allocator) void {
-        a.free(self.bytes);
+        if (!self.inCell()) a.free(self.bytes);
     }
     pub fn gcExternalBytes(self: *const StringData) usize {
-        return self.bytes.len;
+        return if (self.inCell()) 0 else self.bytes.len;
     }
 };
 
@@ -192,9 +213,32 @@ pub const SbMemo = struct {
     u16_pos: usize = 0,
     byte_pos: usize = 0,
 };
-threadlocal var sb_memo: SbMemo = .{};
+/// Per thread, the owner's an ordinary global (`tls_fast`): a builder append
+/// reads it a few times.
+const sb_memo_tls = tls_fast.PerThread(SbMemo);
+
+/// A builder whose header word (`GcHeader.gc_aux`) equals its length in bytes is ASCII
+/// throughout, so that length is its length in UTF-16 units with no scan and no
+/// memo. An ASCII append to such a builder keeps it so, and a length that scanned
+/// sets it; every other change forgets it (`sbMemoInvalidate`). An empty builder
+/// starts known.
+const sb_unknown: u32 = std.math.maxInt(u32);
+
+/// The builder at `cell`'s length when its bytes are known ASCII.
+pub inline fn sbAsciiLen(cell: usize, len: usize) ?usize {
+    const h: *const objcell.gc.GcHeader = @ptrFromInt(cell);
+    if (len >= sb_unknown or @atomicLoad(u32, &h.gc_aux, .monotonic) != len) return null;
+    return len;
+}
+
+inline fn sbSetAscii(cell: usize, len: usize) void {
+    const h: *objcell.gc.GcHeader = @ptrFromInt(cell);
+    @atomicStore(u32, &h.gc_aux, if (len < sb_unknown) @intCast(len) else sb_unknown, .monotonic);
+}
 
 pub fn sbMemoInvalidate(cell: usize) void {
+    sbSetAscii(cell, sb_unknown);
+    const sb_memo = sb_memo_tls.get();
     if (sb_memo.cell == cell) sb_memo.cell = 0;
 }
 
@@ -204,17 +248,25 @@ pub fn sbMemoInvalidate(cell: usize) void {
 /// position is unmoved. A memo of another builder, or of the buffer as it
 /// was before some other change, is dropped.
 pub fn sbMemoAppended(cell: usize, before_ptr: [*]const u8, before_len: usize, after: []const u8, piece: []const u8) void {
-    if (sb_memo.cell != cell) return;
-    if (sb_memo.ptr != before_ptr or sb_memo.len != before_len) {
-        sb_memo.cell = 0;
-        return;
-    }
     var ascii = true;
     for (piece) |b| {
         if (b >= 0x80) {
             ascii = false;
             break;
         }
+    }
+    if (ascii and sbAsciiLen(cell, before_len) != null) {
+        // Known ASCII answers the length; a memo left behind no longer
+        // matches the buffer, so it is not read again.
+        sbSetAscii(cell, after.len);
+        return;
+    }
+    sbSetAscii(cell, sb_unknown);
+    const sb_memo = sb_memo_tls.get();
+    if (sb_memo.cell != cell) return;
+    if (sb_memo.ptr != before_ptr or sb_memo.len != before_len) {
+        sb_memo.cell = 0;
+        return;
     }
     sb_memo.ptr = after.ptr;
     sb_memo.len = after.len;
@@ -223,7 +275,8 @@ pub fn sbMemoAppended(cell: usize, before_ptr: [*]const u8, before_len: usize, a
 }
 
 pub fn sbMemoFor(cell: usize, items: []const u8) *SbMemo {
-    if (sb_memo.cell == cell and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return &sb_memo;
+    const sb_memo = sb_memo_tls.get();
+    if (sb_memo.cell == cell and sb_memo.ptr == items.ptr and sb_memo.len == items.len) return sb_memo;
     var ascii = true;
     for (items) |b| {
         if (b >= 0x80) {
@@ -231,14 +284,85 @@ pub fn sbMemoFor(cell: usize, items: []const u8) *SbMemo {
             break;
         }
     }
-    sb_memo = .{
+    if (ascii) sbSetAscii(cell, items.len);
+    sb_memo.* = .{
         .cell = cell,
         .ptr = items.ptr,
         .len = items.len,
         .ascii = ascii,
         .u16_len = if (ascii) items.len else sbCharCount(items),
     };
-    return &sb_memo;
+    return sb_memo;
+}
+
+const decimal_pairs = blk: {
+    var t: [200]u8 = undefined;
+    for (0..100) |i| {
+        t[2 * i] = '0' + @as(u8, @intCast(i / 10));
+        t[2 * i + 1] = '0' + @as(u8, @intCast(i % 10));
+    }
+    break :blk t;
+};
+
+/// `x` in decimal, as `toString` writes it, at the end of `buf`: two digits a
+/// division.
+pub fn decimal(buf: *[20]u8, x: i64) []const u8 {
+    var u: u64 = if (x < 0) 0 -% @as(u64, @bitCast(x)) else @intCast(x);
+    var i: usize = buf.len;
+    while (u >= 100) {
+        const r: usize = @intCast(u % 100);
+        u /= 100;
+        i -= 2;
+        buf[i..][0..2].* = decimal_pairs[2 * r ..][0..2].*;
+    }
+    if (u >= 10) {
+        i -= 2;
+        buf[i..][0..2].* = decimal_pairs[2 * u ..][0..2].*;
+    } else {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @intCast(u));
+    }
+    if (x < 0) {
+        i -= 1;
+        buf[i] = '-';
+    }
+    return buf[i..];
+}
+
+test "decimal writes every Long as toString does" {
+    var buf: [20]u8 = undefined;
+    for ([_]i64{ 0, 7, -7, 10, 99, 100, -100, 12345, std.math.maxInt(i32), std.math.minInt(i32), std.math.maxInt(i64), std.math.minInt(i64) }) |x| {
+        var want: [24]u8 = undefined;
+        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{d}", .{x}), decimal(&buf, x));
+    }
+}
+
+test "a builder appended only ASCII is known ASCII at its length, and any other change forgets it" {
+    const a = testing.allocator;
+    const sb = try ObjRef(std.ArrayList(u8)).init(a, .empty);
+    defer sb.deinit();
+    const cell = @intFromPtr(sb.cell);
+    const buf = &sb.cell.data;
+    try testing.expectEqual(@as(?usize, 0), sbAsciiLen(cell, 0));
+    for ([_][]const u8{ "ab", "cde" }) |piece| {
+        const before_ptr = buf.items.ptr;
+        const before_len = buf.items.len;
+        try buf.appendSlice(a, piece);
+        sbMemoAppended(cell, before_ptr, before_len, buf.items, piece);
+    }
+    try testing.expectEqual(@as(?usize, 5), sbAsciiLen(cell, buf.items.len));
+    // A non-ASCII piece: the length is the memo's to count.
+    const before_len = buf.items.len;
+    try buf.appendSlice(a, "é");
+    sbMemoAppended(cell, buf.items.ptr, before_len, buf.items, "é");
+    try testing.expect(sbAsciiLen(cell, buf.items.len) == null);
+    try testing.expectEqual(@as(usize, 6), sbMemoFor(cell, buf.items).u16_len);
+    // Back to ASCII by a change the memo is told of; a count of it knows it again.
+    sbMemoInvalidate(cell);
+    buf.shrinkRetainingCapacity(2);
+    try testing.expect(sbAsciiLen(cell, buf.items.len) == null);
+    try testing.expectEqual(@as(usize, 2), sbMemoFor(cell, buf.items).u16_len);
+    try testing.expectEqual(@as(?usize, 2), sbAsciiLen(cell, buf.items.len));
 }
 
 /// The builder's length in UTF-16 code units.
@@ -315,12 +439,26 @@ pub fn strMeta(bytes: []const u8) struct { u16_len: u32, ascii: bool } {
     return .{ .u16_len = n, .ascii = false };
 }
 
-/// Under the GC and reclaim backends the cell owns a private copy of `bytes`;
-/// under the pure arena the slice is adopted as-is.
+/// A string of `len` bytes after its cell, in one allocation, for the caller to write, with
+/// its UTF-16 length and whether it is ASCII, before any other thread can see it.
+pub fn strInitTrailing(allocator: std.mem.Allocator, len: usize) std.mem.Allocator.Error!StringRef {
+    return StringRef.initTrailing(allocator, .{ .bytes = &.{}, .u16_len = 0, .ascii = true }, len);
+}
+
+/// Under the GC and reclaim backends the cell owns a private copy of `bytes`, after it in the
+/// same allocation; under the pure arena the slice is adopted as-is.
 pub fn strInit(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
-    const owned = if (objcell.reclaimEnabled() or objcell.gc.gc_enabled) try allocator.dupe(u8, bytes) else bytes;
-    const m = strMeta(owned);
-    return StringRef.initOwned(allocator, .{ .bytes = owned, .u16_len = m.u16_len, .ascii = m.ascii });
+    if (objcell.reclaimEnabled() or objcell.gc.gc_enabled) {
+        const ref = try strInitTrailing(allocator, bytes.len);
+        const d = ref.asPtr();
+        @memcpy(@constCast(d.bytes), bytes);
+        const m = strMeta(bytes);
+        d.u16_len = m.u16_len;
+        d.ascii = m.ascii;
+        return ref;
+    }
+    const m = strMeta(bytes);
+    return StringRef.initOwned(allocator, .{ .bytes = bytes, .u16_len = m.u16_len, .ascii = m.ascii });
 }
 
 pub fn strInitOwned(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
@@ -369,6 +507,29 @@ pub const IrClosureData = struct {
     /// slot only into that table, never into a later program's. 0 names none.
     table: u64 = 0,
     captures: []Value,
+    /// The record of the function literal or reference the closure was made from, shared
+    /// by every closure of it and held by the program; null for a closure whose table
+    /// slot holds its record.
+    body: ?*const anyopaque = null,
+
+    /// A closure made in one allocation keeps its captures after its cell
+    /// (`IrClosureRef.initTrailing`).
+    pub const Trailing = Value;
+
+    pub fn adoptTrailing(self: *IrClosureData, elems: []Value) void {
+        self.captures = elems;
+    }
+
+    /// Whether the captures are the ones after the closure's own cell, which go with it.
+    fn inCell(self: *const IrClosureData) bool {
+        const cell: *const IrClosureRef.Cell = @alignCast(@fieldParentPtr("data", self));
+        return @intFromPtr(self.captures.ptr) == @intFromPtr(cell) + @sizeOf(IrClosureRef.Cell);
+    }
+
+    /// The captures after the cell that go with it when it is freed.
+    pub fn trailingBytes(self: *const IrClosureData) usize {
+        return if (self.inCell()) self.captures.len * @sizeOf(Value) else 0;
+    }
 
     /// Without this hook the captures read as a leaf and are swept while live.
     pub fn gcTrace(self: *const IrClosureData, m: *objcell.gc.Marker) void {
@@ -377,7 +538,11 @@ pub const IrClosureData = struct {
 
     pub fn gcFinalize(self: *IrClosureData, a: std.mem.Allocator) void {
         if (closureReleaseHook) |f| f(self.table, self.id);
-        a.free(self.captures);
+        if (!self.inCell()) a.free(self.captures);
+    }
+    /// A closure over a function literal's record holds no table slot.
+    pub fn gcNeedsFinalize(self: *const IrClosureData) bool {
+        return self.table != 0 or (self.captures.len != 0 and !self.inCell());
     }
 };
 pub const IrClosureRef = ObjRef(IrClosureData);
@@ -399,30 +564,35 @@ pub const MapPair = struct {
 /// positions. `hashes[i]` is the hash of `pairs[i].key` for each entry below
 /// `hashes.len`: `keyHash` for a simple key, else the hash the host gave for
 /// it (an instance's `hashCode()`), taken once as a `HashMap` node keeps it.
-/// Entries past it are hashed on the next lookup that needs them. `head` maps
-/// a hash to one past the newest indexed entry with it and `chain[i]` links
-/// entry `i` to one past the next older one, 0 ending the bucket; they cover
-/// the first `chain.len` hashes and are rebuilt from `hashes` after a removal.
-/// Maps below `index_threshold` are scanned instead.
+/// Entries past it are hashed on the next lookup that needs them. `buckets`,
+/// a power of two long, maps a hash's low bits to one past the newest indexed
+/// entry whose hash has them, and `chain[i]` links entry `i` to one past the
+/// next older one in its bucket, 0 ending it; a lookup compares the stored
+/// hash before the key. They cover the first `chain.len` hashes. Maps below
+/// `index_threshold` are scanned instead.
 pub const MapStore = struct {
     pairs: std.ArrayList(MapPair) = .empty,
     hashes: std.ArrayList(u64) = .empty,
-    head: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    buckets: []u32 = &.{},
     chain: std.ArrayList(u32) = .empty,
     /// A key neither `keyHash` nor the host can hash (a lambda): lookups scan
     /// until the map is cleared.
     unhashable: bool = false,
     /// Structural-modification counter for fail-fast iteration, shared with
     /// every `keys`, `values` and `entries` view. Null for a read-only map.
-    mod_count: objcell.OptRef(u64) = .{},
+    mod_count: objcell.OptRef(ModCount) = .{},
 
     /// Below this count a linear scan beats a hash table, so no index is built.
     pub const index_threshold: usize = 16;
 
+    /// Writers turn the cell's sequence, so a lookup takes no lock
+    /// (`lookupNoLock`).
+    pub const objref_sequenced = true;
+
     pub fn deinit(self: *MapStore, a: std.mem.Allocator) void {
         self.pairs.deinit(a);
         self.hashes.deinit(a);
-        self.head.deinit(a);
+        a.free(self.buckets);
         self.chain.deinit(a);
         if (self.mod_count.get()) |mc| mc.deinit();
     }
@@ -434,74 +604,52 @@ pub const MapStore = struct {
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
         for (self.pairs.items) |*kv| kv.gcTrace(m);
         if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+        // The lines of the arrays the region holds (`gc.buffer_allocator`).
+        m.markBuffer(@intFromPtr(self.pairs.items.ptr), self.pairs.capacity * @sizeOf(MapPair));
+        m.markBuffer(@intFromPtr(self.hashes.items.ptr), self.hashes.capacity * @sizeOf(u64));
+        m.markBuffer(@intFromPtr(self.chain.items.ptr), self.chain.capacity * @sizeOf(u32));
+        m.markBuffer(@intFromPtr(self.buckets.ptr), self.buckets.len * @sizeOf(u32));
     }
 
     /// Consistent with `Value.structuralEqBoxed`: equal keys hash equal, and
     /// the type tag is mixed in so `5` and `5L` differ. Null for a key that is
     /// not simple-hashable, which only the host can hash.
     pub fn keyHash(k: *const Value) ?u64 {
-        var h = std.hash.Wyhash.init(0);
-        switch (k.*) {
-            .Int => |x| {
-                h.update("i");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Long => |x| {
-                h.update("l");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Short => |x| {
-                h.update("s");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Byte => |x| {
-                h.update("b");
-                h.update(std.mem.asBytes(&x));
-            },
-            .UInt => |x| {
-                h.update("ui");
-                h.update(std.mem.asBytes(&x));
-            },
-            .ULong => |x| {
-                h.update("ul");
-                h.update(std.mem.asBytes(&x));
-            },
-            .UShort => |x| {
-                h.update("us");
-                h.update(std.mem.asBytes(&x));
-            },
-            .UByte => |x| {
-                h.update("ub");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Bool => |x| {
-                h.update("o");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Char => |x| {
-                h.update("c");
-                h.update(std.mem.asBytes(&x));
-            },
-            .Double => |x| {
-                h.update("d");
-                const bits: u64 = @bitCast(x);
-                h.update(std.mem.asBytes(&bits));
-            },
-            .Float => |x| {
-                h.update("f");
-                const bits: u32 = @bitCast(x);
-                h.update(std.mem.asBytes(&bits));
-            },
-            .String => |sref| {
-                h.update("S");
+        return switch (k.*) {
+            .Int => |x| intHash(x),
+            .Long => |x| mixKey(2, @bitCast(x)),
+            .Short => |x| mixKey(3, @as(u16, @bitCast(x))),
+            .Byte => |x| mixKey(4, @as(u8, @bitCast(x))),
+            .UInt => |x| mixKey(5, x),
+            .ULong => |x| mixKey(6, x),
+            .UShort => |x| mixKey(7, x),
+            .UByte => |x| mixKey(8, x),
+            .Bool => |x| mixKey(9, @intFromBool(x)),
+            .Char => |x| mixKey(10, x),
+            .Double => |x| mixKey(11, @bitCast(x)),
+            .Float => |x| mixKey(12, @as(u32, @bitCast(x))),
+            .Null => mixKey(13, 0),
+            .String => |sref| blk: {
                 const sg = sref.borrow();
                 defer sg.deinit();
-                h.update(sg.get().bytes);
+                break :blk std.hash.Wyhash.hash(14, sg.get().bytes);
             },
-            .Null => h.update("z"),
-            else => return null,
-        }
-        return h.final();
+            else => null,
+        };
+    }
+
+    /// An Int key's hash, as `keyHash` answers it.
+    pub inline fn intHash(x: i32) u64 {
+        return mixKey(1, @as(u32, @bitCast(x)));
+    }
+
+    /// A scalar key's hash: its bits and its kind, mixed (splitmix64's
+    /// finalizer), so an Int and a Long of one value land apart.
+    inline fn mixKey(kind: u64, bits: u64) u64 {
+        var z = bits ^ (kind << 56) ^ 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
     }
 
     fn linearFind(self: *const MapStore, key: *const Value) ?usize {
@@ -537,16 +685,15 @@ pub const MapStore = struct {
         const next = self.chain.items[i];
         // A bucket runs from its newest entry to its oldest, so what links
         // to `i` is newer than it.
-        if (self.head.getPtr(h)) |first| {
-            if (first.* == pos) {
-                if (next == 0) _ = self.head.remove(h) else first.* = next;
-            } else {
-                var slot = first.*;
-                while (slot != 0) : (slot = self.chain.items[slot - 1]) {
-                    if (self.chain.items[slot - 1] == pos) {
-                        self.chain.items[slot - 1] = next;
-                        break;
-                    }
+        const first = &self.buckets[h & (self.buckets.len - 1)];
+        if (first.* == pos) {
+            first.* = next;
+        } else {
+            var slot = first.*;
+            while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+                if (self.chain.items[slot - 1] == pos) {
+                    self.chain.items[slot - 1] = next;
+                    break;
                 }
             }
         }
@@ -554,9 +701,8 @@ pub const MapStore = struct {
         for (self.chain.items) |*c| {
             if (c.* > pos) c.* -= 1;
         }
-        var it = self.head.valueIterator();
-        while (it.next()) |v| {
-            if (v.* > pos) v.* -= 1;
+        for (self.buckets) |*b| {
+            if (b.* > pos) b.* -= 1;
         }
         return kv;
     }
@@ -571,7 +717,7 @@ pub const MapStore = struct {
     /// through the index hashes them again.
     pub fn forgetHashes(self: *MapStore) void {
         self.hashes.clearRetainingCapacity();
-        self.head.clearRetainingCapacity();
+        @memset(self.buckets, 0);
         self.chain.clearRetainingCapacity();
         self.unhashable = false;
     }
@@ -589,24 +735,66 @@ pub const MapStore = struct {
         return true;
     }
 
-    /// The positions of the hashed entries whose hash is `h`, oldest first.
-    pub fn bucketOf(self: *MapStore, a: std.mem.Allocator, h: u64, out: *std.ArrayList(u32)) std.mem.Allocator.Error!void {
+    /// The positions of the hashed entries whose hash is `h`, oldest first, into `out`,
+    /// which grows through `out_a`; the map's index grows through `a`.
+    pub fn bucketOf(self: *MapStore, a: std.mem.Allocator, h: u64, out: *std.ArrayList(u32), out_a: std.mem.Allocator) std.mem.Allocator.Error!void {
         try self.indexHashed(a);
-        var slot = self.head.get(h) orelse 0;
-        while (slot != 0) : (slot = self.chain.items[slot - 1]) try out.append(a, slot - 1);
+        var slot = self.bucketHead(h);
+        while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+            if (self.hashes.items[slot - 1] == h) try out.append(out_a, slot - 1);
+        }
         std.mem.reverse(u32, out.items);
     }
 
+    /// One past the newest indexed entry in `h`'s bucket, 0 for none; `chain`
+    /// gives each next older one. Their hashes share `h`'s low bits only.
+    pub inline fn bucketHead(self: *const MapStore, h: u64) u32 {
+        if (self.buckets.len == 0) return 0;
+        return self.buckets[h & (self.buckets.len - 1)];
+    }
+
+    /// Entry `i`, the next to index, into its bucket: the buckets double first
+    /// when they would hold more than three entries for every four of them,
+    /// and every indexed entry is put in its new bucket again.
     fn bucket(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
-        const gop = try self.head.getOrPut(a, self.hashes.items[i]);
-        try self.chain.append(a, if (gop.found_existing) gop.value_ptr.* else 0);
-        gop.value_ptr.* = @intCast(i + 1);
+        try self.chain.ensureUnusedCapacity(a, 1);
+        if ((i + 1) * 4 > self.buckets.len * 3) {
+            const n = @max(64, std.math.ceilPowerOfTwoAssert(usize, (i + 1) * 2));
+            const grown = try a.alloc(u32, n);
+            a.free(self.buckets);
+            self.buckets = grown;
+            @memset(self.buckets, 0);
+            for (self.hashes.items[0..i], 0..) |h, j| {
+                const b = &self.buckets[h & (n - 1)];
+                self.chain.items[j] = b.*;
+                b.* = @intCast(j + 1);
+            }
+        }
+        const b = &self.buckets[self.hashes.items[i] & (self.buckets.len - 1)];
+        self.chain.appendAssumeCapacity(b.*);
+        b.* = @intCast(i + 1);
     }
 
     /// Puts every hashed entry in its bucket.
     fn indexHashed(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
         try self.chain.ensureTotalCapacity(a, self.hashes.items.len);
         while (self.chain.items.len < self.hashes.items.len) try self.bucket(a, self.chain.items.len);
+    }
+
+    /// The entry whose key equals `key`, as `find` answers it, reading only:
+    /// null when the buckets do not index every entry or the key has no hash,
+    /// and `find` must run.
+    pub fn findIndexed(self: *const MapStore, key: *const Value) ?(?usize) {
+        const n = self.pairs.items.len;
+        if (self.unhashable or n < index_threshold or self.hashes.items.len != n or self.chain.items.len != n) return null;
+        const hsh = keyHash(key) orelse return null;
+        var slot = self.bucketHead(hsh);
+        while (slot != 0) {
+            const i = slot - 1;
+            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
+            slot = self.chain.items[i];
+        }
+        return @as(?usize, null);
     }
 
     /// The entry whose key equals `key` structurally: through the buckets
@@ -620,10 +808,10 @@ pub const MapStore = struct {
             try self.hashes.append(a, kh);
         }
         try self.indexHashed(a);
-        var slot = self.head.get(hsh) orelse 0;
+        var slot = self.bucketHead(hsh);
         while (slot != 0) {
             const i = slot - 1;
-            if (Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
+            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
             slot = self.chain.items[i];
         }
         const from = self.hashes.items.len;
@@ -644,6 +832,105 @@ pub const RangeIterState = struct {
 };
 
 pub const MapEntries = ObjRef(MapStore);
+
+/// The value of the entry whose stored hash is `hsh` and whose key `eq(ctx, key)` says
+/// is the one looked up, read with no lock where `objcell.lockfree_reads` holds, in a
+/// map whose every entry is in its index. The store's arrays are read between two
+/// equal even readings of its write sequence, and each candidate entry again before
+/// `eq` looks through its key, so `eq` only sees an entry the map held; arrays a writer
+/// replaced stay mapped until a stop, which no lookup spans. Null when a writer
+/// overlapped the read, the map is not all indexed, or `eq` gives up (null), which
+/// sends the lookup to the lock; `.Null` when no entry matches. An `eq` that
+/// dereferences nothing (`derefs` false) compares a candidate as read, the last
+/// reading of the sequence vouching for what it answered.
+pub fn lookupNoLock(entries: MapEntries, hsh: u64, ctx: anytype, comptime eq: fn (@TypeOf(ctx), *const Value) ?bool, comptime derefs: bool) ?Value {
+    const cell = entries.cell;
+    const seq = &cell.lock.seq;
+    const before = seq.load(.acquire);
+    if (before & 1 != 0) return null;
+    const st = &cell.data;
+    const pairs = sliceWords(&st.pairs.items);
+    const hashes = sliceWords(&st.hashes.items);
+    const buckets = sliceWords(&st.buckets);
+    const chain = sliceWords(&st.chain.items);
+    const unhashable = @atomicLoad(bool, &st.unhashable, .monotonic);
+    objcell.loadFence();
+    if (seq.load(.monotonic) != before) return null;
+    const n = pairs[1];
+    if (unhashable or n < MapStore.index_threshold or hashes[1] != n or chain[1] != n or buckets[1] == 0) return null;
+    const pair_at: [*]const MapPair = @ptrFromInt(pairs[0]);
+    const hash_at: [*]const u64 = @ptrFromInt(hashes[0]);
+    const chain_at: [*]const u32 = @ptrFromInt(chain[0]);
+    const bucket_at: [*]const u32 = @ptrFromInt(buckets[0]);
+    var slot: usize = @atomicLoad(u32, &bucket_at[@intCast(hsh & (buckets[1] - 1))], .monotonic);
+    var steps: usize = 0;
+    while (slot != 0) : (steps += 1) {
+        // Past the entries, or a chain longer than they are: arrays a writer replaced.
+        if (slot > n or steps > n) return null;
+        const i = slot - 1;
+        if (@atomicLoad(u64, &hash_at[i], .monotonic) == hsh) {
+            const words: *const [4]u64 = @ptrCast(&pair_at[i]);
+            var kv: MapPair = undefined;
+            const out: *[4]u64 = @ptrCast(&kv);
+            inline for (0..4) |w| out[w] = @atomicLoad(u64, &words[w], .monotonic);
+            if (derefs) {
+                objcell.loadFence();
+                if (seq.load(.monotonic) != before) return null;
+            }
+            if (eq(ctx, &kv.key)) |same| {
+                if (same) {
+                    if (!derefs) {
+                        objcell.loadFence();
+                        if (seq.load(.monotonic) != before) return null;
+                    }
+                    return kv.value;
+                }
+            } else return null;
+        }
+        slot = @atomicLoad(u32, &chain_at[i], .monotonic);
+    }
+    objcell.loadFence();
+    if (seq.load(.monotonic) != before) return null;
+    return .Null;
+}
+
+/// `lookupNoLock` of Int key `x`: its hash and its compare in line, the rest of a
+/// numeric key's lookup.
+pub fn lookupIntNoLock(entries: MapEntries, x: i32) ?Value {
+    const Eq = struct {
+        fn eq(want: i32, k: *const Value) ?bool {
+            if (k.* == .Int) return k.Int == want;
+            return if (k.isNumeric()) false else null;
+        }
+    };
+    return lookupNoLock(entries, MapStore.intHash(x), x, Eq.eq, false);
+}
+
+/// Whether stored key `k` equals the numeric `key` as `structuralEqBoxed`
+/// answers it, looking through neither: null where only it can say (a stored
+/// key of a kind that is no number).
+pub fn numericKeyEq(key: *const Value, k: *const Value) ?bool {
+    switch (key.*) {
+        .Double => |x| if (k.* == .Double) return (std.math.isNan(x) and std.math.isNan(k.Double)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(k.Double)),
+        .Float => |x| if (k.* == .Float) return (std.math.isNan(x) and std.math.isNan(k.Float)) or @as(u32, @bitCast(x)) == @as(u32, @bitCast(k.Float)),
+        .Int => |x| if (k.* == .Int) return x == k.Int,
+        .Long => |x| if (k.* == .Long) return x == k.Long,
+        .Short => |x| if (k.* == .Short) return x == k.Short,
+        .Byte => |x| if (k.* == .Byte) return x == k.Byte,
+        .UInt => |x| if (k.* == .UInt) return x == k.UInt,
+        .ULong => |x| if (k.* == .ULong) return x == k.ULong,
+        .UShort => |x| if (k.* == .UShort) return x == k.UShort,
+        .UByte => |x| if (k.* == .UByte) return x == k.UByte,
+        else => return null,
+    }
+    return if (k.isNumeric()) false else null;
+}
+
+/// A slice's pointer and length, each read whole.
+inline fn sliceWords(s: anytype) [2]usize {
+    const w: *const [2]usize = @ptrCast(s);
+    return .{ @atomicLoad(usize, &w[0], .monotonic), @atomicLoad(usize, &w[1], .monotonic) };
+}
 
 pub const MapData = struct {
     entries: MapEntries,
@@ -940,7 +1227,7 @@ pub const ListData = struct {
     declared_elem: ?[]const u8 = null,
     /// Structural-modification counter for fail-fast iteration, shared across
     /// every copy of the list value and the iterators it spawns.
-    mod_count: objcell.OptRef(u64) = .{},
+    mod_count: objcell.OptRef(ModCount) = .{},
 
     pub fn deinit(self: *ListData, allocator: std.mem.Allocator) void {
         Value.releaseValueList(self.items, allocator);
@@ -967,7 +1254,7 @@ pub const SetData = struct {
     backing: ?*CollBackingCell,
     /// See `ListData.declared_elem`.
     declared_elem: ?[]const u8 = null,
-    mod_count: objcell.OptRef(u64) = .{},
+    mod_count: objcell.OptRef(ModCount) = .{},
 
     pub fn deinit(self: *SetData, allocator: std.mem.Allocator) void {
         Value.releaseValueList(self.items, allocator);
@@ -1179,6 +1466,9 @@ pub const PrimitiveArrayKind = enum {
 pub const PrimBuf = struct {
     kind: PrimitiveArrayKind,
     bytes: std.ArrayList(u8) = .empty,
+    /// The bytes after the cell it was made with (`init`), which stay with
+    /// the cell after an append moves the elements out.
+    trailing: u32 = 0,
 
     pub fn len(self: *const PrimBuf) usize {
         return self.bytes.items.len / self.kind.elemSize();
@@ -1246,8 +1536,58 @@ pub const PrimBuf = struct {
 
     pub fn append(self: *PrimBuf, a: std.mem.Allocator, v: Value) std.mem.Allocator.Error!void {
         const es = self.kind.elemSize();
+        if (self.inCell()) {
+            // The elements after the cell cannot grow in place.
+            var moved: std.ArrayList(u8) = .empty;
+            try moved.ensureTotalCapacity(a, self.bytes.items.len + es);
+            moved.appendSliceAssumeCapacity(self.bytes.items);
+            self.bytes = moved;
+        }
         try self.bytes.appendNTimes(a, 0, es);
         self.set(self.len() - 1, v);
+    }
+
+    /// `n` zeroed elements of `kind` after the array's own cell, in one
+    /// allocation: a zeroed element is every primitive's default.
+    pub fn init(a: std.mem.Allocator, kind: PrimitiveArrayKind, n: usize) std.mem.Allocator.Error!ObjRef(PrimBuf) {
+        const r = try make(a, kind, n * kind.elemSize());
+        @memset(r.cell.data.bytes.items, 0);
+        return r;
+    }
+
+    /// `bytes` copied after the array's own cell.
+    pub fn initBytes(a: std.mem.Allocator, kind: PrimitiveArrayKind, bytes: []const u8) std.mem.Allocator.Error!ObjRef(PrimBuf) {
+        const r = try make(a, kind, bytes.len);
+        @memcpy(r.cell.data.bytes.items, bytes);
+        return r;
+    }
+
+    /// An array whose elements take `size` bytes, left undefined: after its
+    /// cell, or in a buffer of their own past what `trailing` counts.
+    fn make(a: std.mem.Allocator, kind: PrimitiveArrayKind, size: usize) std.mem.Allocator.Error!ObjRef(PrimBuf) {
+        if (size <= std.math.maxInt(u32)) return ObjRef(PrimBuf).initTrailing(a, .{ .kind = kind }, size);
+        var pb: PrimBuf = .{ .kind = kind };
+        try pb.bytes.resize(a, size);
+        errdefer pb.bytes.deinit(a);
+        return ObjRef(PrimBuf).initOwned(a, pb);
+    }
+
+    pub const Trailing = u8;
+
+    pub fn adoptTrailing(self: *PrimBuf, elems: []u8) void {
+        self.bytes = .{ .items = elems, .capacity = elems.len };
+        self.trailing = @intCast(elems.len);
+    }
+
+    /// Whether the elements are the ones after the array's own cell, which go with it.
+    fn inCell(self: *const PrimBuf) bool {
+        const Cell = ObjRef(PrimBuf).Cell;
+        const cell: *const Cell = @alignCast(@fieldParentPtr("data", self));
+        return self.bytes.capacity != 0 and @intFromPtr(self.bytes.items.ptr) == @intFromPtr(cell) + @sizeOf(Cell);
+    }
+
+    pub fn trailingBytes(self: *const PrimBuf) usize {
+        return self.trailing;
     }
 
     /// Scalars have no out-edges, so the payload is a leaf and mutable access
@@ -1258,14 +1598,17 @@ pub const PrimBuf = struct {
         _ = m;
     }
     pub fn gcFinalize(self: *PrimBuf, a: std.mem.Allocator) void {
-        self.bytes.deinit(a);
+        if (!self.inCell()) self.bytes.deinit(a);
+    }
+    pub fn gcNeedsFinalize(self: *const PrimBuf) bool {
+        return self.bytes.capacity != 0 and !self.inCell();
     }
     /// Bytes owned beyond the control block, for the collection threshold.
     pub fn gcExternalBytes(self: *const PrimBuf) usize {
-        return self.bytes.capacity;
+        return if (self.inCell()) 0 else self.bytes.capacity;
     }
     pub fn deinit(self: *PrimBuf, a: std.mem.Allocator) void {
-        self.bytes.deinit(a);
+        if (!self.inCell()) self.bytes.deinit(a);
     }
 };
 
@@ -1419,10 +1762,9 @@ pub const ArrayData = struct {
     }
 
     pub fn initPacked(a: std.mem.Allocator, kind: PrimitiveArrayKind, items: []const Value) std.mem.Allocator.Error!Value {
-        var pb = PrimBuf{ .kind = kind };
-        try pb.bytes.appendNTimes(a, 0, items.len * kind.elemSize());
-        for (items, 0..) |v, i| pb.set(i, v);
-        return .{ .Array = ArrayData.scalars(try ObjRef(PrimBuf).initOwned(a, pb), kind) };
+        const pb = try PrimBuf.init(a, kind, items.len);
+        for (items, 0..) |v, i| pb.cell.data.set(i, v);
+        return .{ .Array = ArrayData.scalars(pb, kind) };
     }
 
     pub fn fromBoxedList(vl: ValueList) Value {
@@ -1610,7 +1952,7 @@ pub const IterCursor = struct {
     /// Shared with the source: `next` and `hasNext` throw
     /// `ConcurrentModificationException` once it stops matching `exp_mod`, and
     /// the iterator's own `add` and `remove` resync it.
-    mod_count: objcell.OptRef(u64) = .{},
+    mod_count: objcell.OptRef(ModCount) = .{},
     /// True only when the iterator shares a mutable collection's backing, so
     /// `MutableIterator.remove` and the `MutableListIterator` writes reach the
     /// source. Kotlin throws `UnsupportedOperationException` otherwise.
@@ -2313,7 +2655,7 @@ pub const Value = union(enum) {
             .Class => |c| m.shade(&c.cell.hdr),
             // Keep the side-table's capture store and receiver chain alive. A
             // closure no live value marks never reaches here.
-            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtrConst().id, m),
+            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtrConst().id, c.asPtrConst().body, m),
             else => {},
         }
     }
@@ -2403,7 +2745,7 @@ pub const Value = union(enum) {
             // The closure cell owns its captures: release each element, then
             // drop the cell, whose finalize frees the slice.
             .IrClosure => |c| {
-                if (c.cell.refcount.load(.monotonic) == 1) {
+                if (c.strongCount() == 1) {
                     const g = c.borrow();
                     for (g.get().captures) |*e| e.release(allocator);
                     g.deinit();
@@ -2413,7 +2755,7 @@ pub const Value = union(enum) {
             .Comparator => |c| comparatorRefOf(c).deinit(),
             .List => |x| {
                 if (objcell.envSetOnce("KLIO_BOXDIE_TRACE") and x.backing != null and
-                    listRefOf(x).cell.refcount.load(.monotonic) == 1)
+                    listRefOf(x).strongCount() == 1)
                 {
                     std.debug.print("\n[boxdie] view List box dying (backing={s})\n", .{@tagName(x.backing.?.data)});
                     trace_mod.dumpCurrent(.{});
@@ -3068,8 +3410,8 @@ pub const Value = union(enum) {
                 // A non-capturing lambda literal is a singleton in Kotlin, but
                 // klio gives each evaluation its own closure id.
                 if (objcell.gc.closureSingletonHook) |h| {
-                    const sa = h(x.asPtrConst().id);
-                    if (sa != 0 and sa == h(b.IrClosure.asPtrConst().id)) break :blk true;
+                    const sa = h(x.asPtrConst().id, x.asPtrConst().body);
+                    if (sa != 0 and sa == h(b.IrClosure.asPtrConst().id, b.IrClosure.asPtrConst().body)) break :blk true;
                 }
                 break :blk false;
             },
@@ -3199,7 +3541,7 @@ pub const Value = union(enum) {
                 }
             },
             .IrClosure => |c| {
-                if (objcell.gc.closureTextHook) |h| if (try h(c.asPtrConst().id, writer)) return;
+                if (objcell.gc.closureTextHook) |h| if (try h(c.asPtrConst().id, c.asPtrConst().body, writer)) return;
                 try writer.print("{{ir-closure#{d}}}", .{c.asPtrConst().id});
             },
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
@@ -3367,11 +3709,7 @@ pub const Value = union(enum) {
         const cell = self.List.backing orelse return false;
         if (cell.data != .sublist) return false;
         const mc = self.List.mod_count.get() orelse return false;
-        const cur = blk: {
-            const g = mc.borrow();
-            defer g.deinit();
-            break :blk g.get().*;
-        };
+        const cur = mc.cell.data.load();
         return (cur & ~FROZEN_MOD_BIT) != (cell.data.sublist.exp_mod & ~FROZEN_MOD_BIT);
     }
 
@@ -3412,6 +3750,36 @@ pub const ComparatorStep = struct {
 /// views at `build()`. Masked out of comparisons, so a leaked but unmodified
 /// builder view still reads.
 pub const FROZEN_MOD_BIT: u64 = 1 << 63;
+
+/// A collection's count of structural changes, shared with its iterators and
+/// views so they fail fast (`FROZEN_MOD_BIT` marks one a builder froze). Read
+/// and changed with atomics alone, so it takes no lock.
+pub const ModCount = struct {
+    n: std.atomic.Value(u64) = .init(0),
+
+    pub const objref_atomic = true;
+
+    pub fn new(a: std.mem.Allocator) std.mem.Allocator.Error!ModCountRef {
+        return ModCountRef.init(a, .{});
+    }
+
+    pub inline fn load(self: *const ModCount) u64 {
+        return self.n.load(.monotonic);
+    }
+
+    pub inline fn bump(self: *ModCount) void {
+        _ = self.n.fetchAdd(1, .monotonic);
+    }
+
+    pub inline fn freeze(self: *ModCount) void {
+        _ = self.n.fetchOr(FROZEN_MOD_BIT, .monotonic);
+    }
+
+    pub inline fn frozen(self: *const ModCount) bool {
+        return self.load() & FROZEN_MOD_BIT != 0;
+    }
+};
+pub const ModCountRef = ObjRef(ModCount);
 
 /// Refreshes the parent view first, so a root write shows through a whole
 /// `subList().subList()` chain. Structural growth flows the other way.
@@ -3489,7 +3857,7 @@ fn writeInstance(writer: *std.Io.Writer, inst_ref: ObjRef(InstanceData)) std.Io.
         try writer.writeByte(')');
         return;
     }
-    try writer.print("{s}@{x}", .{ cls.fqn, inst.identity });
+    try writer.print("{s}@{x}", .{ cls.fqn, inst.identityOf() });
 }
 
 fn writeFloat64(writer: *std.Io.Writer, v: f64) std.Io.Writer.Error!void {
@@ -3919,7 +4287,7 @@ test "a map hashes a host-hashed key only when given its hash" {
     try std.testing.expect(!try m.addHashes(a, 20, &.{7}));
     var at: std.ArrayList(u32) = .empty;
     defer at.deinit(a);
-    try m.bucketOf(a, 7, &at);
+    try m.bucketOf(a, 7, &at, a);
     try std.testing.expectEqualSlices(u32, &.{20}, at.items);
     try std.testing.expectEqual(@as(?usize, 21), try m.find(a, &Value.newInt(20)));
 }
@@ -4024,3 +4392,319 @@ test "value layout census" {
 
 
 
+
+test "a string made in one allocation keeps its bytes in its cell and frees them with it" {
+    const ref = try strInitTrailing(std.testing.allocator, 5);
+    const d = ref.asPtr();
+    @memcpy(@constCast(d.bytes), "hello");
+    try std.testing.expect(d.inCell());
+    try std.testing.expectEqual(@as(usize, 5), d.trailingBytes());
+    try std.testing.expectEqual(@as(usize, 0), d.gcExternalBytes());
+    ref.deinit();
+    // One whose bytes were allocated apart frees them apart.
+    const apart = try StringRef.initOwned(std.testing.allocator, .{ .bytes = try std.testing.allocator.dupe(u8, "abc"), .u16_len = 3, .ascii = true });
+    try std.testing.expect(!apart.asPtr().inCell());
+    try std.testing.expectEqual(@as(usize, 3), apart.asPtr().gcExternalBytes());
+    apart.deinit();
+}
+
+test "a primitive array made in one allocation keeps its elements in its cell and needs no finalizer" {
+    const a = std.testing.allocator;
+    const pb = try PrimBuf.init(a, .Int, 4);
+    try std.testing.expect(pb.asPtrConst().inCell());
+    try std.testing.expectEqual(@as(usize, 16), pb.asPtrConst().trailingBytes());
+    try std.testing.expectEqual(@as(usize, 0), pb.asPtrConst().gcExternalBytes());
+    try std.testing.expect(!pb.asPtrConst().gcNeedsFinalize());
+    for (0..4) |i| try std.testing.expectEqual(@as(i32, 0), pb.asPtrConst().get(i).Int);
+    pb.asPtr().set(3, .{ .Int = -9 });
+    // An append moves the elements out of the cell, and they are freed apart.
+    try pb.asPtr().append(a, .{ .Int = 5 });
+    try std.testing.expect(!pb.asPtrConst().inCell());
+    try std.testing.expect(pb.asPtrConst().gcNeedsFinalize());
+    try std.testing.expectEqual(@as(usize, 5), pb.asPtrConst().len());
+    try std.testing.expectEqual(@as(i32, -9), pb.asPtrConst().get(3).Int);
+    try std.testing.expectEqual(@as(i32, 5), pb.asPtrConst().get(4).Int);
+    pb.deinit();
+    const bytes = try PrimBuf.initBytes(a, .Byte, "xyz");
+    try std.testing.expectEqualStrings("xyz", bytes.asPtrConst().bytes.items);
+    bytes.deinit();
+}
+
+test "a string or closure needs its finalizer only for what is outside its cell" {
+    const a = std.testing.allocator;
+    const s = try strInitTrailing(a, 2);
+    try std.testing.expect(!s.asPtrConst().gcNeedsFinalize());
+    s.deinit();
+    const apart = try StringRef.initOwned(a, .{ .bytes = try a.dupe(u8, "abc"), .u16_len = 3, .ascii = true });
+    try std.testing.expect(apart.asPtrConst().gcNeedsFinalize());
+    apart.deinit();
+    const rec = try IrClosureRef.initTrailing(a, .{ .id = 1, .captures = &.{}, .body = @ptrCast(&a) }, 1);
+    try std.testing.expect(!rec.asPtrConst().gcNeedsFinalize());
+    rec.deinit();
+    const slot = try IrClosureRef.initTrailing(a, .{ .id = 1, .table = 3, .captures = &.{} }, 0);
+    try std.testing.expect(slot.asPtrConst().gcNeedsFinalize());
+    slot.deinit();
+}
+
+test "a closure made in one allocation keeps its captures in its cell and frees them with it" {
+    const ref = try IrClosureRef.initTrailing(std.testing.allocator, .{ .id = 1, .captures = &.{} }, 2);
+    ref.cell.data.captures[0] = .{ .Int = 4 };
+    ref.cell.data.captures[1] = .Null;
+    try std.testing.expect(ref.asPtrConst().inCell());
+    try std.testing.expectEqual(@as(usize, 2 * @sizeOf(Value)), ref.asPtrConst().trailingBytes());
+    ref.deinit();
+    // One whose captures were allocated apart has none after its cell.
+    const caps = try std.testing.allocator.dupe(Value, &.{Value{ .Int = 1 }});
+    defer std.testing.allocator.free(caps);
+    const apart = try IrClosureRef.init(std.testing.allocator, .{ .id = 2, .captures = caps });
+    try std.testing.expect(!apart.asPtrConst().inCell());
+    try std.testing.expectEqual(@as(usize, 0), apart.asPtrConst().trailingBytes());
+    apart.deinit();
+}
+
+test "an Array element is read with no lock, and a reader overlapping a writer's turn is sent to the lock" {
+    const a = testing.allocator;
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendSlice(a, &.{ .{ .Int = 1 }, .{ .Int = 2 } });
+    const vl = try ValueList.init(a, list);
+    defer vl.deinit();
+    try testing.expectEqual(@as(i32, 2), vl.readAt(1).?.Int);
+    try testing.expect(vl.readAt(2) == null);
+    {
+        const g = vl.borrowMutAt(0);
+        defer g.deinit();
+        try testing.expectEqual(@as(u32, 1), vl.cell.lock.seq.load(.monotonic));
+        try testing.expect(vl.readAt(1) == null);
+        g.get().items[0] = .{ .Long = 5 };
+    }
+    try testing.expectEqual(@as(u32, 2), vl.cell.lock.seq.load(.monotonic));
+    try testing.expectEqual(@as(i64, 5), vl.readAt(0).?.Long);
+    // A shared borrow is no write: the sequence stays.
+    {
+        const g = vl.borrow();
+        defer g.deinit();
+        try testing.expectEqual(@as(i32, 2), vl.readAt(1).?.Int);
+    }
+    try testing.expectEqual(@as(u32, 2), vl.cell.lock.seq.load(.monotonic));
+}
+
+test "list reads with no lock racing writers that grow and free the buffer see only stored elements" {
+    const a = @import("slab.zig").allocator;
+    var list: std.ArrayList(Value) = .empty;
+    try list.append(a, .{ .Int = 0 });
+    const vl = try ValueList.init(a, list);
+    // Element i always holds i, whichever buffer holds it: a read of a freed
+    // buffer, or of a length paired with another buffer, would find otherwise.
+    const Race = struct {
+        vl: ValueList,
+        a: std.mem.Allocator,
+        stop: std.atomic.Value(bool) = .init(false),
+        wrong: std.atomic.Value(usize) = .init(0),
+        reads: std.atomic.Value(usize) = .init(0),
+        hits: std.atomic.Value(usize) = .init(0),
+
+        fn write(self: *@This()) void {
+            var n: usize = 0;
+            while (!self.stop.load(.monotonic)) : (n += 1) {
+                const g = self.vl.borrowMut();
+                defer g.deinit();
+                const items = g.get();
+                if (items.items.len >= 2 + n % 6) {
+                    items.clearAndFree(self.a);
+                } else {
+                    items.append(self.a, .{ .Int = @intCast(items.items.len) }) catch return;
+                }
+            }
+        }
+
+        fn read(self: *@This()) void {
+            var i: usize = 0;
+            while (!self.stop.load(.monotonic)) : (i += 1) {
+                _ = self.reads.fetchAdd(1, .monotonic);
+                const at = i % 8;
+                const v = self.vl.readAtMoving(at) orelse continue;
+                _ = self.hits.fetchAdd(1, .monotonic);
+                if (v != .Int or v.Int != @as(i32, @intCast(at))) _ = self.wrong.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var race: Race = .{ .vl = vl, .a = a };
+    var threads: [6]std.Thread = undefined;
+    threads[0] = try std.Thread.spawn(.{}, Race.write, .{&race});
+    for (threads[1..]) |*t| t.* = try std.Thread.spawn(.{}, Race.read, .{&race});
+    while (race.reads.load(.monotonic) < 2_000_000 or race.hits.load(.monotonic) < 100_000) std.atomic.spinLoopHint();
+    race.stop.store(true, .monotonic);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), race.wrong.load(.monotonic));
+    vl.cell.data.deinit(a);
+}
+
+fn testSameKey(key: *const Value, k: *const Value) ?bool {
+    return Value.structuralEqBoxed(k, key);
+}
+
+test "a map lookup with no lock finds an indexed entry, answers Null for a missing one, and leaves a writer's turn to the lock" {
+    const a = @import("slab.zig").allocator;
+    const entries = try MapEntries.init(a, .{});
+    defer entries.cell.data.deinit(a);
+    const st = &entries.cell.data;
+    var k: i32 = 0;
+    while (k < 40) : (k += 1) try st.append(a, .{ .key = .{ .Int = k }, .value = .{ .Int = k * 2 } });
+    const probe: Value = .{ .Int = 7 };
+    // Not yet indexed: the lock's lookup hashes the entries first.
+    try testing.expect(lookupNoLock(entries, MapStore.keyHash(&probe).?, &probe, testSameKey, true) == null);
+    _ = try st.find(a, &probe);
+    try testing.expectEqual(@as(i32, 14), lookupNoLock(entries, MapStore.keyHash(&probe).?, &probe, testSameKey, true).?.Int);
+    const absent: Value = .{ .Int = 99 };
+    try testing.expect(lookupNoLock(entries, MapStore.keyHash(&absent).?, &absent, testSameKey, true).? == .Null);
+    entries.cell.lock.seq.store(1, .monotonic);
+    try testing.expect(lookupNoLock(entries, MapStore.keyHash(&probe).?, &probe, testSameKey, true) == null);
+    entries.cell.lock.seq.store(0, .monotonic);
+}
+
+test "an Int key's lookup with no lock finds its entry, not a Long's of the same number, and answers Null for a missing one" {
+    const a = @import("slab.zig").allocator;
+    const entries = try MapEntries.init(a, .{});
+    defer entries.cell.data.deinit(a);
+    const st = &entries.cell.data;
+    var k: i32 = 0;
+    while (k < 40) : (k += 1) try st.append(a, .{ .key = .{ .Int = k }, .value = .{ .Int = k * 2 } });
+    try st.append(a, .{ .key = .{ .Long = 50 }, .value = .{ .Int = -1 } });
+    const probe: Value = .{ .Int = 7 };
+    _ = try st.find(a, &probe);
+    try testing.expectEqual(@as(i32, 14), lookupIntNoLock(entries, 7).?.Int);
+    try testing.expectEqual(@as(i32, 78), lookupIntNoLock(entries, 39).?.Int);
+    // `50L` is another key than `50`, as Kotlin's maps take them.
+    try testing.expect(lookupIntNoLock(entries, 50).? == .Null);
+    try testing.expect(lookupIntNoLock(entries, -3).? == .Null);
+    // A writer's turn: the lock's.
+    entries.cell.lock.seq.store(1, .monotonic);
+    try testing.expect(lookupIntNoLock(entries, 7) == null);
+    entries.cell.lock.seq.store(0, .monotonic);
+}
+
+test "map lookups with no lock racing a writer that grows, rehashes and frees see only stored values" {
+    // Candidates checked before their keys are compared, and after.
+    try raceMapLookups(true);
+    try raceMapLookups(false);
+}
+
+fn raceMapLookups(derefs: bool) !void {
+    const a = @import("slab.zig").allocator;
+    const entries = try MapEntries.init(a, .{});
+    const other = try MapEntries.init(a, .{});
+    // Key k always maps to 2k, whichever arrays hold it. The other map, grown and
+    // freed in turn, maps k to -k-1 in arrays of the same sizes, so a read of arrays
+    // the first map freed and the other took finds a value no version held.
+    const Race = struct {
+        entries: MapEntries,
+        other: MapEntries,
+        a: std.mem.Allocator,
+        derefs: bool,
+        stop: std.atomic.Value(bool) = .init(false),
+        wrong: std.atomic.Value(usize) = .init(0),
+        reads: std.atomic.Value(usize) = .init(0),
+        hits: std.atomic.Value(usize) = .init(0),
+
+        fn write(self: *@This()) void {
+            var n: usize = 0;
+            while (!self.stop.load(.monotonic)) : (n += 1) {
+                const which = if (n % 2 == 0) self.entries else self.other;
+                const g = which.borrowMut();
+                defer g.deinit();
+                const st = g.get();
+                const len = st.pairs.items.len;
+                if (len >= 20 + (n / 2) % 40) {
+                    st.deinit(self.a);
+                    st.* = .{};
+                    continue;
+                }
+                const k: i32 = @intCast(len);
+                const v: i32 = if (n % 2 == 0) k * 2 else -k - 1;
+                st.append(self.a, .{ .key = .{ .Int = k }, .value = .{ .Int = v } }) catch return;
+                if (len + 1 >= MapStore.index_threshold) _ = st.find(self.a, &.{ .Int = k }) catch return;
+            }
+        }
+
+        fn read(self: *@This()) void {
+            var i: usize = 0;
+            while (!self.stop.load(.monotonic)) : (i += 1) {
+                _ = self.reads.fetchAdd(1, .monotonic);
+                const key: Value = .{ .Int = @intCast(i % 24) };
+                const hsh = MapStore.keyHash(&key).?;
+                const got = if (self.derefs) lookupNoLock(self.entries, hsh, &key, testSameKey, true) else lookupNoLock(self.entries, hsh, &key, numericKeyEq, false);
+                const v = got orelse continue;
+                _ = self.hits.fetchAdd(1, .monotonic);
+                if (v == .Null) continue;
+                if (v != .Int or v.Int != key.Int * 2) _ = self.wrong.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var race: Race = .{ .entries = entries, .other = other, .a = a, .derefs = derefs };
+    var threads: [6]std.Thread = undefined;
+    threads[0] = try std.Thread.spawn(.{}, Race.write, .{&race});
+    for (threads[1..]) |*t| t.* = try std.Thread.spawn(.{}, Race.read, .{&race});
+    while (race.reads.load(.monotonic) < 2_000_000 or race.hits.load(.monotonic) < 100_000) std.atomic.spinLoopHint();
+    race.stop.store(true, .monotonic);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), race.wrong.load(.monotonic));
+    entries.cell.data.deinit(a);
+    other.cell.data.deinit(a);
+}
+
+test "reads with no lock racing writers that rewrite a whole Array see only whole stored values" {
+    const a = std.heap.smp_allocator;
+    const text = try strInit(a, "whole");
+    defer text.deinit();
+    // Each writer rewrites every element with one kind, byte by byte, so a
+    // read that paired one kind's tag with another's payload is caught.
+    const kinds = [_]Value{ .{ .Int = 0x5a5a5a5a }, .{ .String = text }, .Null, .{ .Long = -1 }, .{ .Double = 0.5 } };
+    var list: std.ArrayList(Value) = .empty;
+    try list.appendNTimes(a, kinds[0], 8);
+    const vl = try ValueList.init(a, list);
+    defer {
+        for (vl.cell.data.items) |*v| v.* = .Null;
+        vl.deinit();
+    }
+    const Race = struct {
+        vl: ValueList,
+        kinds: []const Value,
+        stop: std.atomic.Value(bool) = .init(false),
+        torn: std.atomic.Value(usize) = .init(0),
+        reads: std.atomic.Value(usize) = .init(0),
+
+        fn write(self: *@This(), which: usize) void {
+            var n: usize = 0;
+            while (!self.stop.load(.monotonic)) : (n += 1) {
+                const g = self.vl.borrowMut();
+                defer g.deinit();
+                const v = self.kinds[(which + n) % self.kinds.len];
+                const src = std.mem.asBytes(&v);
+                for (g.get().items) |*e| {
+                    const dst: *volatile [16]u8 = @ptrCast(e);
+                    for (src, 0..) |b, i| dst[i] = b;
+                }
+            }
+        }
+
+        fn read(self: *@This()) void {
+            var i: usize = 0;
+            while (!self.stop.load(.monotonic)) : (i += 1) {
+                const v = self.vl.readAt(i % 8) orelse continue;
+                const whole = for (self.kinds) |k| {
+                    if (std.mem.eql(u8, std.mem.asBytes(&k), std.mem.asBytes(&v))) break true;
+                } else false;
+                if (!whole) _ = self.torn.fetchAdd(1, .monotonic);
+                _ = self.reads.fetchAdd(1, .monotonic);
+            }
+        }
+    };
+    var race: Race = .{ .vl = vl, .kinds = &kinds };
+    var threads: [5]std.Thread = undefined;
+    for (threads[0..2], 0..) |*t, i| t.* = try std.Thread.spawn(.{}, Race.write, .{ &race, i });
+    for (threads[2..]) |*t| t.* = try std.Thread.spawn(.{}, Race.read, .{&race});
+    while (race.reads.load(.monotonic) < 200_000) std.atomic.spinLoopHint();
+    race.stop.store(true, .monotonic);
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(usize, 0), race.torn.load(.monotonic));
+}

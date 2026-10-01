@@ -164,7 +164,9 @@ pub fn monotonicNs() ?u64 {
     }
     if (comptime !builtin.link_libc) return null;
     var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return null;
+    // Apple's `CLOCK_MONOTONIC` counts microseconds and now and then steps back one;
+    // its uptime clock, the one the JVM's `System.nanoTime` reads there, never does.
+    if (std.c.clock_gettime(if (comptime builtin.os.tag.isDarwin()) .UPTIME_RAW else .MONOTONIC, &ts) != 0) return null;
     const ns = @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     if (ns < 0) return null;
     return @intCast(@min(ns, std.math.maxInt(u64)));
@@ -685,6 +687,20 @@ test "monotonicNs never goes back" {
     const a = monotonicNs() orelse return error.SkipZigTest;
     const b = monotonicNs().?;
     try testing.expect(b >= a);
+}
+
+test "monotonicNs counts finer than microseconds on Apple systems, whose microsecond clock steps back" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    // Two readings a microsecond clock gives differ by whole microseconds.
+    var prev = monotonicNs().?;
+    var finer = false;
+    for (0..100_000) |_| {
+        const now = monotonicNs().?;
+        try testing.expect(now >= prev);
+        if (now != prev and (now - prev) % std.time.ns_per_us != 0) finer = true;
+        prev = now;
+    }
+    try testing.expect(finer);
 }
 
 test "realtimeNs is after 2020" {

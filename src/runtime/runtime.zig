@@ -30,6 +30,13 @@ pub const SpinMutex = objcell.SpinMutex;
 pub const setReclaim = objcell.setReclaim;
 pub const reclaimEnabled = objcell.reclaimEnabled;
 pub const freeScratch = objcell.freeScratch;
+/// See `objcell.lockfree_reads`.
+pub inline fn lockfreeReads() bool {
+    return objcell.lockfree_reads;
+}
+pub fn setLockfreeReads(on: bool) void {
+    objcell.lockfree_reads = on;
+}
 pub const reclaimRequested = objcell.reclaimRequested;
 pub const getenvSlice = objcell.getenvSlice;
 pub const envOnce = objcell.envOnce;
@@ -94,6 +101,9 @@ pub const CollBackingRef = value_mod.CollBackingRef;
 pub const MapPair = value_mod.MapPair;
 pub const MapStore = value_mod.MapStore;
 pub const MapEntries = value_mod.MapEntries;
+pub const lookupNoLock = value_mod.lookupNoLock;
+pub const lookupIntNoLock = value_mod.lookupIntNoLock;
+pub const numericKeyEq = value_mod.numericKeyEq;
 pub const RangeKind = value_mod.RangeKind;
 pub const NumericRank = value_mod.NumericRank;
 pub const PrimitiveArrayKind = value_mod.PrimitiveArrayKind;
@@ -108,6 +118,8 @@ pub const BuilderState = value_mod.BuilderState;
 pub const BuilderStateRef = value_mod.BuilderStateRef;
 pub const MergedSource = value_mod.MergedSource;
 pub const FROZEN_MOD_BIT = value_mod.FROZEN_MOD_BIT;
+pub const ModCount = value_mod.ModCount;
+pub const ModCountRef = value_mod.ModCountRef;
 pub const SeqIterState = value_mod.SeqIterState;
 pub const SeqIterStateRef = value_mod.SeqIterStateRef;
 pub const IterCursor = value_mod.IterCursor;
@@ -121,10 +133,13 @@ pub const Utf16View = value_mod.Utf16View;
 pub const SbMemo = value_mod.SbMemo;
 pub const sbMemoInvalidate = value_mod.sbMemoInvalidate;
 pub const sbMemoFor = value_mod.sbMemoFor;
+pub const sbAsciiLen = value_mod.sbAsciiLen;
+pub const decimal = value_mod.decimal;
 pub const sbMemoAppended = value_mod.sbMemoAppended;
 pub const sbUnitAt = value_mod.sbUnitAt;
 pub const sbCharCount = value_mod.sbCharCount;
 pub const strInit = value_mod.strInit;
+pub const strInitTrailing = value_mod.strInitTrailing;
 pub const strInitOwned = value_mod.strInitOwned;
 pub const strMeta = value_mod.strMeta;
 pub const ValueList = value_mod.ValueList;
@@ -180,6 +195,9 @@ pub const PropertyAnchors = class_mod.PropertyAnchors;
 pub const MethodDef = class_mod.MethodDef;
 pub const PropertyDef = class_mod.PropertyDef;
 pub const InstanceData = class_mod.InstanceData;
+pub const PLAIN_SLOTS = class_mod.PLAIN_SLOTS;
+pub const plain_slots = class_mod.plain_slots;
+pub const plainSlotsOn = class_mod.plainSlotsOn;
 pub const NativeState = class_mod.NativeState;
 pub const NativeBox = class_mod.NativeBox;
 
@@ -286,6 +304,7 @@ pub const closeStackReserve = safety_mod.closeReserve;
 test {
     std.testing.refAllDecls(@This());
     _ = objcell;
+    _ = gc.region;
     _ = value_mod;
     _ = class_mod;
     _ = host_mod;
@@ -358,10 +377,8 @@ test "plain instance display uses class at hex" {
     const inst = try ObjRef(InstanceData).init(a, .{
         .class = cls,
         .slots = &.{},
-        .outer = null,
-        .identity = 0x2a,
-        .native_state = null,
     });
+    inst.cell.data.setIdentity(0x2a);
 
     const s = try (Value{ .Instance = inst }).display(a);
     try testing.expectEqualStrings("Foo@2a", s);
@@ -376,10 +393,8 @@ test "data instance display unchanged" {
     const inst = try ObjRef(InstanceData).init(a, .{
         .class = cls,
         .slots = &.{},
-        .outer = null,
-        .identity = 99,
-        .native_state = null,
     });
+    inst.cell.data.setIdentity(99);
 
     const s = try (Value{ .Instance = inst }).display(a);
     try testing.expectEqualStrings("D()", s);

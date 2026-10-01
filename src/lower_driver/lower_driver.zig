@@ -113,9 +113,9 @@ pub fn analyzeWith(a: Allocator, sources: []const []const u8, opts: AnalyzeOptio
     const layers = [2]bridge.Layer{ base_layer, program_layer };
     // Class defs the bridge makes are read by every run; they are minted
     // outside the collected generation.
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn, .host_tries = opts.host_tries, .records = out.files, .layers = &layers });
     return .{ .map = map, .s = s, .out = out, .br = br, .layers = layers };
 }
@@ -190,9 +190,9 @@ pub fn bake(a: Allocator) !Baked {
     const layer: bridge.Layer = .{ .syms = @intCast(s.syms.count()), .files = @intCast(s.files.items.len) };
     try s.resolveBodies(&.{.base});
     const out = try sema.output.build(s);
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn, .records = out.files, .layers = &.{layer} });
     const prog = try lower.lowerProgram(a, s, br);
     return .{ .s = s, .br = br, .layer = layer, .lowered = prog.lowered, .map = map };
@@ -219,9 +219,9 @@ pub fn analyzeOver(a: Allocator, baked: *const Baked, sources: []const []const u
     try s.resolveBodies(&.{.program});
     const out = try sema.output.build(s);
     const layers = [2]bridge.Layer{ base_layer, program_layer };
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.buildOver(a, s, baked.br, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn, .records = out.files, .layers = &layers });
     return .{ .map = map, .s = s, .out = out, .br = br, .layers = layers };
 }
@@ -255,9 +255,9 @@ pub fn runOverImage(a: Allocator, sources: []const []const u8) anyerror!Outcome 
     // The base comes from the image alone: its sema, its bridge and its
     // files' lines. The program's files follow them in the map.
     var map = span.SourceMap.init(a);
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const loaded = try pipeline.base_image.load(a, bytes, .{ .natives = natives.resolve, .host_fns = interp_ir.hostMemberFn }, &map);
     const s = loaded.br.s;
     var program: std.ArrayList(sema.SourceFile) = .empty;

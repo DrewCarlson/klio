@@ -140,17 +140,29 @@ pub const NatFrame = extern struct {
 
 threadlocal var nat_top: ?*NatFrame = null;
 
+/// Each thread's frames are its own roots, which any thread's collection reads
+/// (the marking thread's remark among them): a root reading `nat_top` would see
+/// only the collecting thread's. Linked while the thread has a frame, so none
+/// is left linked by a thread that has exited.
+threadlocal var nat_troot: runtime.gc.ThreadRoot = .{ .ctx = undefined, .mark = markNatFrames };
+
 export fn klio_nat_enter(f: *NatFrame) void {
     f.prev = nat_top;
     nat_top = f;
+    if (!nat_troot.linked) {
+        nat_troot.ctx = @ptrCast(&nat_top);
+        runtime.gc.registerThreadRoot(&nat_troot);
+    }
 }
 
 export fn klio_nat_leave(f: *NatFrame) void {
     nat_top = f.prev;
+    if (nat_top == null) runtime.gc.unregisterThreadRoot(&nat_troot);
 }
 
-fn markNatFrames(m: *runtime.gc.Marker) void {
-    var cur = nat_top;
+fn markNatFrames(ctx: *anyopaque, m: *runtime.gc.Marker) void {
+    const top: *?*NatFrame = @ptrCast(@alignCast(ctx));
+    var cur = top.*;
     while (cur) |f| : (cur = f.prev) {
         var i: u32 = 0;
         while (i < f.n) : (i += 1) {
@@ -160,21 +172,20 @@ fn markNatFrames(m: *runtime.gc.Marker) void {
     }
 }
 
-var nat_roots_registered = false;
+var nat_configured = false;
 
 /// Turns the collector on; a compiled program calls no `klio_rt_run_*` entry.
 export fn klio_nat_init(void_arg: u32) void {
     _ = void_arg;
-    if (nat_roots_registered) return;
-    nat_roots_registered = true;
-    runtime.gc.registerRoot(markNatFrames);
+    if (nat_configured) return;
+    nat_configured = true;
     runtime.backing.configureGcFromEnv();
 }
 
 /// Called between class registration and the program body: cells minted up to
 /// here are program-lifetime and stay off the sweep registry.
 export fn klio_nat_begin() void {
-    runtime.gc.alloc_perm = false;
+    runtime.gc.setAllocPerm(false);
 }
 
 /// The safe point, polled at function entry and loop back edges; no borrow is
@@ -192,6 +203,7 @@ export fn klio_nat_frame_mark() ?*NatFrame {
 
 export fn klio_nat_frame_restore(mark: ?*NatFrame) void {
     nat_top = mark;
+    if (nat_top == null) runtime.gc.unregisterThreadRoot(&nat_troot);
 }
 
 // Boxing. A box carries its kind: `Char` prints as a character, `Short` and
@@ -379,4 +391,22 @@ comptime {
 
 test {
     std.testing.refAllDecls(resolved);
+}
+
+test "a thread's published frames are marked by a collection run on another thread" {
+    var slots = [_]CValue{klio_nat_cell(toC(.{ .Int = 7 }))};
+    var f: NatFrame = .{ .prev = null, .n = 1, .slots = &slots };
+    klio_nat_enter(&f);
+    const Other = struct {
+        fn run(epoch: usize) void {
+            var m: runtime.gc.Marker = .{ .epoch = epoch, .arena = std.heap.page_allocator };
+            defer m.grey.deinit(std.heap.page_allocator);
+            runtime.gc.markThreadRoots(&m);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Other.run, .{@as(usize, 91)});
+    t.join();
+    try std.testing.expectEqual(@as(usize, 91), fromC(slots[0]).Cell.cell.hdr.gc_mark);
+    klio_nat_leave(&f);
+    try std.testing.expect(!nat_troot.linked);
 }

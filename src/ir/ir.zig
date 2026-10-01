@@ -45,6 +45,12 @@ pub const resolved = @import("core/resolved.zig");
 pub const Resolved = resolved.Resolved;
 /// Register liveness, and the renumbering that lets registers share.
 pub const regs = @import("core/regs.zig");
+/// What a frame is known by from its position.
+pub const framemap = @import("core/framemap.zig");
+/// The span a frame stands in, from its position.
+pub const spanmap = @import("core/spanmap.zig");
+/// The try regions a frame stands in, from its position.
+pub const trymap = @import("core/trymap.zig");
 /// Lowering from sema's records.
 pub const lower_sema = @import("lower/sema/mod.zig");
 
@@ -62,8 +68,6 @@ pub const BlockHandlers = core_func.BlockHandlers;
 pub const FuncKind = core_func.FuncKind;
 pub const Func = core_func.Func;
 pub const FuncExtra = core_func.FuncExtra;
-pub const FRAME_FILL_WORDS = core_func.FRAME_FILL_WORDS;
-pub const FRAME_FILL_MAX_REGS = core_func.FRAME_FILL_MAX_REGS;
 pub const Param = core_func.Param;
 
 pub const Class = core_class.Class;
@@ -147,6 +151,9 @@ test {
     testing.refAllDecls(@import("core/module_props.zig"));
     testing.refAllDecls(@import("core/module_lookup.zig"));
     testing.refAllDecls(regs);
+    testing.refAllDecls(framemap);
+    testing.refAllDecls(spanmap);
+    testing.refAllDecls(trymap);
     testing.refAllDecls(resolved);
     testing.refAllDecls(bridge);
     _ = lower_sema;

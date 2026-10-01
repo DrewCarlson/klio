@@ -126,6 +126,12 @@ pub const EvalTls = struct {
     ext_delta: isize = 0,
     /// Whether this thread's frame chain is registered as a collector root.
     frame_root_installed: bool = false,
+    /// This thread's copy of `call_hooks_on`, which a call reads to choose its path
+    /// (`refreshCallMode`).
+    hooks: bool = true,
+    /// Whether calls and returns take their common paths: no call hooks, the tracing
+    /// collector, and this thread's frame root installed (`refreshCallMode`).
+    plain: bool = false,
     /// The suspension a COMPILED body builds as it unwinds: compiled code cannot
     /// return an error union, so it answers `CoroutineSuspended` and leaves it here.
     in_flight_suspend: ?*SuspendState = null,
@@ -145,7 +151,18 @@ pub const EvalTls = struct {
     /// `KLIO_SPIN_TRACE` bookkeeping.
     spin_last_dump: i64 = 0,
     spin_check_counter: u64 = 0,
+    /// The registers of callees compiled into their callers' code while that code runs, one
+    /// callee's after its caller's (`baseline.zig`). No collector root: the code reaches no
+    /// safepoint before it moves them into frames of their own.
+    inline_regs: [INLINE_REGS]Value = undefined,
+    /// Per level of such callees, the span its blocks left where the compiler could not tell
+    /// which it is.
+    inline_spans: [INLINE_LEVELS]?ir.Span = undefined,
 };
+
+/// The registers and levels of callees compiled into one function's code.
+pub const INLINE_REGS = 256;
+pub const INLINE_LEVELS = 4;
 
 /// The evaluation depth cap of the thread whose state `ev` is. The first
 /// read on a thread takes `KLIO_MAX_EVAL_DEPTH`.
@@ -204,7 +221,7 @@ pub inline fn noteExt(ev: *EvalTls, delta: isize) void {
 /// Values in one segment of a thread's value stack.
 const VS_SEGMENT_VALUES: usize = 16 * 1024;
 
-const VsSegment = struct {
+pub const VsSegment = struct {
     prev: ?*VsSegment,
     next: ?*VsSegment,
     buf: []Value,
@@ -342,21 +359,104 @@ pub inline fn gcPopFrame(f: *Frame) void {
     f.tls.frame_chain = f.gc_link;
 }
 
-/// Mark a frame's register file, skipping slots the written mask says were
-/// never written: an unfilled slot holds whatever the pooled buffer last carried.
+/// `KLIO_FRAME_AUDIT`: `1` checks, at every collection, that every register the collector
+/// traces in a frame (those live where it stands, `Frame.liveSet`) holds a tag a value can
+/// have, which garbage an earlier frame left seldom does: a register the maps call live that
+/// nothing wrote, or a frame that reached a safe point without recording where it stands.
+/// `2` also poisons every register not live there, so a read of one the maps call dead fails
+/// where it is read. 0xff until read.
+var frame_audit: u8 = 0xff;
+
+pub inline fn frameAuditLevel() u8 {
+    if (frame_audit == 0xff) frameAuditInit();
+    return frame_audit;
+}
+
+fn frameAuditInit() void {
+    const v = runtime.envOnce("KLIO_FRAME_AUDIT") orelse {
+        frame_audit = 0;
+        return;
+    };
+    frame_audit = if (std.mem.eql(u8, v, "2")) 2 else if (std.mem.eql(u8, v, "0")) 0 else 1;
+}
+
+/// What the audit found, for its summary.
+pub var frame_audit_stats: struct { frames: u64 = 0, unmapped: u64 = 0, bad_position: u64 = 0, garbage: u64 = 0, poisoned: u64 = 0 } = .{};
+
+/// The most findings the audit prints; it counts them all.
+const FRAME_AUDIT_PRINT_MAX = 200;
+
+/// Where a value's tag is: the byte after its eight-byte payload, in its low six bits.
+const VALUE_TAG_OFF = 8;
+
+/// Checks frame `f`'s traced registers at its position, and at level 2 poisons the rest
+/// (`frameAuditLevel`).
+noinline fn auditFrame(f: *Frame) void {
+    frame_audit_stats.frames += 1;
+    const blocks = f.func.blocks;
+    if (f.at_block >= blocks.len or (f.at_idx != ev_frame.block_start and f.at_idx > blocks[f.at_block].insts.len)) {
+        frame_audit_stats.bad_position += 1;
+        if (frame_audit_stats.bad_position <= FRAME_AUDIT_PRINT_MAX)
+            std.debug.print("[frame-audit] {s} stands at b{d}:{d}, past its blocks\n", .{ f.func.fqn, f.at_block, f.at_idx });
+        return;
+    }
+    var buf: [16]u64 = undefined;
+    const live = f.liveSet(&buf) orelse {
+        frame_audit_stats.unmapped += 1;
+        return;
+    };
+    const n_tags = @typeInfo(@typeInfo(Value).@"union".tag_type.?).@"enum".fields.len;
+    const n = @min(f.regs.len, @as(usize, f.func.n_locals));
+    const watch = if (runtime.envOnce("KLIO_FRAME_AUDIT_FN")) |w| (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, f.func.name)) else false;
+    if (watch) std.debug.print("[frame-audit] {s} at b{d}:{d}:", .{ f.func.fqn, f.at_block, f.at_idx });
+    for (0..n) |r| {
+        const is_live = live[r >> 6] & (@as(u64, 1) << @as(u6, @truncate(r))) != 0;
+        if (is_live) {
+            if (watch) std.debug.print(" r{d}", .{r});
+            const bytes: *const [@sizeOf(Value)]u8 = @ptrCast(&f.regs[r]);
+            if (bytes[VALUE_TAG_OFF] & 0x3f < n_tags) continue;
+            frame_audit_stats.garbage += 1;
+            if (frame_audit_stats.garbage <= FRAME_AUDIT_PRINT_MAX)
+                std.debug.print("[frame-audit] {s} at b{d}:{d}: r{d} is live and holds no value\n", .{ f.func.fqn, f.at_block, f.at_idx, r });
+        } else if (frame_audit == 2) {
+            if (watch) std.debug.print(" ~r{d}", .{r});
+            f.regs[r] = .CoroutineSuspended;
+            frame_audit_stats.poisoned += 1;
+        }
+    }
+    if (watch) std.debug.print("\n", .{});
+}
+
+/// The audit's counts, at the end of a run that asked for it.
+pub fn frameAuditSummary() void {
+    if (frameAuditLevel() == 0) return;
+    const s = frame_audit_stats;
+    std.debug.print("[frame-audit] frames={d} unmapped={d} bad_position={d} garbage={d} poisoned={d}\n", .{ s.frames, s.unmapped, s.bad_position, s.garbage, s.poisoned });
+}
+
+/// Mark the registers of a frame the collector can read: those live where it stands
+/// (`Frame.liveSet`), each of which holds a value there; every register of a frame filled
+/// whole. A register past the function's count belongs to a file a write grew, filled.
 pub fn gcMarkFrameRegs(f: *const Frame, m: *runtime.gc.Marker) void {
+    if (frameAuditLevel() != 0) auditFrame(@constCast(f));
     runtime.gc.poison_ctx_name = f.func.name;
-    const mask = &f.wmask;
-    if (mask.isAll()) {
+    var buf: [16]u64 = undefined;
+    const n = @min(f.regs.len, @as(usize, f.func.n_locals));
+    const live = f.liveSet(&buf) orelse {
         for (f.regs, 0..) |v, i| {
             runtime.gc.poison_ctx_idx = i;
             v.gcMark(m);
         }
         return;
-    }
-    for (f.regs, 0..) |v, i| {
+    };
+    for (f.regs[0..n], 0..) |v, i| {
+        if (live[i >> 6] & (@as(u64, 1) << @as(u6, @truncate(i))) == 0) continue;
         runtime.gc.poison_ctx_idx = i;
-        if (mask.has(i)) v.gcMark(m);
+        v.gcMark(m);
+    }
+    for (f.regs[n..], n..) |v, i| {
+        runtime.gc.poison_ctx_idx = i;
+        v.gcMark(m);
     }
 }
 
@@ -423,9 +523,18 @@ pub inline fn markFrameClosure(closure: ?runtime.IrClosureRef, m: *runtime.gc.Ma
     if (closure) |c| (runtime.Value{ .IrClosure = c }).gcMark(m);
 }
 
+/// The switches a call and a return read, copied onto this thread (`hooks`, `plain`): a
+/// process-wide flag costs a load from its own page on every call. Refreshed as each run
+/// starts and as the thread's frame root comes and goes, so a switch set between runs is seen.
+pub fn refreshCallMode(ev: *EvalTls) void {
+    ev.hooks = parent.call_hooks_on;
+    ev.plain = !parent.call_hooks_on and runtime.gc.gc_enabled and ev.frame_root_installed;
+}
+
 /// Link this thread's frame-chain root node (idempotent per thread).
 pub fn gcInstallFrameRoot() void {
     evtlsPtr().frame_root_installed = true;
+    refreshCallMode(evtlsPtr());
     if (frame_troot_inited) return;
     frame_troot_inited = true;
     frame_anchor = .{ .chain = &evtlsPtr().frame_chain, .resuming = &evtlsPtr().resuming, .tid = runtime.gc.currentTid() };
@@ -437,6 +546,7 @@ pub fn gcInstallFrameRoot() void {
 /// workers would otherwise leak one each.
 pub fn gcUninstallFrameRoot() void {
     evtlsPtr().frame_root_installed = false;
+    refreshCallMode(evtlsPtr());
     if (frame_troot_inited) {
         runtime.gc.unregisterThreadRoot(&frame_troot);
         frame_troot_inited = false;

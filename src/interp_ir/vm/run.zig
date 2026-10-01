@@ -132,7 +132,7 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     self.out_sink.attach(out);
     // Close the permanent generation: cells minted up to here are immortal and
     // reference-stable, later ones nursery and swept (a worker does the same at entry).
-    runtime.gc.alloc_perm = false;
+    runtime.gc.setAllocPerm(false);
     runtime.gc.program_started = true;
     // The run thread joins the mutator set, so a worker's collection stops it safely.
     vmhost.coroutines.gcThreadEnter();
@@ -335,9 +335,7 @@ pub fn vmNewResolved(self: *Vm, class: ir.ClassId, ctor: FuncId) Allocator.Error
         var host = vmMakeHost(self, self.out_sink.output());
         return outcomeFromEval(self, try host.callNative(self.allocator, r.func_native[ctor.int()], &.{}));
     }
-    const st = self.resolved_state orelse return .{ .failed = "no resolved state" };
-    const identity = st.cell.data.takeIdentity();
-    const inst = try ir.resolved.instantiate(self.allocator, r, class, identity);
+    const inst = try ir.resolved.instantiate(self.allocator, r, class);
     return vmCallArgs(self, ctor, &.{inst});
 }
 
@@ -390,7 +388,7 @@ pub fn vmRunCalls(
 ) Allocator.Error!?VmError {
     gcRegisterVm(self);
     self.out_sink.attach(out);
-    runtime.gc.alloc_perm = false;
+    runtime.gc.setAllocPerm(false);
     runtime.gc.program_started = true;
     vmhost.coroutines.gcThreadEnter();
     defer vmhost.coroutines.gcThreadExit();

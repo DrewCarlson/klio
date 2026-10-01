@@ -110,11 +110,6 @@ fn valueClass(comptime H: type, host: *H, r: *const Resolved, v: *const Value) ?
     return ir.resolved.classOf(r, v);
 }
 
-/// The next instance's identity from the run state.
-pub fn nextIdentity(st: StateRef) u64 {
-    return st.cell.data.takeIdentity();
-}
-
 /// Runs `func` over `params`: its native when the tables bind one, else its
 /// body as a flat activation (recursively when the flat driver is off).
 /// `params` is the call's argument run or the argument area pushed at `at`,
@@ -185,9 +180,8 @@ fn throwVm(
     message: ?[]const u8,
 ) Allocator.Error!Step {
     const raised = which orelse return raiseStep(frame, .{ .Unsupported = "the tables name no class for " ++ kind });
-    const st = host.resolvedState() orelse return noState(frame, kind);
     if (raised.class.int() >= r.classes.len) return internal(a, frame, kind ++ ": class #{d} is not in the tables", .{raised.class.int()});
-    const exc = try ir.resolved.instantiate(a, r, raised.class, nextIdentity(st));
+    const exc = try ir.resolved.instantiate(a, r, raised.class);
     const msg_v: Value = if (message) |m| .{ .String = try runtime.strInit(a, m) } else .Null;
     defer msg_v.release(a);
     const res = try host.runResolved(a, frame.module, raised.ctor, &.{ exc, msg_v });
@@ -230,14 +224,13 @@ pub fn stackOverflowError(comptime H: type, a: Allocator, module: *const ir.Modu
     const r = module.resolved orelse return null;
     const raised = r.exceptions.by_fqn.get("klio.StackOverflowError") orelse return null;
     if (raised.class.int() >= r.classes.len) return null;
-    const st = host.resolvedState() orelse return null;
     const tls = ev_state.evtlsPtr();
     const cap = ev_state.evalDepthCap(tls);
     tls.eval_depth_cap = cap + overflow_headroom;
     defer tls.eval_depth_cap = cap;
     const floor = runtime.openStackReserve();
     defer runtime.closeStackReserve(floor);
-    var exc = try ir.resolved.instantiate(a, r, raised.class, nextIdentity(st));
+    var exc = try ir.resolved.instantiate(a, r, raised.class);
     // Its trace is the stack that overflowed, the innermost frames of it.
     try ev_diag.attachStackTrace(a, &exc);
     const res = try host.runResolved(a, module, raised.ctor, &.{ exc, .Null });
@@ -759,8 +752,7 @@ pub fn execRNewInstance(comptime H: type, a: Allocator, frame: *Frame, x: anytyp
     if (x.ctor.int() < r.func_native.len and r.func_native[x.ctor.int()] != .none) {
         return land(frame, try host.callNative(a, r.func_native[x.ctor.int()], runOf(frame, x.args, 0, x.n_args)), x.dst);
     }
-    const st = host.resolvedState() orelse return noState(frame, "RNewInstance");
-    var inst = try ir.resolved.instantiate(a, r, x.class, nextIdentity(st));
+    var inst = try ir.resolved.instantiate(a, r, x.class);
     // A throwable's trace is where it is made, before its constructor runs.
     if (r.classes[x.class.int()].throwable) try ev_diag.attachStackTrace(a, &inst);
     // The register holds the instance while the constructor runs; the
@@ -971,8 +963,7 @@ fn laterInitFailure(comptime H: type, a: Allocator, module: *const ir.Module, ho
 /// An instance of throwable class `cc` built by its `(message, cause)`
 /// constructor.
 fn buildThrowable(comptime H: type, a: Allocator, module: *const ir.Module, host: *H, r: *const Resolved, cc: ir.resolved.ClassCtor, message: ?[]const u8, cause: Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
-    const st = host.resolvedState() orelse return .{ .err = .{ .Unsupported = "a throwable without a run state" } };
-    const exc = try ir.resolved.instantiate(a, r, cc.class, nextIdentity(st));
+    const exc = try ir.resolved.instantiate(a, r, cc.class);
     const msg: Value = if (message) |m| .{ .String = try runtime.strInit(a, m) } else .Null;
     defer msg.release(a);
     const res = try host.runResolved(a, module, cc.ctor, &.{ exc, msg, cause });
@@ -1186,7 +1177,7 @@ pub fn objectInstance(comptime H: type, a: Allocator, module: *const ir.Module, 
             },
         }
     }
-    const inst = try ir.resolved.instantiate(a, r, class, nextIdentity(st));
+    const inst = try ir.resolved.instantiate(a, r, class);
     {
         const g = st.borrowMut();
         defer g.deinit();
@@ -1257,8 +1248,10 @@ pub fn execMakeClosure(comptime H: type, a: Allocator, frame: *Frame, x: anytype
             .err => |e| return raiseStep(frame, e),
         }
     };
-    const caps = try a.alloc(Value, x.captures.len);
-    defer a.free(caps);
+    // A literal's few captures are gathered on the stack; the closure copies them.
+    var buf: [8]Value = undefined;
+    const caps = if (x.captures.len <= buf.len) buf[0..x.captures.len] else try a.alloc(Value, x.captures.len);
+    defer if (x.captures.len > buf.len) a.free(caps);
     for (x.captures, caps) |reg, *c| c.* = frame.read(reg);
     return land(frame, try host.makeResolvedClosure(a, frame.module, x.func, caps, .lambda), x.dst);
 }
@@ -1337,7 +1330,7 @@ pub fn execRInstanceOf(comptime H: type, a: Allocator, frame: *Frame, x: anytype
 
 /// `BoxValue`: an instance of the scalar value class over the number, which
 /// runs no init block; an instance or a null is itself.
-pub fn execBoxValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
+pub fn execBoxValue(a: Allocator, frame: *Frame, x: anytype) Allocator.Error!Step {
     const r = frame.module.resolved orelse return noTables(frame, "BoxValue");
     const v = frame.read(x.src);
     if (v == .Instance or v == .Null) {
@@ -1345,15 +1338,14 @@ pub fn execBoxValue(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
         try frame.write(x.dst, v);
         return .cont;
     }
-    const st = host.resolvedState() orelse return noTables(frame, "BoxValue");
-    const boxed = try boxValue(a, r, x.class, x.slot, v, nextIdentity(st));
+    const boxed = try boxValue(a, r, x.class, x.slot, v);
     try frame.write(x.dst, boxed);
     return .cont;
 }
 
 /// The instance of scalar value class `class` holding `v` in field `slot`.
-pub fn boxValue(a: Allocator, r: *const Resolved, class: ClassId, slot: u32, v: Value, identity: u64) Allocator.Error!Value {
-    const boxed = try ir.resolved.instantiate(a, r, class, identity);
+pub fn boxValue(a: Allocator, r: *const Resolved, class: ClassId, slot: u32, v: Value) Allocator.Error!Value {
+    const boxed = try ir.resolved.instantiate(a, r, class);
     v.retain();
     if (runtime.InstanceData.slotSet(boxed.Instance, slot, v)) |old| {
         if (runtime.reclaimEnabled()) old.release(a);

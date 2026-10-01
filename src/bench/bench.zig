@@ -180,9 +180,9 @@ pub fn runStages(a: std.mem.Allocator, base: *const BaseSources, prog: *const Pr
     ns[@intFromEnum(Stage.bodies)] = t.lap();
     const out = try sema.output.build(s);
     ns[@intFromEnum(Stage.records)] = t.lap();
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{
         .natives = hostNative,
         .host_symbol = stdlib.declarationHostSymbol,

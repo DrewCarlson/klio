@@ -241,7 +241,10 @@ pub const TestMemory = struct {
         return self.arena.allocator();
     }
 
+    /// Frees the test's memory, and the streams built for its functions: they are cached by
+    /// the functions' addresses, which the next test's functions may take.
     pub fn deinit(self: *TestMemory) void {
+        ir.bc.resetCacheForTest();
         self.arena.deinit();
         runtime.setReclaim(self.prev_reclaim);
     }

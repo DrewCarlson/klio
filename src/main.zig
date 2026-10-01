@@ -188,6 +188,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 runtime.gc.release_to_os = gcReleaseToOs;
                 return runCli(std.heap.c_allocator, init.args);
             }
+            // Every backend from here frees into the slab heap.
+            runtime.backing.enableLockfreeReads();
             if (std.mem.eql(u8, alloc_mode, "leaktrack")) {
                 if (runtime.envOnce("KLIO_LEAK_BY_FQN")) |_| runtime.leaktrack.by_fqn_only = true;
                 const a = runtime.leaktrack.wrap(runtime.slab.allocator);

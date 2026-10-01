@@ -3,14 +3,15 @@
 // klio runs real worker threads, so the default mode (and explicit
 // SYNCHRONIZED / PUBLICATION) must initialize at most once under
 // contention, matching the JVM actual: `KlioSynchronizedLazyImpl`
-// holds the instance's monitor (`kotlin.synchronized`, the host's
-// per-object reentrant lock) across the check-compute-publish, so two
-// workers racing on `value` run the initializer exactly once and both
-// observe the published result. PUBLICATION's weaker contract (the
-// initializer may run multiple times, first result published) is
-// satisfied by the same once-only implementation. Only explicit
-// `LazyThreadSafetyMode.NONE` gets the unsynchronized upstream
-// `UnsafeLazyImpl`.
+// reads its `@Volatile` value and, until it is published, holds the
+// lock's monitor (`kotlin.synchronized`, the host's per-object
+// reentrant lock; the instance itself unless `lazy(lock)` names one)
+// across the check-compute-publish, so two workers racing on `value`
+// run the initializer exactly once and both observe the published
+// result. PUBLICATION's weaker contract (the initializer may run
+// multiple times, first result published) is satisfied by the same
+// once-only implementation. Only explicit `LazyThreadSafetyMode.NONE`
+// gets the unsynchronized upstream `UnsafeLazyImpl`.
 
 package kotlin
 
@@ -23,20 +24,34 @@ public actual fun <T> lazy(mode: LazyThreadSafetyMode, initializer: () -> T): La
     }
 
 public actual fun <T> lazy(lock: Any?, initializer: () -> T): Lazy<T> =
-    KlioSynchronizedLazyImpl(initializer)
+    KlioSynchronizedLazyImpl(initializer, lock)
 
-internal class KlioSynchronizedLazyImpl<out T>(initializer: () -> T) : Lazy<T> {
+internal class KlioSynchronizedLazyImpl<out T>(initializer: () -> T, lock: Any? = null) : Lazy<T> {
     private var initializer: (() -> T)? = initializer
+
+    @kotlin.concurrent.Volatile
     private var _value: Any? = UNINITIALIZED_VALUE
 
+    private val lock = lock ?: this
+
     override val value: T
-        get() = kotlin.synchronized(this) {
-            if (_value === UNINITIALIZED_VALUE) {
-                _value = initializer!!()
-                initializer = null
+        get() {
+            val v1 = _value
+            if (v1 !== UNINITIALIZED_VALUE) {
+                @Suppress("UNCHECKED_CAST")
+                return v1 as T
             }
-            @Suppress("UNCHECKED_CAST")
-            _value as T
+            return kotlin.synchronized(lock) {
+                val v2 = _value
+                if (v2 !== UNINITIALIZED_VALUE) {
+                    @Suppress("UNCHECKED_CAST") (v2 as T)
+                } else {
+                    val typed = initializer!!()
+                    _value = typed
+                    initializer = null
+                    typed
+                }
+            }
         }
 
     override fun isInitialized(): Boolean = _value !== UNINITIALIZED_VALUE

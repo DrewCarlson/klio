@@ -55,9 +55,9 @@ pub const Op = enum(u32) {
     bin_ident_neq,
     /// inst_idx: every other instruction, via `execInst`.
     escape,
-    /// target (block, pc), exit span: the block's Goto.
+    /// target (block, pc), edge span: the block's Goto.
     jump,
-    /// cond_reg, t (block, pc), f (block, pc), exit span: the block's Branch on a Bool
+    /// cond_reg, t (block, pc), f (block, pc), edge span: the block's Branch on a Bool
     /// register. A non-Bool condition exits to the frame loop's terminator path.
     br,
     /// has_val, reg: the block's Return.
@@ -65,7 +65,7 @@ pub const Op = enum(u32) {
     /// `ret`'s words, in a function with a try region: a return inside one,
     /// or with a finally's flow pending, runs the frame loop's routing.
     ret_try,
-    /// exit span: run the block's real terminator in the frame loop.
+    /// Run the block's real terminator in the frame loop, through its `end` op.
     term_exit,
     /// inst_idx, kind, dst, operand: a unary operator, with the scalar tags
     /// served inline and every other shape falling to the instruction's arm.
@@ -103,7 +103,7 @@ pub const Op = enum(u32) {
     fn_to_ushort,
     fn_to_ubyte,
     fn_unsigned_bits,
-    /// inst_idx, kind, dst, lhs, rhs, t (block, pc), f (block, pc), exit span:
+    /// inst_idx, kind, dst, lhs, rhs, t (block, pc), f (block, pc), edge span:
     /// the block's last instruction is a BinOp whose dst is the Branch condition.
     /// The compare still writes dst, so register state matches the unfused
     /// form; non-scalar operands fall back to the generic arm and branch on dst.
@@ -116,8 +116,9 @@ pub const Op = enum(u32) {
     /// next once `init`, the unit the call must see run (`NONE` for none),
     /// has run.
     call,
-    /// exit span: the end of a block's ops, after its terminator op if it
-    /// has one. Each op dispatches the next, and this one leaves.
+    /// last span: the end of a block's ops, after its terminator op if it
+    /// has one, with the span words of the block's last `Trace`. Each op
+    /// dispatches the next, and this one leaves.
     end,
     /// inst_idx, dst, obj, slot: an instance's field read in place; any other
     /// receiver runs through the instruction's arm.
@@ -141,6 +142,9 @@ pub const Op = enum(u32) {
     callv,
     /// inst_idx, dst, src: `!` on a Boolean; anything else takes the arm.
     not,
+    /// inst_idx, dst, src: `x!!` or a `lateinit` property's read, a copy of anything but
+    /// `null`, which takes the instruction's arm (the exception it throws).
+    not_null,
     /// inst_idx, native, args, n_args, dst, direct: a host call over the
     /// argument run, read in place. Not `direct` (a `super` call), an
     /// instance receiver's own override of the member answers instead.
@@ -204,7 +208,7 @@ pub const Op = enum(u32) {
     /// The first op of a block whose entry pushes, pops or disarms a try
     /// frame, which it does before the block's next op.
     block_entry,
-    /// target (block, pc), exit span: a Goto whose leaving pops try frames,
+    /// target (block, pc), edge span: a Goto whose leaving pops try frames,
     /// done here; with a finally's flow pending, the frame loop routes it.
     goto_try,
     /// dst, src: a capture cell made over a register.
@@ -239,26 +243,188 @@ pub const Op = enum(u32) {
     /// `strings`; a Kotlin string is immutable, and the JVM interns its
     /// literals.
     const_str,
+    /// An op of a compiled function: the op this pc held runs as compiled code
+    /// (`JitCode`), its operands still following as they were.
+    jit,
 };
 
-/// A block's exit span: the span of its last `Trace`, three words (file,
-/// start, end), with file `NO_SPAN` when the block has none. `Trace` runs no
-/// op: the frame loop records where a frame stands at every instruction that
-/// can observe a span (an escape, a call, a throw), finds the statement's
-/// span from the block's instructions, and a block's exit leaves its last
-/// span on the frame for the blocks after it.
-pub const NO_SPAN: u32 = std.math.maxInt(u32);
+/// How many words the op at `pc` takes, `op` being the op that starts there.
+pub fn opLen(op: Op, code: []const u32, pc: usize) usize {
+    return switch (op) {
+        .block_entry, .term_exit => 1,
+        .escape, .make_closure, .new_array => 2,
+        .const_load, .const_val, .const_int, .move, .load_param, .cell_get, .ret, .ret_try, .make_cell, .load_capture => 3,
+        .end, .not, .not_null, .const_str, .cell_set, .store_static, .load_static, .load_object => 4,
+        .un, .un_inc, .un_dec, .un_neg, .conv_byte, .conv_short, .conv_int, .conv_long, .conv_float, .conv_double, .conv_char, .fn_inv, .fn_to_raw_bits, .fn_to_bits, .fn_float_from_bits, .fn_double_from_bits, .fn_count_trailing_zero_bits, .fn_uint_to_float, .fn_uint_to_double, .fn_ulong_to_float, .fn_ulong_to_double, .fn_sin, .fn_cos, .fn_sqrt, .fn_to_ulong, .fn_to_uint, .fn_to_ushort, .fn_to_ubyte, .fn_unsigned_bits, .get_field, .set_field, .array_get, .array_set => 5,
+        .bin, .add, .sub, .cmp, .bin_mul, .bin_div, .bin_mod, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr, .bin_ident_eq, .bin_ident_neq, .jump, .goto_try, .is, .cast, .box_value, .unbox_value => 6,
+        .bin_k_add, .bin_k_sub, .bin_k_mul, .bin_k_div, .bin_k_mod, .bin_k_less, .bin_k_less_eq, .bin_k_greater, .bin_k_greater_eq, .bin_k_eq, .bin_k_not_eq, .bin_k_boxed_eq, .bin_k_boxed_not_eq, .bin_k_and, .bin_k_or, .bin_k_xor, .bin_k_shl, .bin_k_shr, .bin_k_ushr, .bin_k_ident_eq, .bin_k_ident_neq => 6,
+        .cmp_br_k_less, .cmp_br_k_less_eq, .cmp_br_k_greater, .cmp_br_k_greater_eq, .cmp_br_k_eq, .cmp_br_k_not_eq, .cmp_br_k_boxed_eq, .cmp_br_k_boxed_not_eq, .cmp_br_k_ident_eq, .cmp_br_k_ident_neq => 6,
+        .vcall, .native, .callv => 7,
+        .call, .new => 8,
+        .br => 9,
+        .cmp_br => 13,
+        .load_params => 2 + 2 * @as(usize, code[pc + 1]),
+        .jit => unreachable,
+    };
+}
 
-fn exitSpan(blk: *const ir.Block) [3]u32 {
-    var i = blk.insts.len;
-    while (i > 0) {
-        i -= 1;
-        switch (blk.insts[i]) {
-            .Trace => |t| return .{ t.span.file.int(), t.span.start, t.span.end },
-            else => {},
-        }
+/// A compiled function's code: the address of the code of the op at each
+/// pc, and the op each pc held before its opcode word became `jit`.
+pub const JitCode = struct {
+    /// Per code word: the address of the code of the op that starts there,
+    /// `no_entry` where none does.
+    entries: []const usize,
+    /// Per code word: the op that starts there (`jit` where none does).
+    ops: []const Op,
+    /// Where the callees compiled into the code leave it (`InlineExit`), kept
+    /// as long as the code.
+    exits: ?*std.heap.ArenaAllocator = null,
+    /// The code this code replaced, which a frame may still be running.
+    prev: ?*const JitCode = null,
+
+    pub const no_entry: usize = 0;
+
+    pub inline fn entry(self: *const JitCode, pc: usize) usize {
+        return self.entries[pc];
     }
-    return .{ NO_SPAN, 0, 0 };
+};
+
+/// Where code a callee was compiled into leaves it for the interpreter: each
+/// callee it runs in gets its frame, outermost first, and op `op` at `pc` in
+/// block `blk` of the innermost one runs there.
+pub const InlineExit = struct {
+    levels: []const InlineLevel,
+    op: Op,
+    pc: u32,
+    blk: u32,
+    /// For an `is` or `cast`, the class test's cache the code reads, which
+    /// the exit fills for the value it left with.
+    cache: ?*u64 = null,
+    /// Times the code has left here (`baseline.exit_threshold`).
+    runs: std.atomic.Value(u32) = .init(0),
+};
+
+/// A call compiled code makes of the callee its site keeps (`baseline.Gen.directCall`): what
+/// the callee's direct entry (`FuncStreams.direct_entry`) and the shared code that makes the
+/// call otherwise (`stream.directCall`) read of it. Compiled code reads it at fixed offsets.
+/// It carries the callee's shape and the caller's way back as the site compiled them, so a
+/// call reads this record and the thread's own state and nothing of either function's
+/// streams, which a program with many callees finds out of cache.
+pub const DirectSite = extern struct {
+    // What a call reads, in the record's first two cache lines (`baseline` allocates it on a
+    // line's start); the rest only a call the handler takes reads.
+    sc: *const FuncStreams,
+    /// The callee's function and code, as `sc` holds them.
+    func: *const ir.Func,
+    code: [*]const u32,
+    /// The callee's compiled code at `npc`, when it was compiled as the site compiled.
+    entry: usize,
+    /// Where the caller's compiled code goes on after the call (`Activation.ret_code`), set as
+    /// the caller's code is installed.
+    back: usize,
+    /// The caller's streams and code, which the callee returns into.
+    caller: *const FuncStreams,
+    caller_code: [*]const u32,
+    /// The call's block and its instruction there, where the caller stands: one word.
+    blk: u32,
+    idx: u32,
+    /// The argument run: its first register's offset in the caller's window, in bytes, and its
+    /// length.
+    lo16: u32,
+    nargs: u32,
+    /// The callee's window, where it goes on once its parameters are loaded, and its entry
+    /// block.
+    n_locals: u32,
+    npc: u32,
+    eb: u32,
+    /// The callee's parameter pairs in `pairs`: its register, then the argument it loads.
+    npairs: u32,
+    ret_idx: u32,
+    ret_pc: u32,
+    dst: ir.Reg,
+    /// For a virtual call, the class its receiver's instance is; `no_class` for a static call.
+    class: u32,
+    /// Whether the shape above opens the callee's frame: the callee was compiled, its
+    /// parameters fit `pairs`, and opening its frame fills no register and clears no try
+    /// stack or span.
+    shaped: bool,
+    /// Whether a call it leaves to the handler counts toward compiling the caller again
+    /// (`FuncStreams.stale`).
+    stale: bool,
+    pairs: [2 * max_pairs]u32,
+    pc: u32,
+    op: Op,
+
+    pub const no_class = std.math.maxInt(u32);
+    pub const max_pairs = 6;
+
+    /// Fills in the callee's shape once it is compiled (`entries` its entry table), where
+    /// opening its frame takes nothing past it; the flag goes last, so a reader that sees it
+    /// sees the rest. Any thread may: they write the same words.
+    pub fn takeShape(self: *DirectSite, entries: [*]const usize) void {
+        const sc = self.sc;
+        const open = sc.open;
+        if (open.fill_all or open.keeps_try or open.clear_span or sc.fill.len != 0 or sc.param_map.len > self.pairs.len) return;
+        const e = entries[self.npc];
+        if (e == JitCode.no_entry) return;
+        for (sc.param_map, 0..) |w, i| self.pairs[i] = w;
+        self.npairs = @intCast(sc.param_map.len / 2);
+        self.entry = e;
+        @atomicStore(bool, &self.shaped, true, .release);
+    }
+
+    pub inline fn isShaped(self: *const DirectSite) bool {
+        return @atomicLoad(bool, &self.shaped, .acquire);
+    }
+};
+
+/// A callee compiled into its caller's code, as one of its exits finds it.
+pub const InlineLevel = struct {
+    sc: *const FuncStreams,
+    /// The call's pc and block in the caller's streams.
+    call_pc: u32,
+    call_blk: u32,
+    /// The callee's first register in the thread's inline registers.
+    area: u32,
+    /// The callee's registers written by the time the exit is reached; the
+    /// others are `Unit`.
+    written: []const u16,
+    /// The span the callee's blocks left: known to the compiler, or in the
+    /// thread's slot for this level.
+    span: InlineSpan,
+};
+
+pub const InlineSpan = union(enum) {
+    known: ?ir.Span,
+    slot,
+};
+
+/// Span words: a span as three words (file, start, end). `Trace` runs no op: a
+/// frame records where it stands at every instruction that can observe a span (an
+/// escape, a call, a throw), and its span is the last `Trace` before there in its
+/// block, else its block's entry span (`FuncStreams.entry_spans`). An edge op's words
+/// are the span it leaves in the frame for a target that finds its entry span there
+/// (`spanmap.edgeSpan`): file `NO_SPAN` for none to leave, `NULL_SPAN` for leaving
+/// none. The `end` op's words are its block's last `Trace`, or `NO_SPAN`.
+pub const NO_SPAN: u32 = std.math.maxInt(u32);
+pub const NULL_SPAN: u32 = std.math.maxInt(u32) - 1;
+
+/// The span words `sp` names.
+fn spanWords(sp: ?ir.Span) [3]u32 {
+    const x = sp orelse return .{ NULL_SPAN, 0, 0 };
+    return .{ x.file.int(), x.start, x.end };
+}
+
+/// The span a block's last `Trace` names, as the `end` op's words.
+fn lastTraceWords(blk: *const ir.Block) [3]u32 {
+    const sp = ir.spanmap.lastTrace(blk) orelse return .{ NO_SPAN, 0, 0 };
+    return spanWords(sp);
+}
+
+/// The span the words at `code[at]` leave: null for `NULL_SPAN`. Not for `NO_SPAN`.
+pub fn wordsSpan(code: []const u32, at: usize) ?ir.Span {
+    if (code[at] == NULL_SPAN) return null;
+    return .{ .file = @enumFromInt(code[at]), .start = code[at + 1], .end = code[at + 2] };
 }
 
 /// A block's place in its function's code.
@@ -295,14 +461,122 @@ pub const FuncStreams = struct {
     /// Per `vcall` site, the implementations the first two receiver classes it resolved run, once
     /// a call has resolved one the loop runs in place.
     vcallees: []std.atomic.Value(?*const VEntry) = &.{},
+    /// Per `callv` site, the lambda its calls have run, once one has (`LambdaSite`).
+    lambdas: []std.atomic.Value(?*const LambdaSite) = &.{},
     /// Per `const_str` site, the cell of its string once a load has made it (0 before).
     strings: []std.atomic.Value(usize),
     /// The scalar constants the function's `const_val` ops load, made when its code is built.
     values: []const runtime.Value,
-    /// A frame of the function may start with its registers unfilled (`Func.frameDefBeforeUse`).
-    no_fill: bool,
+    /// The registers a frame of the function writes `Unit` to as it opens
+    /// (`framemap.fillSet`), so that every register live anywhere holds a value there; empty
+    /// for almost every function. `Open.fill_all` for one no frame map covers, whose frames
+    /// fill every register.
+    fill: []const u32 = &.{},
+    /// What opening a frame of the function does beyond its window, in the one byte a call
+    /// reads for it.
+    open: Open = .{},
     /// What a call runs in place of a frame when the body is only field traffic (`leafOf`).
     leaf: Leaf = .none,
+    /// The function's compiled code once the JIT has compiled it; every op's
+    /// opcode word is then `jit`.
+    jit: std.atomic.Value(?*const JitCode) = .init(null),
+    /// `jit`'s entries, published with it, read by the `jit` op without the
+    /// hop through `JitCode`.
+    jit_entries: std.atomic.Value(?[*]const usize) = .init(null),
+    /// Where a compiled caller goes in the function's current code to call it (`DirectSite`):
+    /// code that opens the function's frame, as a call's handler would, and goes on at its
+    /// entry. 0 when its code has none.
+    direct_entry: std.atomic.Value(usize) = .init(0),
+    /// Entries and loop edges counted toward compiling the function; racing
+    /// counts may lose one, which only moves when it compiles.
+    hot: std.atomic.Value(u32) = .init(0),
+    /// Runs of call sites its compiled code leaves to the call for want of a
+    /// callee the site's cache held when it compiled; at the JIT's threshold
+    /// the function compiles again with what the caches hold then.
+    stale: std.atomic.Value(u32) = .init(0),
+    /// Times the function has compiled again for its call sites' caches.
+    recompiles: u8 = 0,
+    /// Times the function has compiled again for callees it ran in place that left its code
+    /// too often (`exits_hot`).
+    exit_recompiles: u8 = 0,
+    /// Set once an op of the function compiled into a caller has left the caller's code at
+    /// `baseline.exit_threshold` runs: compiled callers call the function from then on rather
+    /// than run it in place.
+    exits_hot: std.atomic.Value(bool) = .init(false),
+    /// A constructor a `new` runs as its leaf: its class's instance as the
+    /// op makes it in region memory, built at the first `new` that can use it.
+    new_template: std.atomic.Value(?*const runtime.InstanceData.Template) = .init(null),
+    /// How the code runs the instructions it does not run as they stand (hoisted parameter
+    /// loads, constants an op carries), for the frame map.
+    effects: []const ir.framemap.Effect = &.{},
+    /// Per block, the span a frame standing in it before its first `Trace` is in
+    /// (`spanmap.entrySpans`).
+    entry_spans: []const ir.spanmap.EntrySpan = &.{},
+    /// Per block, the try frames in effect from its entry on (`trymap.tryContexts`), none
+    /// in a function with no try region: the function keeps no try stack as it runs, and a
+    /// route through its handlers finds the frames from its block. Null for a function two
+    /// paths into a block of which leave different frames, which keeps its try stack.
+    try_ctx: ?ir.trymap.TryContexts = null,
+    /// Whether a block opens a try region.
+    has_try: bool = false,
+
+    /// What a frame of the function is known by from its position (`framemap.FrameMap`),
+    /// built the first time anything asks: its address, `no_frame_map` for a function it
+    /// cannot map, 0 before.
+    frame_map: std.atomic.Value(usize) = .init(0),
+
+    pub const Open = packed struct(u8) {
+        /// No frame map covers the function: its frames fill every register (`fill`).
+        fill_all: bool = false,
+        /// The function keeps its try stack (`try_ctx` null): it starts empty.
+        keeps_try: bool = false,
+        /// The entry block finds its span in the frame (`spanmap.EntrySpan.dyn`): it
+        /// starts none.
+        clear_span: bool = false,
+        _: u5 = 0,
+    };
+
+    /// The function's frame map, built now if nothing has asked before; null for a function
+    /// whose registers or blocks it cannot map. Safe from any thread, a collector's included:
+    /// it reads the function's blocks, which do not change once published.
+    pub fn frameMap(self: *const FuncStreams) ?*const ir.framemap.FrameMap {
+        const m = self.frame_map.load(.acquire);
+        if (m == no_frame_map) return null;
+        if (m != 0) return @ptrFromInt(m);
+        return self.frameMapSlow();
+    }
+
+    noinline fn frameMapSlow(self: *const FuncStreams) ?*const ir.framemap.FrameMap {
+        const a = std.heap.smp_allocator;
+        const func = self.func;
+        const built: usize = blk: {
+            const fm = (ir.framemap.FrameMap.init(a, func.blocks, func.entry.int(), func.n_locals, self.effects) catch break :blk no_frame_map) orelse break :blk no_frame_map;
+            const p = a.create(ir.framemap.FrameMap) catch {
+                var x = fm;
+                x.deinit(a);
+                break :blk no_frame_map;
+            };
+            p.* = fm;
+            break :blk @intFromPtr(p);
+        };
+        const slot = &@constCast(self).frame_map;
+        if (slot.cmpxchgStrong(0, built, .acq_rel, .acquire)) |won| {
+            if (built != no_frame_map) {
+                const p: *ir.framemap.FrameMap = @ptrFromInt(built);
+                p.deinit(a);
+                a.destroy(p);
+            }
+            return if (won == no_frame_map) null else @ptrFromInt(won);
+        }
+        return if (built == no_frame_map) null else @ptrFromInt(built);
+    }
+
+    /// The op that starts at `pc`, through `jit` to the op it stands for.
+    pub fn opAt(self: *const FuncStreams, pc: usize) Op {
+        const op: Op = @enumFromInt(@atomicLoad(u32, &self.code[pc], .acquire));
+        if (op != .jit) return op;
+        return self.jit.load(.acquire).?.ops[pc];
+    }
 };
 
 /// A body that only moves fields of its first parameter, which a call runs
@@ -341,6 +615,9 @@ fn freeLeaf(a: std.mem.Allocator, leaf: Leaf) void {
 }
 
 pub const NO_OBJECT: u32 = std.math.maxInt(u32);
+
+/// `FuncStreams.frame_map` for a function no map covers.
+const no_frame_map: usize = 1;
 
 /// The `Leaf` of `func`: one block, no handlers, reading parameters and
 /// either returning a field of parameter 0 or storing parameters in its
@@ -485,7 +762,31 @@ pub fn resetCacheForTest() void {
         a.free(fs.callees);
         a.free(fs.strings);
         freeLeaf(a, fs.leaf);
+        var next_jc = fs.jit.load(.acquire);
+        while (next_jc) |jc| {
+            next_jc = jc.prev;
+            a.free(jc.entries);
+            a.free(jc.ops);
+            if (jc.exits) |ar| {
+                ar.deinit();
+                a.destroy(ar);
+            }
+            a.destroy(jc);
+        }
         if (fs.param_map.len != 0) a.free(fs.param_map);
+        const fm = fs.frame_map.load(.acquire);
+        if (fm > no_frame_map) {
+            const p: *ir.framemap.FrameMap = @ptrFromInt(fm);
+            p.deinit(a);
+            a.destroy(p);
+        }
+        a.free(fs.effects);
+        a.free(fs.entry_spans);
+        if (fs.try_ctx) |t| {
+            var tc = t;
+            tc.deinit(a);
+        }
+        a.free(fs.fill);
         a.destroy(fs);
     }
     c.clearRetainingCapacity();
@@ -503,6 +804,8 @@ pub inline fn funcStreams(func: *const ir.Func, consts: []const ir.Const) ?*cons
 }
 
 fn funcStreamsSlow(func: *const ir.Func, consts: []const ir.Const) ?*const FuncStreams {
+    // A body another thread is still publishing has none yet (`Module.ensureFuncBody`).
+    if (@atomicLoad(u32, &func.deferred_offset, .acquire) != 0) return null;
     if (func.blocks.len == 0) return null;
     const gen = stream_gen.load(.monotonic);
     const key: CacheKey = .{ .func = @intFromPtr(func), .blocks = @intFromPtr(func.blocks.ptr), .sig = blocksSignature(func.blocks) };
@@ -525,6 +828,9 @@ fn funcStreamsSlow(func: *const ir.Func, consts: []const ir.Const) ?*const FuncS
     for (strings) |*c| c.* = .init(0);
     const vcallees = a.alloc(std.atomic.Value(?*const VEntry), sites.vcalls) catch return null;
     for (vcallees) |*c| c.* = .init(null);
+    const lambdas = a.alloc(std.atomic.Value(?*const LambdaSite), sites.callvs) catch return null;
+    for (lambdas) |*c| c.* = .init(null);
+    const fill = ir.framemap.fillSet(a, func.blocks, func.entry.int(), func.n_locals, laid.effects) catch null;
     const fs = a.create(FuncStreams) catch return null;
     fs.* = .{
         .func = func,
@@ -533,11 +839,17 @@ fn funcStreamsSlow(func: *const ir.Func, consts: []const ir.Const) ?*const FuncS
         .entry_pc = laid.blocks[func.entry.int()].enter,
         .param_map = laid.param_map,
         .body_pc = laid.body_pc,
+        .effects = laid.effects,
+        .entry_spans = laid.entry_spans,
+        .try_ctx = laid.try_ctx,
+        .has_try = laid.has_try,
         .callees = callees,
         .strings = strings,
         .vcallees = vcallees,
+        .lambdas = lambdas,
         .values = laid.values,
-        .no_fill = func.frameDefBeforeUse(),
+        .fill = fill orelse &.{},
+        .open = .{ .fill_all = fill == null, .keeps_try = laid.try_ctx == null, .clear_span = laid.entry_spans[func.entry.int()] == .dyn },
         .leaf = leafOf(a, func, sites.calls),
     };
     cache.?.put(key, fs) catch return fs;
@@ -550,8 +862,19 @@ fn funcStreamsSlow(func: *const ir.Func, consts: []const ir.Const) ?*const FuncS
 /// frame pushed, a catch-only try's frame popped at its join, a finally's frame disarmed as the
 /// finally begins) and at its Goto (a finally's frame popped, a pending flow a finally's end
 /// completes or replays, an inline return's frames popped). A Branch does none of it, and a
-/// Return checks for it where it runs.
-const BlockFx = struct { entry: bool = false, goto: bool = false, try_ret: bool = false };
+/// Return checks for it where it runs. A function whose try frames are known where each block
+/// stands (`trymap.tryContexts`) keeps no try stack: its blocks push and pop nothing, a Goto
+/// checks only for a pending flow where a finally's end keys one, and a return with a finally
+/// to run goes to the frame loop, which finds the frames from its block.
+const BlockFx = struct {
+    entry: bool = false,
+    goto: bool = false,
+    try_ret: bool = false,
+    /// A return that runs a finally first, in a function with known try frames.
+    ret_exit: bool = false,
+    /// The span words of the block's edge ops: the span they leave for their targets.
+    span: [3]u32 = .{ NO_SPAN, 0, 0 },
+};
 
 /// Whether any block opens a try region, so a return may have finallys to run.
 fn hasTry(blocks: []const ir.Block) bool {
@@ -561,13 +884,20 @@ fn hasTry(blocks: []const ir.Block) bool {
     return false;
 }
 
-fn blockEffects(blocks: []const ir.Block) ?[]BlockFx {
+fn blockEffects(blocks: []const ir.Block, tc: ?*const ir.trymap.TryContexts) ?[]BlockFx {
     const fx = std.heap.smp_allocator.alloc(BlockFx, blocks.len) catch return null;
     @memset(fx, .{});
     const try_ret = hasTry(blocks);
-    for (blocks, fx) |*b, *f| {
+    for (blocks, fx, 0..) |*b, *f, bi| {
         const h = b.h();
         f.try_ret = try_ret;
+        if (tc) |t| {
+            for (t.of(@intCast(bi))) |body| if (blocks[body].h().finally != null) {
+                f.ret_exit = true;
+                break;
+            };
+            continue;
+        }
         if (h.catches.len != 0 or h.finally != null or h.catch_done_for != null) f.entry = true;
         if (h.finally_done_for != null or h.pop_on_exit.len != 0) f.goto = true;
     }
@@ -575,7 +905,7 @@ fn blockEffects(blocks: []const ir.Block) ?[]BlockFx {
     for (blocks) |*b| {
         const h = b.h();
         if (h.finally) |fin| if (fin.int() < fx.len) {
-            fx[fin.int()].entry = true;
+            if (tc == null) fx[fin.int()].entry = true;
             fx[fin.int()].goto = true;
         };
         if (h.finally_done) |d| if (d.int() < fx.len) {
@@ -634,7 +964,18 @@ fn scalarValue(c: ir.Const) runtime.Value {
 }
 
 /// The per-function site counters a stream build numbers its call and string sites with.
-const Sites = struct { calls: u32 = 0, strings: u32 = 0, vcalls: u32 = 0 };
+const Sites = struct { calls: u32 = 0, strings: u32 = 0, vcalls: u32 = 0, callvs: u32 = 0 };
+
+/// A `callv` site's lambda: the function literal's record the closures it
+/// called point to, and what that record runs, the lambda's streams in the
+/// module its body belongs to. Immutable once published.
+pub const LambdaSite = struct {
+    record: *const anyopaque,
+    sc: *const FuncStreams,
+    module: *const ir.Module,
+    /// The sub-module the body was lowered into, null for the main module.
+    owning: ?*const ir.Module,
+};
 
 /// A `vcall` site's receiver classes, up to two, and for each the implementation it runs: the
 /// streams of an interpreted body, or, where that is null, the host function the tables bind.
@@ -671,6 +1012,10 @@ const Laid = struct {
     values: []const runtime.Value,
     param_map: []const u32 = &.{},
     body_pc: u32 = 0,
+    effects: []const ir.framemap.Effect = &.{},
+    entry_spans: []const ir.spanmap.EntrySpan = &.{},
+    try_ctx: ?ir.trymap.TryContexts = null,
+    has_try: bool = false,
 };
 
 /// The entry block's parameter loads that `load_params` takes: each may run first, since
@@ -1230,8 +1575,30 @@ fn buildBlocks(blocks: []const ir.Block, entry: u32, consts: []const ir.Const, n
     const a = std.heap.smp_allocator;
     var e: Emit = .{};
     defer e.fixups.deinit(a);
-    const fx = blockEffects(blocks) orelse return null;
+    // A function with no try region stands in none anywhere.
+    const has_try = hasTry(blocks);
+    const try_ctx: ?ir.trymap.TryContexts = if (has_try) (ir.trymap.tryContexts(a, blocks, entry) catch return null) else ir.trymap.TryContexts.none;
+    const fx = blockEffects(blocks, if (try_ctx) |*t| t else null) orelse return null;
     defer a.free(fx);
+    const entry_spans = ir.spanmap.entrySpans(a, blocks, entry) catch return null;
+    for (blocks, fx, 0..) |*b, *f, bi| {
+        var succ: [2]u32 = undefined;
+        const ts: []const u32 = switch (b.terminator) {
+            .Goto => |g| blk: {
+                succ[0] = g.int();
+                break :blk succ[0..1];
+            },
+            .Branch => |br| blk: {
+                succ = .{ br.t.int(), br.f.int() };
+                break :blk &succ;
+            },
+            else => &.{},
+        };
+        if (ir.spanmap.edgeSpan(entry_spans, b, @intCast(bi), ts)) |es| f.span = switch (es) {
+            .span => |sp| spanWords(sp),
+            .none => spanWords(null),
+        };
+    }
     const hoist = entryHoist(a, blocks, entry, n_locals) orelse return null;
     defer a.free(hoist.skip);
     const folds = constFolds(a, blocks, consts, n_locals) orelse return null;
@@ -1250,12 +1617,25 @@ fn buildBlocks(blocks: []const ir.Block, entry: u32, consts: []const ir.Const, n
     // the entry block's ops load the parameters.
     const direct = hoist.pairs.len != 0 and entry < fx.len and !fx[entry].entry;
     if (!direct and hoist.pairs.len != 0) a.free(hoist.pairs);
+    // How the code runs the instructions it does not run as they stand, for the frame map.
+    var effects: std.ArrayList(ir.framemap.Effect) = .empty;
+    if (hoist.pairs.len != 0) for (hoist.skip, 0..) |h, i| {
+        if (h) effects.append(a, .{ .at = folds.base[entry] + @as(u32, @intCast(i)), .kind = .hoisted }) catch return null;
+    };
+    for (folds.skip, folds.fold, 0..) |sk, fo, g| {
+        if (sk) effects.append(a, .{ .at = @intCast(g), .kind = .skipped }) catch return null;
+        if (fo) |f| effects.append(a, .{ .at = @intCast(g), .kind = .unread, .reg = f.reg }) catch return null;
+    }
     return .{
         .code = e.code.toOwnedSlice(a) catch return null,
         .blocks = out,
         .values = e.values.toOwnedSlice(a) catch return null,
         .param_map = if (direct) hoist.pairs else &.{},
         .body_pc = body_pc,
+        .effects = effects.toOwnedSlice(a) catch return null,
+        .entry_spans = entry_spans,
+        .try_ctx = try_ctx,
+        .has_try = has_try,
     };
 }
 
@@ -1322,7 +1702,7 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
         {
             const bo = insts[i].BinOp;
             const br = blk.terminator.Branch;
-            const cx = exitSpan(blk);
+            const cx = fx.span;
             code.appendSlice(a, &.{
                 @intFromEnum(Op.cmp_br),
                 @intCast(i),
@@ -1440,7 +1820,8 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
                     code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
                     continue;
                 }
-                code.appendSlice(a, &.{ @intFromEnum(Op.callv), @intCast(i), cv.callee.int(), cv.args.int(), cv.n_args, cv.dst.int() }) catch return null;
+                code.appendSlice(a, &.{ @intFromEnum(Op.callv), @intCast(i), cv.callee.int(), cv.args.int(), cv.n_args, cv.dst.int(), sites.callvs }) catch return null;
+                sites.callvs += 1;
             },
             .CallNative => |cn| {
                 const run_ok = cn.n_args == 0 or regOk(n_locals, cn.args.int() + cn.n_args - 1);
@@ -1538,6 +1919,13 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
                 }
                 code.appendSlice(a, &.{ @intFromEnum(Op.not), @intCast(i), n.dst.int(), n.src.int() }) catch return null;
             },
+            inline .NotNullAssert, .LateinitCheck => |n| {
+                if (!regOk(n_locals, n.dst.int()) or !regOk(n_locals, n.src.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
+                code.appendSlice(a, &.{ @intFromEnum(Op.not_null), @intCast(i), n.dst.int(), n.src.int() }) catch return null;
+            },
             .CallStatic => |cs| {
                 const run_ok = cs.n_args == 0 or regOk(n_locals, cs.args.int() + cs.n_args - 1);
                 if (!run_ok or !regOk(n_locals, cs.dst.int())) {
@@ -1579,7 +1967,7 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
             },
         }
     }
-    const xs = exitSpan(blk);
+    const xs = fx.span;
     {
         switch (blk.terminator) {
             .Goto => |g| {
@@ -1593,16 +1981,15 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
                     if (regOk(n_locals, br.cond.int())) {
                         code.appendSlice(a, &.{ @intFromEnum(Op.br), br.cond.int() }) catch return null;
                         if (!e.blockRef(br.t) or !e.blockRef(br.f)) return null;
+                        code.appendSlice(a, &xs) catch return null;
                     } else {
                         code.append(a, @intFromEnum(Op.term_exit)) catch return null;
                     }
-                    code.appendSlice(a, &xs) catch return null;
                 }
             },
             .Return => |maybe_r| {
-                if (maybe_r != null and !regOk(n_locals, maybe_r.?.int())) {
+                if (fx.ret_exit or (maybe_r != null and !regOk(n_locals, maybe_r.?.int()))) {
                     code.append(a, @intFromEnum(Op.term_exit)) catch return null;
-                    code.appendSlice(a, &xs) catch return null;
                 } else {
                     code.appendSlice(a, &.{
                         @intFromEnum(if (fx.try_ret) Op.ret_try else Op.ret),
@@ -1613,13 +2000,12 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
             },
             else => {
                 code.append(a, @intFromEnum(Op.term_exit)) catch return null;
-                code.appendSlice(a, &xs) catch return null;
             },
         }
     }
     const end: u32 = @intCast(code.items.len);
     code.append(a, @intFromEnum(Op.end)) catch return null;
-    code.appendSlice(a, &xs) catch return null;
+    code.appendSlice(a, &lastTraceWords(blk)) catch return null;
     return .{ .enter = enter, .start = start, .end = end, .idx_pc = idx_pc };
 }
 
@@ -1813,12 +2199,14 @@ test "stream encoding: field slots and virtual calls are ops of their own" {
     }, st.code);
 }
 
-test "stream encoding: a trace runs no op, and a block's exit carries its last span" {
+test "stream encoding: a trace runs no op, the end op carries its block's last span, and an edge the span its target finds" {
     const sp = @import("span");
+    const s1: ir.Span = .{ .file = sp.FileId.from(4), .start = 10, .end = 20 };
+    const s2: ir.Span = .{ .file = sp.FileId.from(4), .start = 30, .end = 40 };
     var insts = [_]ir.Inst{
-        .{ .Trace = .{ .span = .{ .file = sp.FileId.from(4), .start = 10, .end = 20 } } },
+        .{ .Trace = .{ .span = s1 } },
         .{ .Move = .{ .dst = ir.Reg.from(1), .src = ir.Reg.from(0) } },
-        .{ .Trace = .{ .span = .{ .file = sp.FileId.from(4), .start = 30, .end = 40 } } },
+        .{ .Trace = .{ .span = s2 } },
         .{ .Move = .{ .dst = ir.Reg.from(2), .src = ir.Reg.from(1) } },
     };
     const blk: ir.Block = .{
@@ -1826,22 +2214,54 @@ test "stream encoding: a trace runs no op, and a block's exit carries its last s
         .insts = &insts,
         .terminator = .{ .Goto = ir.BlockId.from(1) },
     };
+    // Alone, the block's jump has no target that finds its span in the frame.
     const st = buildOne(&blk, &.{}, 8, &test_sites) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{
         @intFromEnum(Op.move), 1, 0,
         @intFromEnum(Op.move), 2, 1,
-        @intFromEnum(Op.jump), 1, 1001, 4, 30, 40,
+        @intFromEnum(Op.jump), 1, 1001, NO_SPAN, 0, 0,
         @intFromEnum(Op.end),  4, 30, 40,
     }, st.code);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 3, 3 }, st.idx_pc);
+    // b0 (s1) branches to b1 (s2) and b2, which b1 goes on to: b2 finds s1 or s2, so the
+    // edges into it leave theirs, b0's on both its edges. b2's `end` has no span.
+    var b0 = [_]ir.Inst{.{ .Trace = .{ .span = s1 } }};
+    var b1 = [_]ir.Inst{.{ .Trace = .{ .span = s2 } }};
+    const blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.from(0), .insts = &b0, .terminator = .{ .Branch = .{ .cond = ir.Reg.from(0), .t = ir.BlockId.from(1), .f = ir.BlockId.from(2) } } },
+        .{ .id = ir.BlockId.from(1), .insts = &b1, .terminator = .{ .Goto = ir.BlockId.from(2) } },
+        .{ .id = ir.BlockId.from(2), .insts = &.{}, .terminator = .{ .Return = null } },
+    };
+    var sites: Sites = .{};
+    const laid = buildBlocks(&blocks, 0, &.{}, 4, &sites) orelse return error.TestUnexpectedResult;
+    const a = std.heap.smp_allocator;
+    defer {
+        for (laid.blocks) |b| a.free(b.idx_pc);
+        a.free(laid.blocks);
+        a.free(laid.code);
+        a.free(laid.values);
+        a.free(laid.effects);
+        a.free(laid.entry_spans);
+    }
+    try std.testing.expectEqual(ir.spanmap.EntrySpan.dyn, laid.entry_spans[2]);
+    const c = laid.code;
+    const br = laid.blocks[0].start;
+    try std.testing.expectEqual(@intFromEnum(Op.br), c[br]);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 10, 20 }, c[br + 6 .. br + 9]);
+    const jmp = laid.blocks[1].start;
+    try std.testing.expectEqual(@intFromEnum(Op.jump), c[jmp]);
+    try std.testing.expectEqualSlices(u32, &.{ 4, 30, 40 }, c[jmp + 3 .. jmp + 6]);
+    try std.testing.expectEqualSlices(u32, &.{ NO_SPAN, 0, 0 }, c[laid.blocks[2].end + 1 .. laid.blocks[2].end + 4]);
 }
 
-test "stream encoding: constructors, function values, host calls and Not are ops of their own" {
+test "stream encoding: constructors, function values, host calls, Not and not-null assertions are ops of their own" {
     var insts = [_]ir.Inst{
         .{ .RNewInstance = .{ .dst = ir.Reg.from(4), .class = ir.ClassId.from(3), .ctor = ir.FuncId.from(11), .args = ir.Reg.from(1), .n_args = 2 } },
         .{ .RCallValue = .{ .dst = ir.Reg.from(5), .callee = ir.Reg.from(0), .args = ir.Reg.from(1), .n_args = 1 } },
         .{ .Not = .{ .dst = ir.Reg.from(6), .src = ir.Reg.from(2) } },
         .{ .CallNative = .{ .dst = ir.Reg.from(7), .native = ir.NativeId.from(40), .args = ir.Reg.from(1), .n_args = 2, .direct = true } },
+        .{ .NotNullAssert = .{ .dst = ir.Reg.from(3), .src = ir.Reg.from(7) } },
+        .{ .LateinitCheck = .{ .dst = ir.Reg.from(2), .src = ir.Reg.from(3), .name = ir.ConstId.from(0) } },
     };
     const blk: ir.Block = .{
         .id = ir.BlockId.from(0),
@@ -1852,9 +2272,11 @@ test "stream encoding: constructors, function values, host calls and Not are ops
     const st = buildOne(&blk, &.{}, 8, &sites) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u32, &.{
         @intFromEnum(Op.new),    0, 3, 11, 1, 2, 4, 0,
-        @intFromEnum(Op.callv),  1, 0, 1, 1, 5,
+        @intFromEnum(Op.callv),  1, 0, 1, 1, 5, 0,
         @intFromEnum(Op.not),    2, 6, 2,
         @intFromEnum(Op.native), 3, 40, 1, 2, 7, 1,
+        @intFromEnum(Op.not_null), 4, 3, 7,
+        @intFromEnum(Op.not_null), 5, 2, 3,
         @intFromEnum(Op.jump),   1, 1001, NO_SPAN, 0, 0,
         @intFromEnum(Op.end),    NO_SPAN, 0, 0,
     }, st.code);
@@ -1898,6 +2320,31 @@ test "stream encoding: a function's blocks share one code array, and an edge nam
     try std.testing.expect(buildBlocks(&bad, 0, &.{}, 8, &sites) == null);
 }
 
+test "a body still being published has no streams until its flag clears" {
+    var none = [_]ir.Inst{};
+    var blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.from(0), .insts = &none, .terminator = .{ .Return = ir.Reg.from(0) } },
+    };
+    var f: ir.Func = .{
+        .id = ir.FuncId.from(0),
+        .name = "published",
+        .fqn = "published",
+        .params = &.{},
+        .return_ty = .{ .name = "", .nullable = true, .args = &.{} },
+        .n_locals = 1,
+        .blocks = &blocks,
+        .deferred_offset = 1,
+        .entry = ir.BlockId.from(0),
+        .is_suspend = false,
+    };
+    // `ensureFuncBody` writes the blocks before it clears the flag; a reader must not take
+    // them before the flag says they are all there.
+    try std.testing.expect(funcStreams(&f, &.{}) == null);
+    @atomicStore(u32, &f.deferred_offset, 0, .release);
+    const fs = funcStreams(&f, &.{}) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), fs.blocks.len);
+}
+
 test "stream encoding: captures, statics and class tests are ops of their own" {
     var insts = [_]ir.Inst{
         .{ .LoadCapture = .{ .dst = ir.Reg.from(1), .idx = 2 } },
@@ -1923,7 +2370,7 @@ test "stream encoding: captures, statics and class tests are ops of their own" {
     }, st.code);
 }
 
-test "stream encoding: a try region's blocks start with block_entry, and its bookkeeping Gotos are goto_try" {
+test "stream encoding: a function whose try frames are known pushes and pops none, and a finally's Gotos check for a pending flow" {
     var none = [_]ir.Inst{};
     var mv = [_]ir.Inst{
         .{ .Move = .{ .dst = ir.Reg.from(1), .src = ir.Reg.from(0) } },
@@ -1938,26 +2385,63 @@ test "stream encoding: a try region's blocks start with block_entry, and its boo
     };
     var sites: Sites = .{};
     const laid = buildBlocks(&blocks, 0, &.{}, 8, &sites) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(laid.try_ctx != null);
     try std.testing.expectEqualSlices(u32, &.{
-        // b0: a plain Goto into the try body, which is entered through the frame loop.
+        // b0: a plain Goto into the try body.
         @intFromEnum(Op.jump),        1, 10, NO_SPAN, 0, 0,
         @intFromEnum(Op.end),         NO_SPAN, 0, 0,
-        // b1: pushes its try frame at entry; its Goto into the finally is plain.
-        @intFromEnum(Op.block_entry),
+        // b1: the try body pushes nothing; its Goto into the finally is plain, and leaves
+        // the finally, which finds its span in the frame, none.
         @intFromEnum(Op.move),        1, 0,
-        @intFromEnum(Op.jump),        2, 24, NO_SPAN, 0, 0,
+        @intFromEnum(Op.jump),        2, 23, NULL_SPAN, 0, 0,
         @intFromEnum(Op.end),         NO_SPAN, 0, 0,
-        // b2: the finally disarms its frame at entry and keys a pending flow at its Goto.
-        @intFromEnum(Op.block_entry),
-        @intFromEnum(Op.goto_try),    3, 35, NO_SPAN, 0, 0,
+        // b2: the finally's Goto checks for a flow it keys.
+        @intFromEnum(Op.goto_try),    3, 33, NO_SPAN, 0, 0,
         @intFromEnum(Op.end),         NO_SPAN, 0, 0,
-        // b3: the done sentinel keys a pending flow and returns through any finally left.
+        // b3: the done sentinel returns through any finally a flow left.
         @intFromEnum(Op.ret_try),     0, 0,
         @intFromEnum(Op.end),         NO_SPAN, 0, 0,
     }, laid.code);
-    try std.testing.expectEqual(@as(u32, 10), laid.blocks[1].enter);
-    try std.testing.expectEqual(@as(u32, 11), laid.blocks[1].start);
-    try std.testing.expectEqualSlices(u32, &.{11}, laid.blocks[1].idx_pc);
+    // A return inside the region has the finally to run, which the frame loop finds.
+    var ret_h: ir.BlockHandlers = .{ .finally = ir.BlockId.from(2), .finally_done = ir.BlockId.from(3) };
+    const inside = [_]ir.Block{
+        .{ .id = ir.BlockId.from(0), .insts = &none, .terminator = .{ .Goto = ir.BlockId.from(1) } },
+        .{ .id = ir.BlockId.from(1), .insts = &mv, .terminator = .{ .Return = ir.Reg.from(1) }, .handlers = &ret_h },
+        .{ .id = ir.BlockId.from(2), .insts = &none, .terminator = .{ .Goto = ir.BlockId.from(3) } },
+        .{ .id = ir.BlockId.from(3), .insts = &none, .terminator = .{ .Return = null }, .handlers = &done_h },
+    };
+    const in_laid = buildBlocks(&inside, 0, &.{}, 8, &sites) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@intFromEnum(Op.term_exit), in_laid.code[in_laid.blocks[1].start + 3]);
+}
+
+test "stream encoding: a function whose paths leave a block different try frames keeps its try stack: its try blocks start with block_entry" {
+    var none = [_]ir.Inst{};
+    var catches = [_]ir.CatchHandler{.{ .class = ir.ClassId.from(0), .handler = ir.BlockId.from(3), .exception_reg = ir.Reg.from(1) }};
+    var body_h: ir.BlockHandlers = .{ .catches = &catches };
+    // b1's region goes on to b2 without leaving it, and b0 goes around it to b2.
+    const blocks = [_]ir.Block{
+        .{ .id = ir.BlockId.from(0), .insts = &none, .terminator = .{ .Branch = .{ .cond = ir.Reg.from(0), .t = ir.BlockId.from(1), .f = ir.BlockId.from(2) } } },
+        .{ .id = ir.BlockId.from(1), .insts = &none, .terminator = .{ .Goto = ir.BlockId.from(2) }, .handlers = &body_h },
+        .{ .id = ir.BlockId.from(2), .insts = &none, .terminator = .{ .Return = null } },
+        .{ .id = ir.BlockId.from(3), .insts = &none, .terminator = .{ .Return = null } },
+    };
+    var sites: Sites = .{};
+    const laid = buildBlocks(&blocks, 0, &.{}, 8, &sites) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(laid.try_ctx == null);
+    try std.testing.expectEqualSlices(u32, &.{
+        @intFromEnum(Op.br),          0, 1, 13, 2, 24, NO_SPAN, 0, 0,
+        @intFromEnum(Op.end),         NO_SPAN, 0, 0,
+        // b1: pushes its try frame at entry.
+        @intFromEnum(Op.block_entry),
+        @intFromEnum(Op.jump),        2, 24, NO_SPAN, 0, 0,
+        @intFromEnum(Op.end),         NO_SPAN, 0, 0,
+        @intFromEnum(Op.ret_try),     0, 0,
+        @intFromEnum(Op.end),         NO_SPAN, 0, 0,
+        @intFromEnum(Op.ret_try),     0, 0,
+        @intFromEnum(Op.end),         NO_SPAN, 0, 0,
+    }, laid.code);
+    try std.testing.expectEqual(@as(u32, 13), laid.blocks[1].enter);
+    try std.testing.expectEqual(@as(u32, 14), laid.blocks[1].start);
 }
 
 test "stream encoding: cells, static stores, closures and arrays are ops of their own" {
@@ -2008,8 +2492,9 @@ pub fn dumpBlock(w: anytype, fs: *const FuncStreams, b: usize) !void {
     var pc: usize = fs.blocks[b].enter;
     const code = fs.code;
     while (pc <= fs.blocks[b].end) {
-        const op: Op = @enumFromInt(code[pc]);
+        const op = fs.opAt(pc);
         switch (op) {
+            .jit => unreachable,
             .const_load => {
                 try w.print("  {d:>4}: const_load r{d} <- const#{d}\n", .{ pc, code[pc + 1], code[pc + 2] });
                 pc += 3;
@@ -2136,11 +2621,15 @@ pub fn dumpBlock(w: anytype, fs: *const FuncStreams, b: usize) !void {
                 pc += 8;
             },
             .callv => {
-                try w.print("  {d:>4}: callv      i{d} r{d}(r{d}..+{d}) -> r{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5] });
-                pc += 6;
+                try w.print("  {d:>4}: callv      i{d} r{d}(r{d}..+{d}) -> r{d} site{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5], code[pc + 6] });
+                pc += 7;
             },
             .not => {
                 try w.print("  {d:>4}: not        i{d} r{d} <- !r{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
+                pc += 4;
+            },
+            .not_null => {
+                try w.print("  {d:>4}: not_null   i{d} r{d} <- r{d}!!\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
                 pc += 4;
             },
             .const_str => {
@@ -2364,6 +2853,7 @@ test "stream encoding: the entry block's parameters load in one op a call steps 
         a.free(laid.code);
         a.free(laid.values);
         a.free(laid.param_map);
+        a.free(laid.effects);
     }
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 1, 1 }, laid.param_map);
     const e0 = laid.blocks[0].enter;
@@ -2371,6 +2861,8 @@ test "stream encoding: the entry block's parameters load in one op a call steps 
     try std.testing.expectEqual(e0 + 6, laid.body_pc);
     // A later block's load keeps its own op.
     try std.testing.expectEqual(@intFromEnum(Op.load_param), laid.code[laid.blocks[1].start]);
+    // The frame map reads the two loads as run before the entry block's first instruction.
+    try std.testing.expectEqualSlices(ir.framemap.Effect, &.{ .{ .at = 1, .kind = .hoisted }, .{ .at = 2, .kind = .hoisted } }, laid.effects);
 }
 
 
@@ -2406,6 +2898,14 @@ test "stream encoding: a constant only one operation reads rides in that operati
         @intFromEnum(Op.cmp_br),   3,                  kindWord(.Less), 4, 3, 2,
     }, laid.code[0..24]);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 12, 12 }, laid.blocks[0].idx_pc);
+    // The frame map reads each folded constant as doing nothing, and its op as reading no
+    // register for it.
+    try std.testing.expectEqualSlices(ir.framemap.Effect, &.{
+        .{ .at = 0, .kind = .skipped },
+        .{ .at = 1, .kind = .unread, .reg = 1 },
+        .{ .at = 2, .kind = .skipped },
+        .{ .at = 3, .kind = .unread, .reg = 3 },
+    }, laid.effects);
     // A constant read twice, one on the left of an operator with no mirror, and a NaN keep their loads.
     const t = laid.blocks[1].start;
     try std.testing.expectEqualSlices(u32, &.{ @intFromEnum(Op.const_int), 5, 0xff }, laid.code[t .. t + 3]);

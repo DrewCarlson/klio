@@ -1,0 +1,23 @@
+plain/3: size=3 3 get=[0, null, null] set=[true, false, false] index=[0, 49, -1]
+plain/3: after remove 2
+plain/40: size=40 40 get=[0, null, null] set=[true, false, false] index=[0, 49, -1]
+plain/40: after remove 39
+point/3: size=3 3 get=[0, null, null] set=[true, false, false] index=[0, 49, -1]
+point/3: after remove 2
+point/40: size=40 40 get=[0, null, null] set=[true, false, false] index=[0, 49, -1]
+point/40: after remove 39
+byId/3: size=3 3 get=[null, null, null] set=[false, false, false] index=[4, 4, -1]
+byId/3: after remove 3
+byId/40: size=40 40 get=[4, 4, null] set=[true, true, false] index=[4, 4, -1]
+byId/40: after remove 39
+tagged/3: size=3 3 get=[2, 2, null] set=[true, true, false] index=[2, 2, -1]
+tagged/3: after remove 2
+tagged/40: size=40 40 get=[2, 2, null] set=[true, true, false] index=[2, 2, -1]
+tagged/40: after remove 39
+hashOnly/3: size=3 3 get=[null, null] set=[false, false] index=[5, -1]
+hashOnly/3: after remove 3
+hashOnly/40: size=40 40 get=[5, null] set=[true, false] index=[5, -1]
+hashOnly/40: after remove 39
+plain null point string int
+3 null hashCode calls=2
+245000

@@ -628,12 +628,7 @@ pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.E
             const g = m.entries.borrow();
             const src_mc = g.get().mod_count;
             const live = m.mutable and !stdlib.implementations.collections.modCountFrozen(src_mc);
-            const stamp: u64 = blk: {
-                const cell = src_mc.get() orelse break :blk 0;
-                const cg = cell.borrow();
-                defer cg.deinit();
-                break :blk cg.get().*;
-            };
+            const stamp: u64 = if (src_mc.get()) |cell| cell.cell.data.load() else 0;
             var items: std.ArrayList(Value) = .empty;
             for (g.get().pairs.items) |kv| {
                 kv.key.retain();
@@ -813,7 +808,7 @@ pub fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Va
                 const sel = step.selector;
                 const n_params: usize = switch (sel) {
                     .IrClosure => |c| blk: {
-                        if (self.closures.get(@intCast(c.asPtrConst().id))) |info| break :blk info.n_params;
+                        if (self.closures.record(c.asPtrConst())) |info| break :blk info.n_params;
                         break :blk 1;
                     },
                     else => 1,
@@ -979,11 +974,7 @@ pub fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (me.backing.get()) |entries| {
                 const g = entries.borrow();
                 var stale = false;
-                if (g.get().mod_count.get()) |cell| {
-                    const cg = cell.borrow();
-                    stale = cg.get().* != me.exp_mod;
-                    cg.deinit();
-                }
+                if (g.get().mod_count.get()) |cell| stale = cell.cell.data.load() != me.exp_mod;
                 if (stale) {
                     g.deinit();
                     return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
@@ -1071,33 +1062,22 @@ fn mapEntriesCounter(entries: runtime.MapEntries) u64 {
     const g = entries.borrow();
     defer g.deinit();
     const cell = g.get().mod_count.get() orelse return 0;
-    const cg = cell.borrow();
-    defer cg.deinit();
-    return cg.get().*;
+    return cell.cell.data.load();
 }
 
-const ModCapture = struct { mod_count: ?ObjRef(u64), exp_mod: u64 };
+const ModCapture = struct { mod_count: ?runtime.ModCountRef, exp_mod: u64 };
 
 /// A list's shared `mod_count` and its value, the iterator's expectation.
-pub fn captureModCount(allocator: Allocator, src: ?ObjRef(u64)) Allocator.Error!ModCapture {
+pub fn captureModCount(allocator: Allocator, src: ?runtime.ModCountRef) Allocator.Error!ModCapture {
     _ = allocator;
     const mc = src orelse return .{ .mod_count = null, .exp_mod = 0 };
-    const cur = blk: {
-        const g = mc.borrow();
-        defer g.deinit();
-        break :blk g.get().*;
-    };
-    return .{ .mod_count = mc.clone(), .exp_mod = cur };
+    return .{ .mod_count = mc.clone(), .exp_mod = mc.cell.data.load() };
 }
 
 /// `ConcurrentModificationException` when the source mutated since capture.
 fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResult {
     const mc = iterModCount(it).get() orelse return null;
-    const cur = blk: {
-        const g = mc.borrow();
-        defer g.deinit();
-        break :blk g.get().*;
-    };
+    const cur = mc.cell.data.load();
     const exp = blk: {
         const g = it.borrow();
         defer g.deinit();
@@ -1110,11 +1090,7 @@ fn iteratorCheckMod(allocator: Allocator, it: anytype) Allocator.Error!?EvalResu
 /// Resync the expectation after the iterator's OWN structural mutation.
 fn iteratorResyncMod(it: anytype) void {
     const mc = iterModCount(it).get() orelse return;
-    const cur = blk: {
-        const g = mc.borrow();
-        defer g.deinit();
-        break :blk g.get().*;
-    };
+    const cur = mc.cell.data.load();
     const g = it.borrowMut();
     defer g.deinit();
     g.get().exp_mod = cur;
@@ -1123,11 +1099,7 @@ fn iteratorResyncMod(it: anytype) void {
 /// The iterator's own `add`/`remove` bypasses the list intrinsics: bump the
 /// shared `mod_count`, then resync this iterator.
 fn iteratorOwnStructuralMod(it: anytype) void {
-    if (iterModCount(it).get()) |mc| {
-        const g = mc.borrowMut();
-        g.get().* +%= 1;
-        g.deinit();
-    }
+    if (iterModCount(it).get()) |mc| mc.cell.data.bump();
     iteratorResyncMod(it);
 }
 
@@ -1845,8 +1817,8 @@ pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b:
     const ca = a.IrClosure;
     const cb = b.IrClosure;
     if (ca.asPtrConst().id == cb.asPtrConst().id) return true;
-    const ia = self.closures.get(@intCast(ca.asPtrConst().id)) orelse return Value.structuralEq(a, b);
-    const ib = self.closures.get(@intCast(cb.asPtrConst().id)) orelse return Value.structuralEq(a, b);
+    const ia = self.closures.record(ca.asPtrConst()) orelse return Value.structuralEq(a, b);
+    const ib = self.closures.record(cb.asPtrConst()) orelse return Value.structuralEq(a, b);
     if (ia.resolved != null or ib.resolved != null) {
         if (!resolvedSameTarget(ia, ib)) return false;
         const ga = ca.borrow();
@@ -1906,7 +1878,7 @@ fn resolvedSameTarget(ia: root.ClosureInfo, ib: root.ClosureInfo) bool {
 /// Hash of a callable reference, consistent with `closureRefEquals`.
 pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
     const c = v.IrClosure;
-    const info = self.closures.get(@intCast(c.asPtrConst().id)) orelse return kotlinHashCode(v);
+    const info = self.closures.record(c.asPtrConst()) orelse return kotlinHashCode(v);
     if (info.resolved) |kind| {
         const target: u32 = switch (kind) {
             .lambda => return kotlinHashCode(v),

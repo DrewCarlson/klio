@@ -12,6 +12,7 @@ const pack = @import("pack");
 const bf = pack.bundle_format;
 
 const interp_ir = @import("interp_ir");
+const ir = @import("ir");
 const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
@@ -113,6 +114,7 @@ fn mmapSelf(len: u64) ?[]const u8 {
 }
 
 pub fn run(gpa: Allocator, argv: []const []const u8) u8 {
+    ir.eval.jitDefaultOn();
     const trailer = probeSelf() orelse {
         io.writeStderr("error: bundle probe failed after activation\n");
         return 1;

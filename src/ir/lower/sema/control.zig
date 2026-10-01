@@ -284,6 +284,8 @@ fn loopWhile(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     const exit = try b.newBlock();
     b.terminate(.{ .Goto = cond_blk });
     b.switchTo(cond_blk);
+    // Every test of the condition stands at the loop, as kotlinc's line table has it.
+    try b.emit(.{ .Trace = .{ .span = e.span() } });
     const c = try loopCondition(b, w.cond, groups);
     if (!b.terminated()) b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
     b.switchTo(body_blk);
@@ -322,6 +324,8 @@ fn loopDoWhile(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     if (w.body) |bd| try loopBody(b, bd, label, exit, cond_blk, groups);
     if (!b.terminated()) b.terminate(.{ .Goto = cond_blk });
     b.switchTo(cond_blk);
+    // The condition stands at itself, after the body's last statement.
+    try b.emit(.{ .Trace = .{ .span = w.cond.span() } });
     const c = try loopCondition(b, w.cond, groups);
     if (!b.terminated()) b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
     b.switchTo(exit);
@@ -367,6 +371,8 @@ fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     const exit = try b.newBlock();
     b.terminate(.{ .Goto = head });
     b.switchTo(head);
+    // `hasNext()` and `next()` stand at the loop on every iteration.
+    try b.emit(.{ .Trace = .{ .span = e.span() } });
     if (groups.per_iteration) try compose.startReplaceGroup(b, f.iter.span());
     const more = try operator.callOn(b, &g.has_next, iter, &.{});
     if (groups.per_iteration) {
@@ -443,7 +449,7 @@ fn countedFor(b: *Builder, e: *const ast.Expr, g: *const records.ForGroup) Error
 }
 
 /// `rangeTo`/`rangeUntil` of the primitive class, on an operand of its own type.
-fn primRangeMember(s: *sema.Sema, callee: Sym, prim: operator.Prim, want: []const u8) bool {
+pub fn primRangeMember(s: *sema.Sema, callee: Sym, prim: operator.Prim, want: []const u8) bool {
     if (s.syms.kind(callee) != .function or !std.mem.eql(u8, s.str(s.syms.name(callee)), want)) return false;
     const owner = s.syms.owner(callee);
     if (owner == .none or s.syms.kind(owner) != .class or operator.primOfClass(s, owner) != prim) return false;
@@ -451,7 +457,7 @@ fn primRangeMember(s: *sema.Sema, callee: Sym, prim: operator.Prim, want: []cons
 }
 
 /// `until`/`downTo` of `kotlin.ranges` on the primitive, with a bound of its type.
-fn rangesExtension(s: *sema.Sema, callee: Sym, prim: operator.Prim) bool {
+pub fn rangesExtension(s: *sema.Sema, callee: Sym, prim: operator.Prim) bool {
     if (s.syms.kind(callee) != .function) return false;
     const owner = s.syms.owner(callee);
     if (owner == .none or s.syms.kind(owner) != .package) return false;
@@ -541,6 +547,7 @@ fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) 
         const exit = try b.newBlock();
         b.terminate(.{ .Goto = head });
         b.switchTo(head);
+        try b.emit(.{ .Trace = .{ .span = e.span() } });
         try compose.startReplaceGroup(b, f.iter.span());
         const test_more = b.newReg();
         try b.emit(.{ .Move = .{ .dst = test_more, .src = more } });
@@ -554,6 +561,7 @@ fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) 
         try loopBody(b, f.body, label, exit, next, groups);
         if (!b.terminated()) b.terminate(.{ .Goto = next });
         b.switchTo(next);
+        try b.emit(.{ .Trace = .{ .span = e.span() } });
         try countStep(b, c, i, bound, step, more);
         b.terminate(.{ .Goto = head });
         b.switchTo(exit);
@@ -572,6 +580,8 @@ fn loopCounted(b: *Builder, e: *const ast.Expr, label: ?[]const u8, c: Counted) 
     try loopBody(b, f.body, label, exit, next, groups);
     if (!b.terminated()) b.terminate(.{ .Goto = next });
     b.switchTo(next);
+    // The step stands at the loop, as the test it ends with does.
+    try b.emit(.{ .Trace = .{ .span = e.span() } });
     try countStep(b, c, i, bound, step, more);
     b.terminate(.{ .Branch = .{ .cond = more, .t = body_blk, .f = exit } });
     b.switchTo(exit);

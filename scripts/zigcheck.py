@@ -7,6 +7,8 @@ Usage: scripts/zigcheck.py <module>            # run `zig test`
        scripts/zigcheck.py <module> --build-only # `zig build-obj` (compile, no run)
        scripts/zigcheck.py <module> --build-only --target x86_64-windows-gnu
                                                  # compile for another target
+       scripts/zigcheck.py <module> --target x86_64-macos
+                                                 # run x86-64 tests (arm64 Mac, Rosetta)
 
 The `itests` module is special-cased: one `zig test` per file under
 src/itests/ (mirroring build.zig's per-file test binaries), because a single
@@ -37,7 +39,8 @@ GRAPH = {
     "lexer": ["diagnostics", "span"],
     "pack": ["ast", "span", "types"],
     "parser": ["ast", "diagnostics", "lexer", "span"],
-    "ir": ["span", "ast", "runtime", "diagnostics", "sema"],
+    "jit": [],
+    "ir": ["span", "ast", "runtime", "diagnostics", "sema", "jit"],
     "stdlib": ["runtime", "pack"],
     "cfa": ["ast", "diagnostics", "lexer", "parser", "span", "types"],
     "resolver": ["span", "ast", "diagnostics", "types", "stdlib"],
@@ -200,6 +203,13 @@ def run_itest_shards(build_only, mods, jobs, target=None):
     return 1 if failed else 0
 
 
+def host_runs(target):
+    """Whether this host runs `target`'s test binaries: an arm64 Mac runs
+    x86-64 macOS ones under Rosetta."""
+    import platform
+    return sys.platform == "darwin" and platform.machine() == "arm64" and target.startswith("x86_64-macos")
+
+
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in GRAPH:
         print("usage: zigcheck.py <module> [--build-only [--target TRIPLE]] [--root FILE] [--jobs N]", file=sys.stderr)
@@ -217,9 +227,9 @@ def main():
             target = sys.argv[i + 1]
         if a == "--jobs" and i + 1 < len(sys.argv):
             jobs = max(1, int(sys.argv[i + 1]))
-    if target and not build_only:
+    if target and not build_only and not host_runs(target):
         # A test binary for another target cannot run here.
-        print("error: --target needs --build-only", file=sys.stderr)
+        print("error: --target needs --build-only unless this host runs that target", file=sys.stderr)
         return 2
     mods = closure(root)
 

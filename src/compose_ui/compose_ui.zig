@@ -50,6 +50,7 @@ pub fn hostBindings(allocator: std.mem.Allocator) Error!HostBindings {
     try b.register("androidx.compose.ui.window.__composeui_winSetCursor", winSetCursor);
     try b.register("androidx.compose.ui.window.__composeui_winRefreshHz", winRefreshHz);
     try b.register("androidx.compose.ui.window.__composeui_appWake", appWake);
+    try b.register("androidx.compose.ui.window.__composeui_scriptSettled", scriptSettled);
     try b.register("androidx.compose.ui.window.__composeui_winDragStart", winDragStart);
     try b.register("androidx.compose.ui.window.__composeui_winDndAccept", winDndAccept);
     try b.register("androidx.compose.ui.window.__composeui_traySupported", traySupported);
@@ -197,6 +198,7 @@ const Skia = struct {
     winSetCursor: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
     winRefreshHz: ?*const fn (?*SkWindow) callconv(.c) c_int,
     appWake: ?*const fn () callconv(.c) void,
+    scriptSettled: ?*const fn () callconv(.c) void,
     winDragStart: ?WinDragStartFn,
     winDndAccept: ?*const fn (?*SkWindow, c_int) callconv(.c) void,
     winLastError: ?*const fn () callconv(.c) [*:0]const u8,
@@ -355,6 +357,7 @@ fn loadSkia() ?*Skia {
         .winSetCursor = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
         .winRefreshHz = lib.lookup(*const fn (?*SkWindow) callconv(.c) c_int, "klio_win_refresh_hz"),
         .appWake = lib.lookup(*const fn () callconv(.c) void, "klio_app_wake"),
+        .scriptSettled = lib.lookup(*const fn () callconv(.c) void, "klio_script_settled"),
         .winDragStart = lib.lookup(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = lib.lookup(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
@@ -420,6 +423,7 @@ fn loadSkiaStatic() ?*Skia {
         .winSetCursor = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_set_cursor"),
         .winRefreshHz = externSym(*const fn (?*SkWindow) callconv(.c) c_int, "klio_win_refresh_hz"),
         .appWake = externSym(*const fn () callconv(.c) void, "klio_app_wake"),
+        .scriptSettled = externSym(*const fn () callconv(.c) void, "klio_script_settled"),
         .winDragStart = externSym(WinDragStartFn, "klio_win_drag_start"),
         .winDndAccept = externSym(*const fn (?*SkWindow, c_int) callconv(.c) void, "klio_win_dnd_accept"),
         .winLastError = externSym(*const fn () callconv(.c) [*:0]const u8, "klio_win_last_error"),
@@ -951,6 +955,16 @@ fn appWake(ctx: *CallCtx) Error!EvalResult {
     _ = ctx;
     const skia = loadSkia() orelse return ok(.{ .Unit = {} });
     const f = skia.appWake orelse return ok(.{ .Unit = {} });
+    f();
+    return ok(.{ .Unit = {} });
+}
+
+/// `__composeui_scriptSettled()`: the window loop has no work queued, no frame
+/// wanted and no window to draw, so scripted input's next events may come.
+fn scriptSettled(ctx: *CallCtx) Error!EvalResult {
+    _ = ctx;
+    const skia = loadSkia() orelse return ok(.{ .Unit = {} });
+    const f = skia.scriptSettled orelse return ok(.{ .Unit = {} });
     f();
     return ok(.{ .Unit = {} });
 }
@@ -1604,8 +1618,9 @@ test "hostBindings registers the surface and windowing sinks" {
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winSetCursor") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winRefreshHz") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_appWake") != null);
+    try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_scriptSettled") != null);
     try testing.expect(b.resolve("androidx.compose.ui.window.__composeui_winDragStart") != null);
-    try testing.expectEqual(@as(usize, 71), b.len());
+    try testing.expectEqual(@as(usize, 72), b.len());
 }
 
 test "a window that cannot open says why" {

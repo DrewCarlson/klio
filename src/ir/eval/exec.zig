@@ -57,7 +57,6 @@ const FlatCallSite = ev_flow.FlatCallSite;
 const Frame = ev_frame.Frame;
 const ParkPoint = ev_flow.ParkPoint;
 const PendingFinallyState = ev_snapshot.PendingFinallyState;
-const RegMask = ev_frame.RegMask;
 const Step = ev_flow.Step;
 const TryFrame = ev_snapshot.TryFrame;
 const attachStackTrace = ev_diag.attachStackTrace;
@@ -122,6 +121,7 @@ fn runLoop(
     host: *H,
 ) Allocator.Error!EvalResult {
     const ev: *EvalTls = ev_state.evtlsPtr();
+    ev_state.refreshCallMode(ev);
     const S = stream.Stream(H, reclaim);
     // What the stream loop keeps besides its hot state; the open activations are its `top`.
     var c: S.Ctx = .{
@@ -130,10 +130,9 @@ fn runLoop(
         .ev = ev,
         .root = root,
         .root_ts = root_ts,
-        .try_stack = root_ts,
-        .func = root.func,
         .bs = undefined,
         .frame = root,
+        .tlab = runtime.gc.tlabFor(allocator),
     };
     // On an allocation failure, unwind every open activation so no frame dangles on the GC chain.
     errdefer while (c.top) |act| {
@@ -164,7 +163,7 @@ fn runLoop(
         c.park_out = &park_point;
         var res: EvalResult = blocks: {
             // Lazy IR: materialise a deferred function's blocks first.
-            if (func.blocks.len == 0 and !frame.module.ensureFuncBody(@constCast(func))) {
+            if (!frame.module.ensureFuncBody(@constCast(func))) {
                 if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
                     std.debug.print("[empty-frame] fqn={s} params={d} caller={s}\n", .{
                         func.fqn, func.params.len,
@@ -177,6 +176,7 @@ fn runLoop(
             dumpFnIfRequested(func);
             // The function's code: a null table is an allocation that failed or an edge to no block.
             var bc_streams: *const bc.FuncStreams = bc.funcStreams(func, frame.module.consts.items) orelse return error.OutOfMemory;
+            S.countEntry(bc_streams, frame.module);
             block_loop: while (true) {
                 // A block entry is a safe point: no cell lock may be held across it.
                 runtime.assertNoCellLock();
@@ -200,14 +200,20 @@ fn runLoop(
                 if (runtime.gc.gc_enabled and runtime.gc.pendingFlag() and
                     resume_throw == null and resume_unwind == null)
                 {
+                    // At the block's start, or where a resume goes on in it (its terminator
+                    // for one past its instructions).
+                    frame.at(cur, if (resume_idx == 0) ev_frame.block_start else @min(resume_idx, func.blocks[cur.int()].insts.len));
                     runtime.gc.safePoint();
                 }
                 const block = &func.blocks[cur.int()];
-                if (resume_idx == 0) {
-                    try enterTryBlock(try_stack, block, cur);
-                } else if (block.h().catch_done_for) |body| {
-                    // A resume into a catch-only try's join pops the body's frame, as an entry does.
-                    if (rpositionByBody(try_stack.items, body)) |p| _ = try_stack.orderedRemove(p);
+                // A function with known try frames keeps no try stack (`FuncStreams.try_ctx`).
+                if (bc_streams.try_ctx == null) {
+                    if (resume_idx == 0) {
+                        try enterTryBlock(try_stack, block, cur);
+                    } else if (block.h().catch_done_for) |body| {
+                        // A resume into a catch-only try's join pops the body's frame, as an entry does.
+                        if (rpositionByBody(try_stack.items, body)) |p| _ = try_stack.orderedRemove(p);
+                    }
                 }
                 const insts: []const Inst = block.insts;
                 const term = block.terminator;
@@ -246,8 +252,6 @@ fn runLoop(
                     else
                         bl.idx_pc[start_idx];
                     c.frame = frame;
-                    c.try_stack = try_stack;
-                    c.func = func;
                     c.bs = bs;
                     c.thrown = null;
                     c.unwound = null;
@@ -255,8 +259,8 @@ fn runLoop(
                     const exit = S.run(&c, frame, bs.code.ptr, pc, cur.int());
                     // The stream may have gone on into other blocks and other frames.
                     frame = c.frame;
-                    try_stack = c.try_stack;
-                    func = c.func;
+                    try_stack = if (c.top) |a| &a.try_stack else root_ts;
+                    func = frame.func;
                     bc_streams = c.bs;
                     cur = @enumFromInt(c.blk);
                     thrown = c.thrown;
@@ -273,6 +277,11 @@ fn runLoop(
                         .cont => unreachable,
                     }
                 }
+                // A throw or an unwind routes to a catch or a finally, which finds the span where
+                // the frame stands.
+                if (thrown != null or unwound != null) frame.leaveSpanFrom(cur.int());
+                // What follows reads the try stack: with known try frames, the block's.
+                if (bc_streams.try_ctx) |*tc| try tryStackOf(try_stack, func, tc, cur.int());
                 if (unwound) |e| {
                     // Mid-block non-local return: route through the armed finally blocks only, never a
                     // catch.
@@ -538,7 +547,7 @@ fn runLoop(
                 return e;
             };
             act.ret_block = site.ret_block;
-            act.ret_idx = site.ret_idx;
+            act.ret_idx = @intCast(site.ret_idx);
             act.caller = c.top;
             c.top = act;
             frame = &act.frame;
@@ -643,6 +652,16 @@ pub fn enterTryBlock(try_stack: *std.ArrayList(TryFrame), block: *const ir.Block
             .finally_entry = h.finally,
             .finally_done = h.finally_done,
         });
+    }
+}
+
+/// The try stack of a frame of `func` standing in block `cur`, from the function's known try
+/// frames (`FuncStreams.try_ctx`), for a route through its handlers to read.
+pub fn tryStackOf(try_stack: *std.ArrayList(TryFrame), func: *const ir.Func, tc: *const ir.trymap.TryContexts, cur: u32) Allocator.Error!void {
+    try_stack.clearRetainingCapacity();
+    for (tc.of(cur)) |body| {
+        const h = func.blocks[body].h();
+        try try_stack.append(ev_snapshot.try_alloc, .{ .body = .from(body), .catches = h.catches, .finally_entry = h.finally, .finally_done = h.finally_done });
     }
 }
 

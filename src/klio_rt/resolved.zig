@@ -598,11 +598,6 @@ fn land(r: ir.eval.EvalResult, what: []const u8) CValue {
     };
 }
 
-fn nextIdentity() u64 {
-    const st = vm.resolved_state orelse return 0;
-    return st.cell.data.takeIdentity();
-}
-
 /// Builds exception `which` with `message` through the class the program
 /// registered for it and throws it, as the VM raises its own.
 pub fn raise(which: Raise, message: ?[]const u8) noreturn {
@@ -649,7 +644,7 @@ fn raiseName(which: Raise) []const u8 {
 /// A new instance of `rz.class` built by its constructor over `args`.
 fn build(rz: ir.resolved.Raised, args: []const Value) Value {
     const a = alloc();
-    const inst = ir.resolved.instantiate(a, tables, rz.class, nextIdentity()) catch @panic("raise: out of memory");
+    const inst = ir.resolved.instantiate(a, tables, rz.class) catch @panic("raise: out of memory");
     runtime.keepalivePush(inst);
     var call: std.ArrayList(Value) = .empty;
     call.append(a, inst) catch @panic("raise: out of memory");
@@ -743,7 +738,7 @@ export fn klio_r_unreachable() noreturn {
 /// A fresh instance of `cls` with every slot holding its seed.
 export fn klio_r_new(cls: u32) CValue {
     if (cls >= tables.classes.len) fatal("an instance of a class the program did not register");
-    return toC(ir.resolved.instantiate(alloc(), tables, ClassId.from(cls), nextIdentity()) catch @panic("klio_r_new: out of memory"));
+    return toC(ir.resolved.instantiate(alloc(), tables, ClassId.from(cls)) catch @panic("klio_r_new: out of memory"));
 }
 
 /// The class of `v`, `NONE` for a value whose kind has none.
@@ -971,7 +966,7 @@ export fn klio_r_hash_code(vcv: CValue) i32 {
 export fn klio_r_identity_hash(vcv: CValue) i32 {
     const v = fromC(vcv);
     return switch (v) {
-        .Instance => |inst| @truncate(@as(i64, @bitCast(inst.asPtrConst().identity))),
+        .Instance => |inst| @truncate(@as(i64, @bitCast(inst.asPtrConst().identityOf()))),
         else => 0,
     };
 }

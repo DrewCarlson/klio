@@ -622,7 +622,7 @@ test "a host map entry equals an entry instance by the key and value its getters
     }.of;
     const make = struct {
         fn of(al: Allocator, tables: *const ir.Resolved, c: ir.ClassId, k: Value, v: Value) !Value {
-            const inst = try ir.resolved.instantiate(al, tables, c, 1);
+            const inst = try ir.resolved.instantiate(al, tables, c);
             _ = runtime.InstanceData.slotSet(inst.Instance, 0, k);
             _ = runtime.InstanceData.slotSet(inst.Instance, 1, v);
             return inst;
@@ -674,7 +674,7 @@ test "a well-known member runs the instance's own implementation, and none the c
     try vm.prepareResolved();
     var cap = runtime.CaptureOutput.init(a);
     var host = vm.makeHost(cap.output());
-    const inst = try ir.resolved.instantiate(a, module_ref.asPtrConst().resolved.?, shown, 1);
+    const inst = try ir.resolved.instantiate(a, module_ref.asPtrConst().resolved.?, shown);
     const r = (try host.callWellKnown(a, &inst, .to_string, &.{})).?;
     try testing.expect(r == .ok and r.ok == .String);
     try testing.expectEqualStrings("a Shown", r.ok.String.asPtr().bytes);
@@ -754,7 +754,7 @@ test "an instance the tables make carries its class in its header" {
     var h = try Hand.init(a);
     const c = try h.class("C", .{ .slot_names = &.{"x"}, .seeds = &.{.int} });
     try h.finish();
-    const inst = try ir.resolved.instantiate(a, h.r, c, 1);
+    const inst = try ir.resolved.instantiate(a, h.r, c);
     try testing.expectEqual(c.int(), inst.Instance.asPtrConst().class_id);
     // The header answers, not the def.
     h.r.classes[c.int()].def.asPtr().ir_class = std.math.maxInt(u32);
@@ -955,11 +955,11 @@ test "a native invokes an instance of a class implementing a function type throu
     try rig.init(a, &h);
     defer rig.deinit();
     const r = rig.module().resolved.?;
-    const fn_inst = try ir.resolved.instantiate(a, r, adder, 1);
+    const fn_inst = try ir.resolved.instantiate(a, r, adder);
     const got = try rig.natives().invokeCallable(&fn_inst, &.{.{ .Int = 5 }}, rig.cap.output());
     try testing.expect(got == .ok);
     try testing.expectEqual(@as(i32, 105), got.ok.Int);
-    const plain_inst = try ir.resolved.instantiate(a, r, plain, 2);
+    const plain_inst = try ir.resolved.instantiate(a, r, plain);
     const refused = try rig.natives().invokeCallable(&plain_inst, &.{.{ .Int = 5 }}, rig.cap.output());
     try expectNotCallable(refused, "Vm::invoke_callable on");
 }
@@ -1055,7 +1055,7 @@ test "a host instance holds the native's state and has no class in the tables" {
     try testing.expect(ir.resolved.classOf(h.r, &scope) == null);
     const g = scope.Instance.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(u64, 7), g.get().identity);
+    try testing.expectEqual(@as(u64, 7), g.get().identityOf());
     try testing.expect(g.get().get("__seq_has_value").?.Bool == false);
     const cg = g.get().class.borrow();
     defer cg.deinit();

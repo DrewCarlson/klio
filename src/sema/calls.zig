@@ -1309,11 +1309,18 @@ fn visibleMembers(ctx: *Ctx, container: Sym, n: Name) Allocator.Error![]const Sy
 // ----------------------------------------------------------- selection ----
 
 /// `KLIO_SEMA_TRACE=<name>` prints every candidate a call named `<name>`
-/// considers and why each is rejected.
+/// considers and why each is rejected. Read once: every call a body resolves
+/// asks.
 fn traceName() ?[]const u8 {
-    const v = std.c.getenv("KLIO_SEMA_TRACE") orelse return null;
-    return std.mem.span(v);
+    if (trace_name_state.load(.acquire) == 0) {
+        trace_name = if (std.c.getenv("KLIO_SEMA_TRACE")) |v| std.mem.span(v) else null;
+        trace_name_state.store(1, .release);
+    }
+    return trace_name;
 }
+
+var trace_name_state = std.atomic.Value(u8).init(0);
+var trace_name: ?[]const u8 = null;
 
 var trace_active: bool = false;
 

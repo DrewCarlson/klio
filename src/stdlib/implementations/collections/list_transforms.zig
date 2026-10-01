@@ -627,7 +627,7 @@ pub fn coll_list_sublist(ctx: *CallCtx) Error!EvalResult {
     // Share the root list's structural counter, so a modification of the parent
     // not made through this view trips this subList's iterators, as Kotlin's
     // SubList does by tracking root.modCount.
-    const shared_mc = if (recv.List.mod_count.get()) |mc| runtime.OptRef(u64).from(mc.clone()) else try modCountFor(a, mutable);
+    const shared_mc = if (recv.List.mod_count.get()) |mc| runtime.OptRef(runtime.ModCount).from(mc.clone()) else try modCountFor(a, mutable);
     return ok(try Value.newList(a, .{
         .items = try ValueList.init(a, window),
         .mutable = mutable,

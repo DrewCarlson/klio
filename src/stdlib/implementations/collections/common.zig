@@ -64,9 +64,9 @@ pub fn makeStringOwned(a: Allocator, s: []const u8) Error!Value {
 
 /// Wrap a slice of values into a `List`. A mutable list gets a fresh
 /// structural-modification counter so its iterators fail fast.
-pub fn modCountFor(a: Allocator, mutable: bool) Error!runtime.OptRef(u64) {
+pub fn modCountFor(a: Allocator, mutable: bool) Error!runtime.OptRef(runtime.ModCount) {
     if (!mutable) return .{};
-    return .from(try ObjRef(u64).init(a, 0));
+    return .from(try runtime.ModCount.new(a));
 }
 
 pub fn listLenOf(v: *const Value) usize {
@@ -77,7 +77,7 @@ pub fn listLenOf(v: *const Value) usize {
     };
 }
 
-fn modCountOf(v: *const Value) runtime.OptRef(u64) {
+fn modCountOf(v: *const Value) runtime.OptRef(runtime.ModCount) {
     return switch (v.*) {
         .List => |l| l.mod_count,
         .Set => |s| s.mod_count,
@@ -88,11 +88,7 @@ fn modCountOf(v: *const Value) runtime.OptRef(u64) {
 /// Increment a collection's `mod_count`. Called directly for a structural op
 /// that leaves the length unchanged (`trimToSize`, `ensureCapacity`).
 pub fn bumpModCount(v: *const Value) void {
-    if (modCountOf(v).get()) |mc| {
-        const g = mc.borrowMut();
-        defer g.deinit();
-        g.get().* +%= 1;
-    }
+    if (modCountOf(v).get()) |mc| mc.cell.data.bump();
 }
 
 /// Bumps `mod_count` only when the length changed, so `remove(absent)` and
@@ -114,11 +110,7 @@ pub fn mapStructuralBump(entries: MapEntries, before: usize) void {
     const g = entries.borrowMut();
     defer g.deinit();
     if (g.get().pairs.items.len == before) return;
-    if (g.get().mod_count.get()) |mc| {
-        const mg = mc.borrowMut();
-        defer mg.deinit();
-        mg.get().* +%= 1;
-    }
+    if (g.get().mod_count.get()) |mc| mc.cell.data.bump();
 }
 
 /// A new handle on the map's shared `mod_count` for a view, so the view's
@@ -127,12 +119,10 @@ pub fn entriesCounterNow(entries: MapEntries) u64 {
     const g = entries.borrow();
     defer g.deinit();
     const cell = g.get().mod_count.get() orelse return 0;
-    const cg = cell.borrow();
-    defer cg.deinit();
-    return cg.get().*;
+    return cell.cell.data.load();
 }
 
-pub fn entriesModCountClone(entries: MapEntries) runtime.OptRef(u64) {
+pub fn entriesModCountClone(entries: MapEntries) runtime.OptRef(runtime.ModCount) {
     const g = entries.borrow();
     defer g.deinit();
     return if (g.get().mod_count.get()) |mc| .from(mc.clone()) else .{};
@@ -140,7 +130,7 @@ pub fn entriesModCountClone(entries: MapEntries) runtime.OptRef(u64) {
 
 pub fn makeList(a: Allocator, items: []const Value, mutable: bool) Error!Value {
     var list: std.ArrayList(Value) = .empty;
-    try list.appendSlice(a, items);
+    try list.appendSlice(runtime.gc.freshBufferAllocator(a), items);
     // `items` is borrowed; the list owns one ref per element, so retain.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     return try Value.newList(a, .{
@@ -298,11 +288,9 @@ pub fn thrown(a: Allocator, fqn: []const u8, message: ?[]const u8) Error!EvalRes
 /// `List`/`Set`/`Map`. Null when `args[0]` is mutable.
 pub const FROZEN_MOD_BIT: u64 = runtime.FROZEN_MOD_BIT;
 
-pub fn modCountFrozen(mc: runtime.OptRef(u64)) bool {
+pub fn modCountFrozen(mc: runtime.OptRef(runtime.ModCount)) bool {
     const cell = mc.get() orelse return false;
-    const g = cell.borrow();
-    defer g.deinit();
-    return (g.get().* & FROZEN_MOD_BIT) != 0;
+    return cell.cell.data.frozen();
 }
 
 /// A live `MutableMap` view supports write-through removal but never insertion:
@@ -374,6 +362,7 @@ pub fn eqBoxed(x: *const Value, y: *const Value) bool {
 /// do; otherwise structural equality.
 pub fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
     if (x.* == .Instance or y.* == .Instance) {
+        if (host.identityKey(x) != null) return y.* == .Instance and runtime.ObjRef(runtime.InstanceData).ptrEq(x.Instance, y.Instance);
         if (try host.callWellKnown(x, .equals, &.{y.*}, out)) |m| {
             if (m == .ok and m.ok == .Bool) return m.ok.Bool;
         }

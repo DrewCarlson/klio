@@ -49,7 +49,7 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .mutable = true,
         .enum_entries = false,
         .backing = null,
-        .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
+        .mod_count = .from(try runtime.ModCount.new(ctx.allocator)),
     });
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
@@ -58,11 +58,7 @@ pub fn builders_build_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return r;
         }
     }
-    if (buildable.List.mod_count.get()) |mc| {
-        const g = mc.borrowMut();
-        g.get().* |= collections.FROZEN_MOD_BIT;
-        g.deinit();
-    }
+    if (buildable.List.mod_count.get()) |mc| mc.cell.data.freeze();
     // An empty build result is the shared empty singleton, as Kotlin's
     // `buildList` returns EmptyList for size 0.
     const list_empty = blk: {
@@ -86,11 +82,7 @@ pub fn builders_freeze_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return .{ .err = .{ .Type = "__klio_freezeList expects a List" } };
     }
     var buildable = ctx.args[0];
-    if (buildable.List.mod_count.get()) |mc| {
-        const g = mc.borrowMut();
-        g.get().* |= collections.FROZEN_MOD_BIT;
-        g.deinit();
-    }
+    if (buildable.List.mod_count.get()) |mc| mc.cell.data.freeze();
     const list_empty = blk: {
         const g = buildable.List.items.borrow();
         defer g.deinit();
@@ -109,11 +101,7 @@ pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return .{ .err = .{ .Type = "__klio_freezeSet expects a Set" } };
     }
     var buildable = ctx.args[0];
-    if (buildable.Set.mod_count.get()) |mc| {
-        const g = mc.borrowMut();
-        g.get().* |= collections.FROZEN_MOD_BIT;
-        g.deinit();
-    }
+    if (buildable.Set.mod_count.get()) |mc| mc.cell.data.freeze();
     const set_empty = blk: {
         const g = buildable.Set.items.borrow();
         defer g.deinit();
@@ -136,11 +124,7 @@ pub fn builders_freeze_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = buildable.Map.entries.borrow();
         const mc = g.get().mod_count;
         g.deinit();
-        if (mc.get()) |cell| {
-            const cg = cell.borrowMut();
-            cg.get().* |= collections.FROZEN_MOD_BIT;
-            cg.deinit();
-        }
+        if (mc.get()) |cell| cell.cell.data.freeze();
     }
     const map_empty = blk: {
         const g = buildable.Map.entries.borrow();
@@ -167,7 +151,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .items = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .backing = null,
-        .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)),
+        .mod_count = .from(try runtime.ModCount.new(ctx.allocator)),
     });
     {
         const r = try ctx.host.invokeCallableWithThis(&block, &.{}, &buildable, ctx.out);
@@ -176,11 +160,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             return r;
         }
     }
-    if (buildable.Set.mod_count.get()) |mc| {
-        const g = mc.borrowMut();
-        g.get().* |= collections.FROZEN_MOD_BIT;
-        g.deinit();
-    }
+    if (buildable.Set.mod_count.get()) |mc| mc.cell.data.freeze();
     const set_empty = blk: {
         const g = buildable.Set.items.borrow();
         defer g.deinit();
@@ -201,7 +181,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = try Value.newMap(ctx.allocator, .{
-        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try ObjRef(u64).init(ctx.allocator, 0)) }),
+        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try runtime.ModCount.new(ctx.allocator)) }),
         .mutable = true,
     });
     {
@@ -215,11 +195,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const g = buildable.Map.entries.borrow();
         const mc = g.get().mod_count;
         g.deinit();
-        if (mc.get()) |cell| {
-            const cg = cell.borrowMut();
-            cg.get().* |= collections.FROZEN_MOD_BIT;
-            cg.deinit();
-        }
+        if (mc.get()) |cell| cell.cell.data.freeze();
     }
     const map_empty = blk: {
         const g = buildable.Map.entries.borrow();

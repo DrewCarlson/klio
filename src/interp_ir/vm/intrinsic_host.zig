@@ -122,7 +122,7 @@ pub fn evalClosureRaw(
     const id = callable.IrClosure.asPtrConst().id;
     const live_captures = callable.IrClosure;
 
-    const info = self.closures.get(@intCast(id)) orelse {
+    const info = self.closures.record(callable.IrClosure.asPtrConst()) orelse {
         const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
         return .{ .err = .{ .Type = msg } };
     };
@@ -170,9 +170,11 @@ pub fn evalClosureRaw(
         if (lc.len == info.capture_names.len) {
             try capture_values.appendSlice(self.allocator, lc);
         } else {
-            const cap_g = info.captures.borrow();
-            defer cap_g.deinit();
-            try capture_values.appendSlice(self.allocator, cap_g.get().items);
+            if (info.captures) |store| {
+                const cap_g = store.borrow();
+                defer cap_g.deinit();
+                try capture_values.appendSlice(self.allocator, cap_g.get().items);
+            }
         }
     }
     if (this_value) |t| {
@@ -477,10 +479,8 @@ pub fn newHostInstance(self: *VmIntrinsicHost, kind: runtime.HostInstance, ident
     const inst = try ObjRef(InstanceData).init(self.allocator, .{
         .class = class_def,
         .slots = slots,
-        .outer = null,
-        .identity = identity,
-        .native_state = null,
     });
+    inst.cell.data.setIdentity(identity);
     return .{ .Instance = inst };
 }
 

@@ -187,6 +187,7 @@ pub fn resumeContinuation(
             return e;
         };
         frame.closure = snap.closure;
+        frame.cur_span = snap.span;
         frame.pfSet(snap.pending_finally) catch |e| {
             frame.deinitIn(ev);
             return e;
@@ -355,8 +356,10 @@ pub fn snapshotSuspendedFrame(
     resume_reg: ?Reg,
     state: *SuspendState,
 ) Allocator.Error!void {
-    // The snapshot copies the whole register file and the collector traces the copy, so define it fully.
+    // A dense snapshot copies the whole register file and the collector traces the copy, so
+    // every register not live where the frame stands is set to a value first.
     frame.materializeRegs();
+    var lbuf: [16]u64 = undefined;
     const saved_regs = try snapshotRegisters(
         allocator,
         frame.func,
@@ -365,6 +368,7 @@ pub fn snapshotSuspendedFrame(
         resume_reg,
         frame.regs,
         try_stack.items.len == 0,
+        frame.liveAt(block.int(), @intCast(inst_idx), &lbuf),
     );
     noteSuspendSnapshot(
         saved_regs.isDense(),
@@ -378,6 +382,7 @@ pub fn snapshotSuspendedFrame(
         .module = frame.module_arc,
         .block = block,
         .inst_idx = inst_idx,
+        .span = frame.cur_span,
         .regs = saved_regs,
         .params = blk: {
             if (runtime.gc.gc_enabled and runtime.gc.external_accounting) runtime.gc.noteExternalBytes((frame.params.len + frame.captures.len) * @sizeOf(Value));
@@ -424,7 +429,10 @@ fn actAlloc(ev: *EvalTls, allocator: Allocator) Allocator.Error!*Activation {
             ev.act_pool_len -= 1;
             return ev.act_pool[ev.act_pool_len];
         }
-        break :blk try std.heap.c_allocator.create(Activation);
+        const fresh = try std.heap.c_allocator.create(Activation);
+        fresh.frame.heap = &.{};
+        fresh.frame.pending = null;
+        break :blk fresh;
     } else try allocator.create(Activation);
     act.try_stack = .empty;
     return act;
@@ -436,6 +444,8 @@ pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
     if (actPoolOn()) {
         if (ev.act_pool_len < ACT_POOL_MAX) {
             act.try_stack.clearRetainingCapacity();
+            // A pooled frame is its pool's thread's (`Frame.enterPooledWindow`).
+            act.frame.tls = ev;
             ev.act_pool[ev.act_pool_len] = act;
             ev.act_pool_len += 1;
             return;
@@ -462,7 +472,7 @@ pub inline fn openStreamActivation(
     closure: ?runtime.IrClosureRef,
     owning: ?*const Module,
     dst: Reg,
-    no_fill: bool,
+    fill: ev_frame.Fill,
     comptime reclaim: bool,
 ) Allocator.Error!*Activation {
     if (reclaim or parent.call_hooks_on or !runtime.gc.gc_enabled) return openActivation(ev, allocator, module, .{
@@ -480,12 +490,15 @@ pub inline fn openStreamActivation(
         break :blk ev.act_pool[ev.act_pool_len];
     } else blk: {
         const fresh = try std.heap.c_allocator.create(Activation);
-        fresh.frame.wmask.clear();
+        // A pooled frame's are always clear, the pool's openers rely on it, and an enter that
+        // fails before setting them pools this one as it is.
+        fresh.frame.heap = &.{};
+        fresh.frame.pending = null;
         fresh.try_stack = .empty;
         break :blk fresh;
     };
     errdefer actFree(ev, allocator, act);
-    try act.frame.enterStream(ev, allocator, module, func, params, captures, area, no_fill, false);
+    try act.frame.enterStream(ev, allocator, module, func, params, captures, area, fill, false);
     act.frame.closure = closure;
     act.frame.module_arc = owning;
     act.try_stack.clearRetainingCapacity();
@@ -532,6 +545,7 @@ pub fn openActivation(ev: *EvalTls, allocator: Allocator, caller_module: *const 
     act.ret_dst = req.dst;
     act.ret_streams = null;
     act.ret_pc = 0;
+    act.ret_code = 0;
     gcPushFrame(&act.frame);
     return act;
 }

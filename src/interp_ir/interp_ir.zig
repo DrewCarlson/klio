@@ -132,8 +132,9 @@ pub const ClosureInfo = struct {
     has_receiver: bool = false,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,
-    /// Live capture values, behind a shared handle so `StoreGlobal` propagates.
-    captures: ObjRef(std.ArrayList(Value)),
+    /// Live capture values, behind a shared handle so `StoreGlobal` propagates;
+    /// null for a function literal's record, whose closures hold their own.
+    captures: ?ObjRef(std.ArrayList(Value)),
 
     /// Set for a closure lowered from sema: what it is beside its body,
     /// which then takes the call's arguments exactly and does not read
@@ -155,6 +156,12 @@ pub const ClosureTable = struct {
     slots: std.ArrayList(ClosureInfo) = .empty,
     /// Reclaimed ids; `push` reuses one before extending `slots`.
     free: std.ArrayList(u64) = .empty,
+    /// The records of the function literals and references closures made from sema point
+    /// to (`record`), one per module, body and kind, living as long as the table.
+    records: std.HashMapUnmanaged(RecordKey, *ClosureInfo, RecordContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// The records of the program's own lambdas last made, by body, read without the lock:
+    /// a record never changes once made.
+    lambda_cache: [lambda_cache_len]std.atomic.Value(?*const ClosureInfo) = @splat(.init(null)),
 
     /// Traces nothing. A closure's capture store lives only while a value
     /// references its id, through `markClosureHook`, so the table must not
@@ -167,12 +174,38 @@ pub const ClosureTable = struct {
     pub fn deinit(self: *ClosureTable, a: Allocator) void {
         self.slots.deinit(a);
         self.free.deinit(a);
+        var it = self.records.valueIterator();
+        while (it.next()) |r| {
+            a.free(r.*.capture_names);
+            a.destroy(r.*);
+        }
+        self.records.deinit(a);
     }
 
     pub fn gcFinalize(self: *ClosureTable, a: Allocator) void {
         self.deinit(a);
     }
 };
+
+/// A function literal's or reference's record: its module (0 for the program's), body and kind.
+pub const RecordKey = struct { module: usize, func: u32, kind: ir.resolved.Callable };
+
+const RecordContext = struct {
+    pub fn hash(_: RecordContext, k: RecordKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&h, k);
+        return h.final();
+    }
+    pub fn eql(_: RecordContext, a: RecordKey, b: RecordKey) bool {
+        return std.meta.eql(a, b);
+    }
+};
+
+const lambda_cache_len = 512;
+
+/// Ids of closures that point to their records, apart from every table slot's.
+const record_ids_from: u64 = 1 << 62;
+var record_ids = std.atomic.Value(u64).init(0);
 
 /// The generation the next closure table takes; 0 names no table.
 var table_gens = std.atomic.Value(u64).init(0);
@@ -181,7 +214,9 @@ var table_gens = std.atomic.Value(u64).init(0);
 /// shares one spine by handle clone, so one handle serves every collector.
 var active_closures: ?SharedClosures = null;
 
-fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
+fn markClosureThunk(id: u64, body: ?*const anyopaque, m: *runtime.gc.Marker) void {
+    // A closure pointing to its record keeps its captures in its own cell.
+    if (body != null) return;
     const sc = active_closures orelse return;
     // Shade the slot's capture store. The table's shared borrow is held
     // throughout: a mark may run beside a `push` that reallocates the slots,
@@ -190,7 +225,7 @@ fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     defer g.deinit();
     const slots = g.get().slots.items;
     if (id >= slots.len) return;
-    m.shade(&slots[id].captures.cell.hdr);
+    if (slots[id].captures) |cs| m.shade(&cs.cell.hdr);
 }
 
 /// The table swept closures release their slots into: the running program's,
@@ -216,9 +251,9 @@ fn releaseClosureThunk(table: u64, id: u64) void {
 /// Singleton identity for a closure id: non-zero and stable per (module, body
 /// function) when the closure captures nothing, 0 otherwise. Kotlin makes a
 /// non-capturing lambda a singleton, so `structuralEq` compares by this.
-fn closureSingletonThunk(id: u64) u64 {
+fn closureSingletonThunk(id: u64, body: ?*const anyopaque) u64 {
     const sc = active_closures orelse return 0;
-    const info = sc.get(id) orelse return 0;
+    const info = sc.recordOf(id, body) orelse return 0;
     // A capturing closure keeps per-instance identity; a reclaimed slot none.
     if (info.reclaimed or info.is_ref or info.capture_names.len != 0) return 0;
     const mod_bits: u64 = if (info.module) |m| @intFromPtr(m) else 0;
@@ -233,9 +268,9 @@ fn closureSingletonThunk(id: u64) u64 {
 var active_module: ?*const Module = null;
 
 /// A closure lowered from sema renders as its `toString` answers.
-fn closureTextThunk(id: u64, w: *std.Io.Writer) std.Io.Writer.Error!bool {
+fn closureTextThunk(id: u64, record: ?*const anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!bool {
     const sc = active_closures orelse return false;
-    const info = sc.get(id) orelse return false;
+    const info = sc.recordOf(id, record) orelse return false;
     const kind = info.resolved orelse return false;
     const module = info.module orelse active_module orelse return false;
     const func = module.funcById(info.body_func) orelse return false;
@@ -304,6 +339,67 @@ pub const SharedClosures = struct {
         return slots[id];
     }
 
+    /// Closure `c`'s record: the one it points to, else its table slot's.
+    pub fn record(self: SharedClosures, c: *const runtime.IrClosureData) ?ClosureInfo {
+        return self.recordOf(c.id, c.body);
+    }
+
+    pub fn recordOf(self: SharedClosures, id: u64, body: ?*const anyopaque) ?ClosureInfo {
+        if (body) |b| return @as(*const ClosureInfo, @ptrCast(@alignCast(b))).*;
+        return self.get(@intCast(id));
+    }
+
+    /// The record every closure of `key` points to, made by the first: `n_params` the
+    /// arguments its body takes, `n_captures` the values each closure of it holds.
+    pub fn intern(self: SharedClosures, key: RecordKey, n_params: usize, n_captures: usize) Allocator.Error!*const ClosureInfo {
+        const own_lambda = key.module == 0 and key.kind == .lambda;
+        const cached = &self.obj.asPtrConst().lambda_cache[key.func % lambda_cache_len];
+        if (own_lambda) if (@constCast(cached).load(.acquire)) |r| if (r.body_func.int() == key.func and r.module == null and r.resolved.? == .lambda) return r;
+        const r = try self.internLocked(key, n_params, n_captures);
+        if (own_lambda) @constCast(cached).store(r, .release);
+        return r;
+    }
+
+    fn internLocked(self: SharedClosures, key: RecordKey, n_params: usize, n_captures: usize) Allocator.Error!*const ClosureInfo {
+        {
+            const g = self.obj.borrow();
+            defer g.deinit();
+            if (g.get().records.get(key)) |r| return r;
+        }
+        const g = self.obj.borrowMut();
+        defer g.deinit();
+        const t = g.get();
+        const a = self.obj.cell.allocatorOf();
+        const gop = try t.records.getOrPut(a, key);
+        if (gop.found_existing) return gop.value_ptr.*;
+        errdefer _ = t.records.remove(key);
+        const names = try a.alloc([]const u8, n_captures);
+        errdefer a.free(names);
+        // The names are display-only; one per capture keeps a capturing closure
+        // from reading as a non-capturing singleton.
+        @memset(names, "");
+        const r = try a.create(ClosureInfo);
+        r.* = .{
+            .body_func = FuncId.from(key.func),
+            .is_ref = key.kind != .lambda,
+            .module = if (key.module == 0) null else @ptrFromInt(key.module),
+            .n_params = n_params,
+            .receiver_shape_known = true,
+            .has_receiver = false,
+            .capture_names = names,
+            .captures = null,
+            .resolved = key.kind,
+        };
+        gop.value_ptr.* = r;
+        return r;
+    }
+
+    /// An id for a closure pointing to its record: never a table slot's.
+    pub fn recordId(self: SharedClosures) u64 {
+        _ = self;
+        return record_ids_from | (record_ids.fetchAdd(1, .monotonic) + 1);
+    }
+
     /// Free slot `id`'s owned metadata and its id, when `gen` is this table's
     /// and the slot is held. The capture-store cell is swept separately.
     pub fn release(self: SharedClosures, gen: u64, id: u64) void {
@@ -313,7 +409,7 @@ pub const SharedClosures = struct {
         if (gen != t.gen or id >= t.slots.items.len) return;
         const info = &t.slots.items[@intCast(id)];
         if (info.reclaimed) return;
-        const a = self.obj.cell.allocator;
+        const a = self.obj.cell.allocatorOf();
         // An id that cannot be listed stays held: a reused slot must be on the
         // list, and a lost one only makes the table longer.
         t.free.append(a, id) catch return;
@@ -333,7 +429,7 @@ pub const SharedClosures = struct {
             return id;
         }
         const id: u64 = t.slots.items.len;
-        try t.slots.append(self.obj.cell.allocator, info);
+        try t.slots.append(self.obj.cell.allocatorOf(), info);
         return id;
     }
 };
@@ -620,12 +716,12 @@ test "shared closures push is append-stable" {
 /// A closure cell over a slot of `sc` taken for it, as `makeResolvedClosure` makes one.
 fn testClosure(sc: SharedClosures, caps: ObjRef(std.ArrayList(Value)), names: [][]const u8) !runtime.IrClosureRef {
     const id = try sc.push(.{ .body_func = .from(0), .n_params = 0, .capture_names = names, .captures = caps });
-    return runtime.IrClosureRef.init(sc.obj.cell.allocator, .{ .id = id, .table = sc.generation(), .captures = try sc.obj.cell.allocator.alloc(Value, 0) });
+    return runtime.IrClosureRef.init(sc.obj.cell.allocatorOf(), .{ .id = id, .table = sc.generation(), .captures = try sc.obj.cell.allocatorOf().alloc(Value, 0) });
 }
 
 /// What the collector does to a closure cell it sweeps.
 fn sweepCell(c: runtime.IrClosureRef) void {
-    c.cell.hdr.gc_finalize(&c.cell.hdr);
+    c.cell.hdr.finalizeCell();
 }
 
 test "a swept closure's slot is reused and a live one's is not" {
@@ -689,8 +785,9 @@ test "a closure swept after its program's table was replaced leaves the new tabl
     // With no program's table installed, a sweep releases nothing.
     release_table.store(null, .release);
     const orphan = try testClosure(new, caps, &.{});
+    const orphan_id = orphan.asPtrConst().id;
     sweepCell(orphan);
-    try testing.expect(!new.get(orphan.asPtrConst().id).?.reclaimed);
+    try testing.expect(!new.get(orphan_id).?.reclaimed);
 }
 
 test "a closure's slot is released once, however often its release runs" {
@@ -741,7 +838,7 @@ test "a mark of a closure's slot runs beside pushes and releases that change the
     while (epoch < 20_000) : (epoch += 1) {
         var m: runtime.gc.Marker = .{ .epoch = epoch, .arena = a };
         defer m.grey.deinit(a);
-        markClosureThunk(0, &m);
+        markClosureThunk(0, null, &m);
         try testing.expectEqual(@as(usize, 1), m.grey.items.len);
         try testing.expectEqual(&caps.cell.hdr, m.grey.items[0]);
     }
@@ -764,7 +861,7 @@ test "a thread's error result keeps the values it carries reachable" {
     }
     var m: runtime.gc.Marker = .{ .epoch = 91, .arena = a };
     defer m.grey.deinit(a);
-    table.cell.hdr.gc_trace(&table.cell.hdr, &m);
+    table.cell.hdr.traceCell(&m);
     try testing.expectEqual(@as(usize, 91), thrown.cell.hdr.gc_mark);
 }
 
@@ -778,8 +875,8 @@ test "closure singleton identity excludes lexical receiver chains" {
 
     const plain0 = try sc.push(.{ .body_func = .from(7), .n_params = 0, .capture_names = &.{}, .captures = caps });
     const plain1 = try sc.push(.{ .body_func = .from(7), .n_params = 0, .capture_names = &.{}, .captures = caps });
-    try testing.expect(closureSingletonThunk(plain0) != 0);
-    try testing.expectEqual(closureSingletonThunk(plain0), closureSingletonThunk(plain1));
+    try testing.expect(closureSingletonThunk(plain0, null) != 0);
+    try testing.expectEqual(closureSingletonThunk(plain0, null), closureSingletonThunk(plain1, null));
 
 }
 
@@ -817,4 +914,37 @@ test "shared output clone shares one inner sink" {
     try testing.expectEqual(@as(usize, 2), cap.lines.items.len);
     try testing.expectEqualStrings("a", cap.lines.items[0]);
     try testing.expectEqualStrings("b", cap.lines.items[1]);
+}
+
+test "every closure of a function literal points to its one record, which the table frees" {
+    const sc = try SharedClosures.new(testing.allocator);
+    defer sc.deinit();
+    active_closures = sc;
+    defer active_closures = null;
+    const lambda: RecordKey = .{ .module = 0, .func = 7, .kind = .lambda };
+    const r0 = try sc.intern(lambda, 1, 2);
+    const r1 = try sc.intern(lambda, 1, 2);
+    try testing.expectEqual(r0, r1);
+    try testing.expectEqual(@as(usize, 2), r0.capture_names.len);
+    try testing.expect(!r0.is_ref and r0.module == null and r0.captures == null);
+    // The same body as a reference is another record.
+    const as_ref = try sc.intern(.{ .module = 0, .func = 7, .kind = .{ .function_ref = FuncId.from(3) } }, 1, 0);
+    try testing.expect(as_ref != r0 and as_ref.is_ref);
+    // Its closures' ids are never a slot's, and nothing of the table is marked for them.
+    const id = sc.recordId();
+    try testing.expect(id >= record_ids_from and sc.get(@intCast(id)) == null);
+    var m: runtime.gc.Marker = .{ .epoch = 1, .arena = testing.allocator };
+    defer m.grey.deinit(testing.allocator);
+    markClosureThunk(id, r0, &m);
+    try testing.expectEqual(@as(usize, 0), m.grey.items.len);
+    // A capturing literal's closures keep their own identity; a reference's none by body.
+    try testing.expectEqual(@as(u64, 0), closureSingletonThunk(id, r0));
+    const plain = try sc.intern(.{ .module = 0, .func = 9, .kind = .lambda }, 0, 0);
+    try testing.expect(closureSingletonThunk(sc.recordId(), plain) != 0);
+    try testing.expectEqual(r0.body_func, sc.recordOf(id, r0).?.body_func);
+    // Two bodies sharing a slot of the lock-free cache each find their own record.
+    const other = try sc.intern(.{ .module = 0, .func = 7 + lambda_cache_len, .kind = .lambda }, 3, 0);
+    try testing.expect(other != r0 and other.n_params == 3);
+    try testing.expectEqual(r0, try sc.intern(lambda, 1, 2));
+    try testing.expectEqual(other, try sc.intern(.{ .module = 0, .func = 7 + lambda_cache_len, .kind = .lambda }, 3, 0));
 }

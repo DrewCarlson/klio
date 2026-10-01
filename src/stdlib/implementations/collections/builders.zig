@@ -114,13 +114,11 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                     const buf = try arr.snapshot(a);
                     defer if (runtime.freeScratch()) a.free(buf);
                     const k = prim.?;
-                    var pb = runtime.PrimBuf{ .kind = k };
-                    errdefer pb.bytes.deinit(a);
-                    try pb.bytes.appendNTimes(a, 0, buf.len * k.elemSize());
+                    const pb = try runtime.PrimBuf.init(a, k, buf.len);
                     for (buf, 0..) |v, i| {
-                        pb.setAs(i, v, src);
+                        pb.cell.data.setAs(i, v, src);
                     }
-                    return ok(.{ .Array = runtime.ArrayData.scalars(try ObjRef(runtime.PrimBuf).initOwned(a, pb), k) });
+                    return ok(.{ .Array = runtime.ArrayData.scalars(pb, k) });
                 },
             };
         }
@@ -134,10 +132,13 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     // buffer is already the Kotlin default for every primitive.
     if (prim) |k| {
         const un: usize = @intCast(n);
-        var pb = runtime.PrimBuf{ .kind = k };
-        errdefer pb.bytes.deinit(a);
-        try pb.bytes.appendNTimes(a, 0, un * k.elemSize());
+        const pb = try runtime.PrimBuf.init(a, k, un);
+        const arr: Value = .{ .Array = runtime.ArrayData.scalars(pb, k) };
         if (call_args.len == 2) {
+            // The initializer may collect, and nothing else holds the array yet.
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            runtime.keepalivePush(arr);
             const block = call_args[1];
             var i: usize = 0;
             while (i < un) : (i += 1) {
@@ -145,10 +146,10 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                     .value => |x| x,
                     .err => |e| return e,
                 };
-                pb.set(i, v);
+                pb.cell.data.set(i, v);
             }
         }
-        return ok(.{ .Array = runtime.ArrayData.scalars(try ObjRef(runtime.PrimBuf).initOwned(a, pb), k) });
+        return ok(arr);
     }
 
     if (call_args.len == 1) {

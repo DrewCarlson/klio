@@ -994,10 +994,17 @@ pub fn checked(fc: *const sema_mod.FileCtx) bool {
     return fc.origin == .program or (fc.origin == .pack and checkPacks());
 }
 
+/// Read once: the checks ask for every reference in a pack.
 fn checkPacks() bool {
-    const v = std.c.getenv("KLIO_CHECK_PACKS") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "1");
+    if (check_packs_state.load(.acquire) == 0) {
+        check_packs = if (std.c.getenv("KLIO_CHECK_PACKS")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        check_packs_state.store(1, .release);
+    }
+    return check_packs;
 }
+
+var check_packs_state = std.atomic.Value(u8).init(0);
+var check_packs: bool = false;
 
 /// Declared in a class's body rather than a package or a body.
 fn isMember(s: *Sema, sym: Sym) bool {

@@ -1,0 +1,5 @@
+made with the lock released: true
+made with the lock released: true, initializer runs: 1
+published
+reads while the monitor was held: 3
+racing readers saw one value: true, initializer runs: 1

@@ -239,6 +239,10 @@ pub const IntrinsicHost = struct {
         /// declare it.
         well_known_object: ?*const fn (ctx: *anyopaque, object: WellKnownObject) std.mem.Allocator.Error!?Value = null,
         alloc_instance_id: ?*const fn (ctx: *anyopaque) u64 = null,
+        /// The hash `Any.hashCode` answers for an instance whose class keeps `Any`'s
+        /// `hashCode` and `equals`, which then hashes and compares by identity; null for
+        /// any other value.
+        identity_key: ?*const fn (ctx: *anyopaque, key: *const Value) ?u32 = null,
         /// A host value presenting as `kind`, holding `fields`.
         new_host_instance: ?*const fn (ctx: *anyopaque, kind: HostInstance, identity: u64, fields: []const InstanceData.Field) std.mem.Allocator.Error!Value = null,
         /// A new `class` built by its primary constructor over `args`; null
@@ -340,6 +344,12 @@ pub const IntrinsicHost = struct {
     pub fn allocInstanceId(self: IntrinsicHost) u64 {
         if (self.vtable.alloc_instance_id) |f| return f(self.ctx);
         return 0;
+    }
+
+    /// `key`'s identity hash when it hashes and compares by identity (`identity_key`).
+    pub fn identityKey(self: IntrinsicHost, key: *const Value) ?u32 {
+        if (self.vtable.identity_key) |f| return f(self.ctx, key);
+        return null;
     }
 
     pub fn newHostInstance(self: IntrinsicHost, kind: HostInstance, identity: u64, fields: []const InstanceData.Field) !Value {

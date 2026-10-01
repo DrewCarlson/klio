@@ -7,11 +7,14 @@ const std = @import("std");
 
 const ir = @import("ir");
 const runtime = @import("runtime");
+const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
 const host_call_func = @import("host_call_func.zig");
+const host_members = @import("host_members.zig");
 
 const VmHost = vmhost.VmHost;
+const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
 const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
@@ -88,6 +91,47 @@ pub fn callNative(self: *VmHost, allocator: Allocator, id: NativeId, args: []con
     }
     if (n.host_fn) |f| return hostResult(self, allocator, try f(self, allocator, run));
     return kotlinThrow(self, allocator, try host_call_func.dispatchIntrinsic(self, allocator, n.name, n.func, run));
+}
+
+/// Native `id` over `args`, the registers of a frame, run straight: its stdlib function
+/// called with the host's kept view, when it has one and the call needs nothing
+/// `callNative` does around it (a spread, a compiler intrinsic, an instance receiver's
+/// override or host base). The registers keep the arguments reachable, so none is pinned.
+/// Null for any other native, which `callNative` then runs.
+pub fn callNativeDirect(self: *VmHost, allocator: Allocator, id: NativeId, args: []const Value) Allocator.Error!?EvalResult {
+    if (args.len != 0 and args[0] == .Instance) return null;
+    // A traced run records every intrinsic's dispatch (`emitPath`).
+    if (vmhost.trace.pathEnabled()) return null;
+    const r = self.module.asPtrConst().resolved orelse return null;
+    if (id.int() >= r.natives.len) return null;
+    const f = directFn(&r.natives[id.int()]) orelse return null;
+    if (self.view == null) self.view = VmIntrinsicHost.borrowedFrom(self);
+    stdlib.implementations.string.clearRecvMemo();
+    var ctx = runtime.CallCtx{ .args = args, .out = self.out, .host = self.view.?.intrinsicHost(), .allocator = allocator };
+    const track = runtime.leaktrack.active();
+    const prev = if (track) runtime.leaktrack.currentFqn() else null;
+    if (track) runtime.leaktrack.setCurrentFqn(r.natives[id.int()].name);
+    const res = try f(&ctx);
+    if (track) runtime.leaktrack.setCurrentFqn(prev);
+    if (res == .ok and res.ok != .Result and res.ok != .CoroutineSuspended) return .{ .ok = res.ok };
+    return try kotlinThrow(self, allocator, host_call_func.evalResultOf(allocator, res));
+}
+
+/// The stdlib function native `n` runs over its arguments as they are: its own for a
+/// native of the stdlib's table, the one a member's host function wraps (`directOf`).
+fn directFn(n: *ir.resolved.NativeRt) ?runtime.StdlibFn {
+    const kept = n.direct.load(.monotonic);
+    if (kept > 1) return @ptrFromInt(kept);
+    if (kept == 1) return null;
+    const f: ?runtime.StdlibFn = if (n.static_ or n.reified != 0 or n.vararg_back != null or n.op != .none)
+        null
+    else switch (n.table) {
+        .natives => if (n.host_fn == null) n.func else null,
+        .members => if (n.host_fn) |hf| host_members.directOf(hf) else null,
+        else => null,
+    };
+    n.direct.store(if (f) |x| @intFromPtr(x) else 1, .monotonic);
+    return f;
 }
 
 /// Runs native `id` where a call site bound it statically. A Kotlin
@@ -189,10 +233,6 @@ pub fn mintInstanceId(self: *VmHost) u64 {
     return g.get().fetchAdd(1, .monotonic) + 1;
 }
 
-fn nextIdentity(st: ir.resolved.StateRef) u64 {
-    return st.cell.data.takeIdentity();
-}
-
 /// Object `class`'s instance, made and constructed on first use, as
 /// `LoadObject` makes it.
 fn objectValue(self: *VmHost, allocator: Allocator, module: *const Module, class: ir.ClassId) Allocator.Error!EvalResult {
@@ -209,8 +249,8 @@ pub fn construct(self: *VmHost, allocator: Allocator, module: *const Module, cc:
 /// A new instance of `cc.class` built by its constructor over `args`.
 pub fn constructWith(self: *VmHost, allocator: Allocator, module: *const Module, cc: ir.resolved.ClassCtor, args: []const Value) Allocator.Error!EvalResult {
     const r = module.resolved.?;
-    const st = self.resolved_state orelse return fail(allocator, "a construction without a run state", .{});
-    const inst = try ir.resolved.instantiate(allocator, r, cc.class, nextIdentity(st));
+    if (self.resolved_state == null) return fail(allocator, "a construction without a run state", .{});
+    const inst = try ir.resolved.instantiate(allocator, r, cc.class);
     const call = try allocator.alloc(Value, args.len + 1);
     defer allocator.free(call);
     call[0] = inst;
@@ -409,12 +449,35 @@ fn callSlot(self: *VmHost, allocator: Allocator, module: *const Module, recv: *c
     else
         .none;
     if (native == .none and (host_value or target == null)) return null;
+    var sfa = std.heap.stackFallback(8 * @sizeOf(Value), allocator);
+    const la = sfa.get();
     var list: std.ArrayList(Value) = .empty;
-    defer list.deinit(allocator);
-    try list.append(allocator, recv.*);
-    try list.appendSlice(allocator, args);
+    defer list.deinit(la);
+    try list.append(la, recv.*);
+    try list.appendSlice(la, args);
     if (native != .none) return try callNative(self, allocator, native, list.items);
     return try runResolved(self, allocator, module, target.?, list.items);
+}
+
+/// The hash `Any.hashCode` answers for instance `key` (its identity's low word) when the
+/// key's class keeps `Any`'s `hashCode` and `equals`: such a key hashes and compares by
+/// identity, which a collection then does with no call. Null for any other value, and for
+/// an instance served as the host value its class holds (`hostBase`).
+pub fn identityKey(module: *const Module, key: *const Value) ?u32 {
+    if (key.* != .Instance) return null;
+    const r = module.resolved orelse return null;
+    const cls = ir.resolved.classOf(r, key) orelse return null;
+    if (cls.int() >= r.classes.len or r.classes[cls.int()].host_slot != ir.resolved.NONE) return null;
+    inline for (.{ .{ runtime.WellKnown.hash_code, &host_members.anyHashCode }, .{ runtime.WellKnown.equals, &host_members.anyEquals } }) |p| {
+        const slot = r.well_known.get(p[0]) orelse return null;
+        const f = ir.resolved.slotTarget(r, cls, slot) orelse return null;
+        if (f.int() >= r.func_native.len) return null;
+        const n = r.func_native[f.int()];
+        if (n == .none or n.int() >= r.natives.len) return null;
+        const hf = r.natives[n.int()].host_fn orelse return null;
+        if (hf != p[1]) return null;
+    }
+    return @truncate(key.Instance.asPtrConst().identityOf());
 }
 
 /// A host entry's `equals` against an instance lowered from sema whose class
@@ -490,26 +553,12 @@ pub fn makeResolvedClosure(
     kind: ir.resolved.Callable,
 ) Allocator.Error!EvalResult {
     const f = module.funcById(func) orelse return fail(allocator, "closure: function #{d} is not in the module", .{func.int()});
-    // The names are display-only; one per capture keeps a capturing closure
-    // from reading as a non-capturing singleton.
-    const names = try allocator.alloc([]const u8, captures.len);
-    @memset(names, "");
-    var store: std.ArrayList(Value) = .empty;
-    try store.appendSlice(allocator, captures);
     const body: ir.resolved.ClosureBody = .{ .id = 0, .func = f, .module = module, .kind = kind };
-    const id = try self.closures.push(.{
-        .body_func = func,
-        .is_ref = kind != .lambda,
-        .module = if (module == self.module.asPtrConst()) null else module,
-        .n_params = body.arity(),
-        .receiver_shape_known = true,
-        .has_receiver = false,
-        .capture_names = names,
-        .captures = try ObjRef(std.ArrayList(Value)).init(allocator, store),
-        .resolved = kind,
-    });
+    const own = module == self.module.asPtrConst();
+    const record = try self.closures.intern(.{ .module = if (own) 0 else @intFromPtr(module), .func = func.int(), .kind = kind }, body.arity(), captures.len);
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
-    const ref = try IrClosureRef.init(allocator, .{ .id = id, .table = self.closures.generation(), .captures = try allocator.dupe(Value, captures) });
+    const ref = try IrClosureRef.initTrailing(allocator, .{ .id = self.closures.recordId(), .captures = &.{}, .body = record }, captures.len);
+    @memcpy(ref.cell.data.captures, captures);
     return .{ .ok = .{ .IrClosure = ref } };
 }
 
@@ -542,7 +591,7 @@ pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const V
 pub noinline fn resolvedClosure(self: *VmHost, v: *const Value) ?ir.resolved.ClosureBody {
     if (v.* != .IrClosure) return null;
     const id = v.IrClosure.asPtrConst().id;
-    const info = self.closures.get(@intCast(id)) orelse return null;
+    const info = self.closures.record(v.IrClosure.asPtrConst()) orelse return null;
     const kind = info.resolved orelse return null;
     const module = info.module orelse self.module.asPtrConst();
     const func = module.funcById(info.body_func) orelse return null;

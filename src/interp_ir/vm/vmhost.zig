@@ -182,6 +182,9 @@ pub const VmHost = struct {
     allocator: Allocator,
     /// This thread's keepalive handle; every member call pins across a host re-entry.
     ka: runtime.KeepaliveHandle,
+    /// A view of these handles for a stdlib native's context, made on the first direct
+    /// call (`callNativeDirect`) and kept, since the handles do not change.
+    view: ?VmIntrinsicHost = null,
 
     /// Transient `VmHost` BORROWING another host's handles by value, with no refcount
     /// bump: it never outlives the owner and must not `deinit` a borrowed handle.
@@ -202,6 +205,7 @@ pub const VmHost = struct {
     pub const resolvedState = host_resolved.resolvedState;
     pub const callNative = host_resolved.callNative;
     pub const callNativeSite = host_resolved.callNativeSite;
+    pub const callNativeDirect = host_resolved.callNativeDirect;
     pub const tryNative = host_resolved.tryNative;
     pub const callWellKnown = host_resolved.callWellKnown;
     pub const wellKnownObject = host_resolved.wellKnownObject;
@@ -308,6 +312,9 @@ fn ivCallWellKnown(ctx: *anyopaque, receiver: *const Value, member: runtime.Well
 }
 fn ivAllocInstanceId(ctx: *anyopaque) u64 {
     return intrinsic_host.allocInstanceId(ip(ctx));
+}
+fn ivIdentityKey(ctx: *anyopaque, key: *const Value) ?u32 {
+    return host_resolved.identityKey(ip(ctx).module.asPtrConst(), key);
 }
 fn ivNewHostInstance(ctx: *anyopaque, kind: runtime.HostInstance, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
     return intrinsic_host.newHostInstance(ip(ctx), kind, identity, fields);
@@ -432,7 +439,7 @@ fn ivPersist(ctx: *anyopaque) IntrinsicHost {
 fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
     const self = ip(ctx);
     if (callable.* != .IrClosure) return null;
-    const info = self.closures.get(@intCast(callable.IrClosure.asPtrConst().id)) orelse return null;
+    const info = self.closures.record(callable.IrClosure.asPtrConst()) orelse return null;
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const module = info.module orelse module_ref.asPtr();
@@ -448,6 +455,7 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .call_well_known = ivCallWellKnown,
     .well_known_object = ivWellKnownObject,
     .alloc_instance_id = ivAllocInstanceId,
+    .identity_key = ivIdentityKey,
     .new_host_instance = ivNewHostInstance,
     .construct_well_known = ivConstructWellKnown,
     .run_blocking = ivRunBlocking,

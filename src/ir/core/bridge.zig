@@ -222,6 +222,9 @@ pub const Slot = struct {
     /// For display.
     name: []const u8,
     seed: SlotSeed = .null_ref,
+    /// A `@Volatile` property's: every access orders as the JMM orders a
+    /// volatile field's (`runtime.ClassDef.ordered_slots`).
+    volatile_: bool = false,
 };
 
 /// A slot or index left empty.
@@ -1839,6 +1842,16 @@ const Build = struct {
         b.br.layout = out;
     }
 
+    /// Whether property `p` is `@Volatile` (`kotlin.concurrent.Volatile`, or
+    /// `kotlin.jvm.Volatile` on the JVM's side of a shared source).
+    fn isVolatile(b: *Build, p: Sym) Error!bool {
+        const s = b.s;
+        inline for (.{ "kotlin.concurrent.Volatile", "kotlin.jvm.Volatile" }) |fqn| {
+            if (try sema.headers.hasAnnotation(s, p, .decl, s.classByFqn(fqn))) return true;
+        }
+        return false;
+    }
+
     fn layoutOf(b: *Build, c: ClassId, depth: u32) Error![]const Slot {
         if (b.layouts.items[c.int()]) |l| return l;
         const s = b.s;
@@ -1868,7 +1881,7 @@ const Build = struct {
                     if (s.syms.kind(p) != .property) continue;
                     if (!try b.hasStorage(p)) continue;
                     b.br.field_of[p.int()] = @intCast(slots.items.len);
-                    try slots.append(b.a, .{ .name = s.str(s.syms.name(p)), .seed = try b.seedOf(p) });
+                    try slots.append(b.a, .{ .name = s.str(s.syms.name(p)), .seed = try b.seedOf(p), .volatile_ = try b.isVolatile(p) });
                 }
                 for (members) |p| {
                     if (s.syms.kind(p) != .property or !s.syms.propertyInfo(p).has_delegate) continue;
@@ -2411,7 +2424,10 @@ const Build = struct {
         switch (origin) {
             .decl, .abstract => |d| switch (s.syms.kind(d)) {
                 .property => try b.accessorParams(d, false, out),
-                else => try b.declParams(d, isInstanceMember(s, d), out),
+                else => {
+                    try b.declParams(d, isInstanceMember(s, d), out);
+                    try b.primitiveParams(d, out.items);
+                },
             },
             .getter => |p| try b.accessorParams(p, false, out),
             .setter => |p| try b.accessorParams(p, true, out),
@@ -2471,6 +2487,25 @@ const Build = struct {
                 try b.pushParam(out, "$rc", false);
                 try b.pushParam(out, "$rf", false);
             },
+        }
+    }
+
+    /// Names the type of each of `d`'s value parameters, and of its extension
+    /// receiver, declared a non-null primitive, the last of `params` being its
+    /// value parameters as `declParams` pushed them (after the receiver). A
+    /// body's argument there always holds that type (`kinds.zig`).
+    fn primitiveParams(b: *Build, d: Sym, params: []ir.Param) Error!void {
+        const s = b.s;
+        const info = s.syms.functionInfo(d);
+        if (composableFunction(s, d) or info.type_params.len != 0) return;
+        const n = info.params.len;
+        const has_recv = info.receiver != .none;
+        const first = params.len -| (n + @intFromBool(has_recv));
+        if (params.len < n + @intFromBool(has_recv)) return;
+        if (has_recv) params[first].ty = primitiveType(seedOfType(s, info.receiver));
+        for (info.params, params[first + @intFromBool(has_recv) ..][0..n]) |p, *out| {
+            if (s.syms.flags(p).vararg) continue;
+            out.ty = primitiveType(seedOfType(s, try sema.headers.paramType(s, p)));
         }
     }
 
@@ -3390,6 +3425,23 @@ fn seedOfType(s: *sema.Sema, t: TypeId) SlotSeed {
     return .null_ref;
 }
 
+/// The type a parameter of seed `seed` is declared, named as `kinds.zig`
+/// reads it: a primitive's Kotlin name, or none.
+fn primitiveType(seed: SlotSeed) ir.TypeRef {
+    const name: []const u8 = switch (seed) {
+        .null_ref => "",
+        .int => "kotlin.Int",
+        .long => "kotlin.Long",
+        .short => "kotlin.Short",
+        .byte => "kotlin.Byte",
+        .float => "kotlin.Float",
+        .double => "kotlin.Double",
+        .boolean => "kotlin.Boolean",
+        .char => "kotlin.Char",
+    };
+    return .{ .name = name, .nullable = seed == .null_ref, .args = &.{} };
+}
+
 /// Per written supertype of a class, whether it is delegated with `by`.
 fn supertypeDelegates(s: *sema.Sema, cls: Sym) []const bool {
     // A class laid out here is one this build analyzed: a base image's
@@ -3569,6 +3621,9 @@ pub fn classDefOf(a: Allocator, m: *const ir.Module, c: usize, layout: []const S
         def.supertype_names = names.items;
     }
     def.is_data = flags.is_data;
+    def.ordered_slots = for (layout) |sl| {
+        if (sl.volatile_) break true;
+    } else false;
     def.is_value = ic.is_value;
     def.is_object = ic.is_object;
     def.is_enum = ic.is_enum;

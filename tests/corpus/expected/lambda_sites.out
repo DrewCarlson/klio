@@ -1,0 +1,8 @@
+one lambda: 34650
+two lambdas at one site: 2500
+captured var: 820
+receiver: 3045
+three parameters: p0xp1xp2xp3xp4x
+lambda calling a lambda: 5340
+thrown from a lambda: bad 37
+calling a function: {even:0=15, even:2=15, odd:1=15, odd:3=15}

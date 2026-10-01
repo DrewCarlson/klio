@@ -119,11 +119,9 @@ fn syncSublistChain(a: Allocator, cell: *runtime.CollBackingRef.Cell, view_items
     if (sb.parent_backing) |pb| syncSublistChain(a, pb, sb.parent, cur);
 }
 
-pub fn counterNowOf(mc: runtime.OptRef(u64)) u64 {
+pub fn counterNowOf(mc: runtime.OptRef(runtime.ModCount)) u64 {
     const cell = mc.get() orelse return 0;
-    const g = cell.borrow();
-    defer g.deinit();
-    return g.get().*;
+    return cell.cell.data.load();
 }
 
 /// The CME predicate: the backing changed structurally other than through this
@@ -149,11 +147,7 @@ pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        if (g.get().mod_count.get()) |cell| {
-            const cg = cell.borrow();
-            stale = cg.get().* != me.exp_mod;
-            cg.deinit();
-        }
+        if (g.get().mod_count.get()) |cell| stale = cell.cell.data.load() != me.exp_mod;
         if (!stale) {
             for (g.get().pairs.items) |*slot| {
                 if (Value.structuralEq(&slot.key, me.key.asPtrConst())) {

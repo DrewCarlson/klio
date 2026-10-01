@@ -1,0 +1,4 @@
+for next: next at 3, called at line 37
+for hasNext: hasNext at 4, called at line 49
+while: check at 3, called at line 62
+do-while: check at 3, called at line 84

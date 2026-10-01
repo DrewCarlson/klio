@@ -454,9 +454,9 @@ test "a data class's run-time def lists its constructor properties, so host equa
     try std.testing.expectEqual(@as(usize, 0), r.classes[(try fx.cid("demo.Q")).int()].def.asPtrConst().primary_params.len);
 
     const a = fx.arena.allocator();
-    const x = try ir.resolved.instantiate(a, r, p_id, 1);
-    const y = try ir.resolved.instantiate(a, r, p_id, 2);
-    const z = try ir.resolved.instantiate(a, r, p_id, 3);
+    const x = try ir.resolved.instantiate(a, r, p_id);
+    const y = try ir.resolved.instantiate(a, r, p_id);
+    const z = try ir.resolved.instantiate(a, r, p_id);
     for ([_]runtime.Value{ x, y, z }, [_]i32{ 1, 2, 1 }) |v, n| {
         const g = v.Instance.borrowMut();
         defer g.deinit();
@@ -520,6 +520,41 @@ test "layouts: superclass slots first, the outer instance, stored properties onl
     // An accessor that reads `field` makes one; one that does not, none.
     try std.testing.expectEqual(@as(?u32, 0), br.fieldOf(try fx.memberOf("demo.F", "g")));
     try std.testing.expectEqual(@as(u32, 0), br.slotCount(try fx.cid("demo.H")));
+}
+
+test "a @Volatile property keeps its class's slots, and its subclasses', ordered" {
+    var fx = try Fx.init(&.{
+        \\package kotlin.concurrent
+        \\@Target(AnnotationTarget.FIELD)
+        \\annotation class Volatile
+        ,
+        \\package demo
+        \\import kotlin.concurrent.Volatile
+        \\class Plain(val a: Int) { var b = "x" }
+        \\class Flag { @Volatile var done = false; var n = 0 }
+        \\class Param(@Volatile var v: Int)
+        \\open class Base { @Volatile var s: Any? = null }
+        \\class Sub : Base() { var t = 1 }
+        \\fun main() {}
+    });
+    defer fx.deinit();
+    const br = fx.br();
+    const a = fx.arena.allocator();
+    const cases = [_]struct { []const u8, []const bool, bool }{
+        .{ "demo.Plain", &.{ false, false }, false },
+        .{ "demo.Flag", &.{ true, false }, true },
+        .{ "demo.Param", &.{true}, true },
+        .{ "demo.Base", &.{true}, true },
+        .{ "demo.Sub", &.{ true, false }, true },
+    };
+    for (cases) |c| {
+        const id = try fx.cid(c[0]);
+        const layout = br.layout[id.int()];
+        try std.testing.expectEqual(c[1].len, layout.len);
+        for (layout, c[1]) |sl, v| try std.testing.expectEqual(v, sl.volatile_);
+        const def = try ir.bridge.classDefOf(a, br.m, id.int(), layout, .{});
+        try std.testing.expectEqual(c[2], def.asPtrConst().ordered_slots);
+    }
 }
 
 test "accessors: one getter per property, a setter per var, slots from the property's roots" {

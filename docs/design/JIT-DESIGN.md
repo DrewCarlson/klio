@@ -19,12 +19,11 @@ The JIT is built **on top of** the existing IR interpreter, never replacing it:
   loop back-edge count). Then the JIT attempts to compile it. On success, future
   entries run native code; on any unsupported IR, the compile bails and the
   function stays interpreted.
-- On by default for the `klio` binary via the `fast` performance profile
-  (`--opt fast` / `KLIO_OPT=fast`); `--opt safe` keeps the interpreter. The
-  in-process multi-program test harness uses the conservative default profile
-  (interpreter), so a hot loop never compiles per worker. The legacy `KLIO_JIT`
-  / `KLIO_FUNC_JIT` env vars remain as per-feature overrides on top of the
-  profile. See `src/runtime/perf.zig`.
+- On by default for `klio run` and bundled apps, with the optimizing loop tier
+  (`plans/jit-opt.md`), on AArch64 and x86-64; `KLIO_JIT=0` (or
+  `KLIO_JIT_OPT=0` for the tier alone) keeps the interpreter. Other commands
+  and the in-process multi-program test harness interpret unless `KLIO_JIT`
+  turns the JIT on, so a hot loop never compiles per worker.
 
 ## Stages
 

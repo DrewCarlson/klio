@@ -270,3 +270,123 @@ test "compare values natural order" {
     );
     try testing.expect(unsigned == .order and unsigned.order == .gt);
 }
+
+/// A host whose `equals` and `hashCode` calls are counted and answer nothing, and which
+/// says every instance hashes by identity when `identity` is set.
+const CountingHost = struct {
+    identity: bool,
+    calls: u32 = 0,
+
+    fn vtInvoke(ctx: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!runtime.EvalResult {
+        _ = .{ ctx, callable, args, out };
+        return .{ .err = .{ .Unimplemented = "CountingHost::invoke_callable" } };
+    }
+    fn vtInvokeThis(ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: runtime.Output) std.mem.Allocator.Error!runtime.EvalResult {
+        _ = .{ ctx, callable, args, this_value, out };
+        return .{ .err = .{ .Unimplemented = "CountingHost::invoke_callable_with_this" } };
+    }
+    fn vtCallWellKnown(ctx: *anyopaque, receiver: *const Value, member: runtime.WellKnown, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!?runtime.EvalResult {
+        _ = .{ receiver, member, args, out };
+        const self: *CountingHost = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        return null;
+    }
+    fn vtIdentityKey(ctx: *anyopaque, key: *const Value) ?u32 {
+        const self: *CountingHost = @ptrCast(@alignCast(ctx));
+        if (!self.identity or key.* != .Instance) return null;
+        return @truncate(key.Instance.asPtrConst().identityOf());
+    }
+    const vtable: runtime.IntrinsicHost.VTable = .{
+        .invoke_callable = vtInvoke,
+        .invoke_callable_with_this = vtInvokeThis,
+        .call_well_known = vtCallWellKnown,
+        .identity_key = vtIdentityKey,
+    };
+    fn host(self: *CountingHost) runtime.IntrinsicHost {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+/// An instance of a class with no members and identity `id`.
+fn bareInstance(a: std.mem.Allocator, class: runtime.ObjRef(runtime.ClassDef), id: u64) !Value {
+    return .{ .Instance = try runtime.InstanceData.new(a, class.clone(), &.{}, id) };
+}
+
+fn bareClass(a: std.mem.Allocator) !runtime.ObjRef(runtime.ClassDef) {
+    const env = try runtime.ObjRef(runtime.Env).init(a, runtime.Env.init(a));
+    return runtime.ObjRef(runtime.ClassDef).init(a, .{
+        .name = "K",
+        .fqn = "K",
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = &.{},
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = null,
+        .interfaces = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = &.{},
+        .companion = try runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null),
+        .enclosing_class = try runtime.ObjRef(?runtime.ObjRef(runtime.ClassDef)).init(a, null),
+        .nested_classes = &.{},
+        .captured_env = env,
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
+        .object_singleton = try runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null),
+    });
+}
+
+test "a map over instance keys that hash by identity puts, finds and removes them with no call into the VM" {
+    for ([_]bool{ true, false }) |identity| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var sink = runtime.CaptureOutput.init(std.heap.page_allocator);
+        defer sink.deinit();
+        var counting: CountingHost = .{ .identity = identity };
+        const class = try bareClass(a);
+        var keys: [40]Value = undefined;
+        for (&keys, 0..) |*k, i| k.* = try bareInstance(a, class, 1000 + i);
+        const map = try common_mod.makeMapH(counting.host(), sink.output(), a, &.{}, true);
+        // A map past the index's size hashes its keys, one below it scans them.
+        for (&keys, 0..) |k, i| {
+            const args = [_]Value{ map, k, Value.newInt(@intCast(i)) };
+            var c: CallCtx = .{ .args = &args, .out = sink.output(), .host = counting.host(), .allocator = a };
+            const r = try map_mod.coll_mut_map_put(&c);
+            try testing.expect(r == .ok);
+        }
+        for (&keys, 0..) |k, i| {
+            const args = [_]Value{ map, k };
+            var c: CallCtx = .{ .args = &args, .out = sink.output(), .host = counting.host(), .allocator = a };
+            const r = try coll_map_get(&c);
+            try testing.expect(r == .ok and r.ok == .Int and r.ok.Int == i);
+        }
+        const other = try bareInstance(a, class, 5000);
+        const args = [_]Value{ map, other };
+        var c: CallCtx = .{ .args = &args, .out = sink.output(), .host = counting.host(), .allocator = a };
+        const miss = try coll_map_get(&c);
+        try testing.expect(miss == .ok and miss.ok == .Null);
+        for (keys[0..10], 0..) |k, i| {
+            const rargs = [_]Value{ map, k };
+            var rc: CallCtx = .{ .args = &rargs, .out = sink.output(), .host = counting.host(), .allocator = a };
+            const r = try map_mod.coll_mut_map_remove(&rc);
+            try testing.expect(r == .ok and r.ok == .Int and r.ok.Int == i);
+        }
+        try testing.expectEqual(@as(usize, 30), mapLen(map.Map.entries));
+        if (identity) try testing.expectEqual(@as(u32, 0), counting.calls) else try testing.expect(counting.calls > 0);
+    }
+}

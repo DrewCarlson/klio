@@ -231,7 +231,7 @@ pub fn throwable_cause(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 fn makeList(items: ValueList, mutable: bool) std.mem.Allocator.Error!Value {
-    return try Value.newList(items.cell.allocator, .{
+    return try Value.newList(items.cell.allocatorOf(), .{
         .items = items,
         .mutable = mutable,
         .enum_entries = false,

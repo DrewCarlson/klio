@@ -1016,8 +1016,13 @@ inline int klioAwtKeyChar(int vk, unsigned platformChar) {
 // Scripted input: $KLIO_WIN_INPUT names a file of events to queue on a window
 // as if its platform had sent them, so a program's window can be driven and
 // its frames checked (KLIO_SKIA_DUMP_AT). An event comes at the window's n-th
-// event poll, or t milliseconds after its first ("<t>ms"). One event per
-// line, '#' starting a comment:
+// event poll, or t milliseconds after the first poll of any window ("<t>ms"),
+// every window on the one timeline, in the order the events fall due. A
+// window's next events wait until the program has shown the effect of the
+// last ones any window took (a frame presented, or the window loop settled),
+// as a person's input comes a frame or more apart: the program has composed
+// and drawn what one event did before the next arrives. One event per line,
+// '#' starting a comment:
 //   <when> move <x> <y>                  (a script with a pointer, key or text
 //                                        event is the windows' only pointer and
 //                                        keyboard input, the platform's dropped)
@@ -1080,7 +1085,7 @@ inline bool klioScriptDrivesInput();
 
 struct KlioScriptEntry {
     int poll;       // the poll it comes at, or -1 for a timed one
-    long long ms;   // milliseconds after the first poll, for a timed one
+    long long ms;   // milliseconds after the windows' first poll, for a timed one
     KlioEv ev;
     bool tray;      // a tray's event, not a window's
 };
@@ -1250,23 +1255,159 @@ inline bool klioScriptDrivesInput() {
     return drives;
 }
 
-// A window's progress through the script: its polls, when the first came,
-// and which timed events it has queued.
+struct KlioScriptState;
+
+// The windows following the script, in the order they were made. The window
+// loop's thread alone makes, polls, presents and closes windows.
+inline std::vector<KlioScriptState*>& klioScriptWindows() {
+    static auto* windows = new std::vector<KlioScriptState*>();  // outlives the windows closed at exit
+    return *windows;
+}
+
+// How many times the window loop settled (klio_script_settled): it has no
+// work queued, no frame wanted and no window to draw, so the events it took
+// have shown all their effect.
+inline std::atomic<unsigned long long>& klioScriptSettles() {
+    static std::atomic<unsigned long long> settles{0};
+    return settles;
+}
+
+inline bool klioScriptTraced() {
+    static const bool traced = std::getenv("KLIO_SCRIPT_TRACE") != nullptr;
+    return traced;
+}
+
+// When the windows' timed events count from: the first poll of any window.
+inline std::chrono::steady_clock::time_point& klioScriptOrigin() {
+    static std::chrono::steady_clock::time_point origin;
+    return origin;
+}
+
+// A window's progress through the script: its polls, when its timed events
+// count from (the windows' origin; a tray's own first poll), and which timed
+// events it has queued. A window follows the script from when it is made, so
+// the windows take its timed events in the order they fall due even when one
+// polls first long after another; a tray keeps its own time.
 struct KlioScriptState {
+    bool tray = false;
     int polls = 0;
+    // When the window was made.
+    std::chrono::steady_clock::time_point made = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point start;
     size_t nextTimed = 0;
+    // Events came and the program has not shown their effect since: the
+    // window presented no frame and the window loop has not settled. Every
+    // window's next events wait for it, no longer than klioScriptFrameWaitMs
+    // for a window that draws nothing.
+    bool awaitFrame = false;
+    std::chrono::steady_clock::time_point awaitSince;
+    unsigned long long awaitSettles = 0;
+
+    KlioScriptState() : KlioScriptState(false) {}
+    explicit KlioScriptState(bool isTray) : tray(isTray) {
+        if (!tray && !klioScript().empty()) klioScriptWindows().push_back(this);
+    }
+    KlioScriptState(const KlioScriptState&) = delete;
+    KlioScriptState& operator=(const KlioScriptState&) = delete;
+    ~KlioScriptState() {
+        auto& windows = klioScriptWindows();
+        windows.erase(std::remove(windows.begin(), windows.end(), this), windows.end());
+    }
 };
 
+inline constexpr long long klioScriptFrameWaitMs = 1000;
+
+inline long long klioScriptMillis(std::chrono::steady_clock::duration d) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+}
+
+// The window presented a frame: the script's next events may come.
+inline void klioScriptFramed(KlioScriptState& st) {
+    if (klioScriptTraced() && st.awaitFrame) std::fprintf(stderr, "[script] %p framed\n", static_cast<void*>(&st));
+    st.awaitFrame = false;
+}
+
+// The window loop settled.
+inline void klioScriptSettled() {
+    klioScriptSettles().fetch_add(1, std::memory_order_relaxed);
+}
+
+// Whether the window still waits for the effect of the events it took last.
+inline bool klioScriptAwaits(KlioScriptState& st, std::chrono::steady_clock::time_point now) {
+    if (!st.awaitFrame) return false;
+    if (klioScriptSettles().load(std::memory_order_relaxed) == st.awaitSettles &&
+        klioScriptMillis(now - st.awaitSince) < klioScriptFrameWaitMs) {
+        return true;
+    }
+    st.awaitFrame = false;
+    return false;
+}
+
+// When a window's timed event is due; the one at `index` of its timed events.
+// A window counts from the windows' origin, polled yet or not.
+inline bool klioScriptDue(const KlioScriptState& st, size_t index, std::chrono::steady_clock::time_point* due) {
+    size_t timed = 0;
+    for (const KlioScriptEntry& e : klioScript()) {
+        if (e.tray || e.poll >= 0) continue;
+        if (timed++ != index) continue;
+        *due = (st.tray ? st.start : klioScriptOrigin()) + std::chrono::milliseconds(e.ms);
+        return true;
+    }
+    return false;
+}
+
+// Whether a window's timed event due at `due` waits for another window's
+// that is due before it (or at the same time, for a window made first): the
+// windows take the script's timed events in the order they fall due. A
+// window that has not taken its event klioScriptFrameWaitMs after it fell due
+// (or, polling for the first time only then, after it was made) is not waited
+// for.
+inline bool klioScriptOthersFirst(const KlioScriptState& st, std::chrono::steady_clock::time_point due,
+                                  std::chrono::steady_clock::time_point now) {
+    bool before = true;  // whether the other window was made first
+    for (const KlioScriptState* other : klioScriptWindows()) {
+        if (other == &st) {
+            before = false;
+            continue;
+        }
+        std::chrono::steady_clock::time_point theirs;
+        if (!klioScriptDue(*other, other->nextTimed, &theirs)) continue;
+        const auto since = other->polls == 0 ? std::max(theirs, other->made) : theirs;
+        if (klioScriptMillis(now - since) >= klioScriptFrameWaitMs) continue;
+        if (theirs < due || (before && theirs == due)) return true;
+    }
+    return false;
+}
+
 // Counts a window's event poll and queues the scripted events due at it:
-// those of this poll, and the timed ones whose time has come, in order.
+// those of this poll, and the timed ones whose time has come, in order. A
+// window's events wait until the program has shown the effect of every
+// window's last ones, so each batch of events meets the state the ones before
+// it left.
 inline void klioScriptTick(KlioScriptState& st, std::deque<KlioEv>& q, bool tray = false) {
     const auto& script = klioScript();
     if (script.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!tray) {
+        if (klioScriptAwaits(st, now)) return;
+        for (KlioScriptState* other : klioScriptWindows()) {
+            if (other != &st && klioScriptAwaits(*other, now)) return;
+        }
+    }
     const int n = ++st.polls;
-    if (n == 1) st.start = std::chrono::steady_clock::now();
-    const long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - st.start).count();
+    if (n == 1) {
+        st.start = now;
+        if (!tray) {
+            static bool started = false;
+            if (!started) {
+                started = true;
+                klioScriptOrigin() = now;
+            }
+            st.start = klioScriptOrigin();
+        }
+    }
+    const long long elapsed = klioScriptMillis(now - st.start);
+    const size_t queued = q.size();
     size_t timed = 0;
     bool waiting = false;  // a timed event not yet due holds back the ones after it
     for (const KlioScriptEntry& e : script) {
@@ -1274,11 +1415,21 @@ inline void klioScriptTick(KlioScriptState& st, std::deque<KlioEv>& q, bool tray
         if (e.poll == n) q.push_back(e.ev);
         if (e.poll >= 0) continue;
         if (timed++ < st.nextTimed || waiting) continue;
-        if (e.ms > elapsed) {
+        if (e.ms > elapsed || (!tray && klioScriptOthersFirst(st, st.start + std::chrono::milliseconds(e.ms), now))) {
             waiting = true;
             continue;
         }
         q.push_back(e.ev);
         st.nextTimed++;
+    }
+    // A tray draws no frames.
+    if (!tray && q.size() != queued) {
+        if (klioScriptTraced()) {
+            std::fprintf(stderr, "[script] %p poll %d at +%lldms: %zu events\n", static_cast<void*>(&st), n, elapsed,
+                         q.size() - queued);
+        }
+        st.awaitFrame = true;
+        st.awaitSince = now;
+        st.awaitSettles = klioScriptSettles().load(std::memory_order_relaxed);
     }
 }

@@ -1,0 +1,254 @@
+//! The x86-64 assembler's encodings against the system assembler's.
+
+const std = @import("std");
+const x64 = @import("x64.zig");
+
+const Asm = x64.Asm;
+const Mem = x64.Mem;
+
+test "every instruction encodes as the system assembler encodes it" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    try a.mov(.q, .rax, .rbx);
+    try a.mov(.q, .r8, .rcx);
+    try a.mov(.d, .rax, .r9);
+    try a.mov(.b, .rsi, .rdx);
+    try a.load(.q, .rax, Mem.at(.rbx, 8));
+    try a.load(.q, .r10, Mem.at(.rsp, 16));
+    try a.load(.d, .rax, Mem.at(.rbp, 0));
+    try a.load(.q, .r11, Mem.at(.r13, 200));
+    try a.store(.q, Mem.indexed(.rdi, .rsi, 3, 4), .rax);
+    try a.store(.d, Mem.at(.r12, 0), .rcx);
+    try a.store(.b, Mem.at(.rdx, 1), .rsi);
+    try a.storeImm(.b, Mem.at(.rax, 3), 7);
+    try a.storeImm(.d, Mem.at(.rcx, 0), 5);
+    try a.storeImm(.q, Mem.at(.r9, 8), -1);
+    try a.loadU8(.rax, Mem.at(.rdi, 8));
+    try a.loadU16(.rcx, Mem.at(.rsi, 0));
+    try a.loadI8(.rax, Mem.at(.rbx, 0));
+    try a.loadI16(.rdx, Mem.at(.r8, 2));
+    try a.loadI32(.rax, Mem.at(.rcx, 4));
+    try a.movsxd(.r9, .rcx);
+    try a.movsx(.b, .rax, .rbx);
+    try a.movsx(.d, .rcx, .rsi);
+    try a.movzx(.b, .rax, .rsi);
+    try a.movzx(.d, .rdx, .rcx);
+    try a.movImm(.rax, 42);
+    try a.movImm(.r15, 0xffffffff);
+    try a.movImm(.rax, @bitCast(@as(i64, -5)));
+    try a.movImm(.r10, 0x1122334455667788);
+    try a.lea(.rax, Mem.indexed(.rdi, .rsi, 1, 16));
+    try a.add(.q, .rax, .rbx);
+    try a.sub(.d, .rcx, .rdx);
+    try a.@"and"(.q, .r8, .r9);
+    try a.@"or"(.q, .rax, .r15);
+    try a.xor(.d, .rsi, .rsi);
+    try a.cmp(.q, .rax, .rcx);
+    try a.addImm(.q, .rax, 1);
+    try a.subImm(.q, .rsp, 1000);
+    try a.andImm(.d, .rcx, 255);
+    try a.orImm(.q, .rdx, -128);
+    try a.xorImm(.q, .r11, 7);
+    try a.cmpImm(.d, .rax, 1000000);
+    try a.cmpMemImm(.q, Mem.at(.rdi, 8), 0);
+    try a.addMemImm(.d, Mem.at(.rbx, 0), 1);
+    try a.cmpLoad(.q, .rax, Mem.at(.rdi, 0));
+    try a.addLoad(.q, .rcx, Mem.at(.rsi, 8));
+    try a.subLoad(.d, .rax, Mem.at(.r8, 0));
+    try a.@"test"(.q, .rax, .rax);
+    try a.@"test"(.d, .rsi, .rdx);
+    try a.testImm(.b, .rax, 1);
+    try a.testImm(.q, .rdi, 256);
+    try a.testMemImm8(Mem.at(.rdi, 8), 63);
+    try a.imul(.q, .rax, .rcx);
+    try a.imul(.d, .r8, .r9);
+    try a.imulImm(.q, .rax, .rbx, 100);
+    try a.not(.q, .rax);
+    try a.neg(.d, .rcx);
+    try a.idiv(.q, .r8);
+    try a.idiv(.d, .rcx);
+    try a.signExtendAcc(.q);
+    try a.signExtendAcc(.d);
+    try a.shlCl(.q, .rax);
+    try a.shrCl(.d, .rdx);
+    try a.sarCl(.q, .r9);
+    try a.shlImm(.q, .rax, 3);
+    try a.shrImm(.d, .rcx, 31);
+    try a.sarImm(.q, .r10, 63);
+    try a.setcc(.e, .rax);
+    try a.setcc(.l, .rsi);
+    try a.setcc(.ne, .r9);
+    try a.cmov(.e, .q, .rax, .rcx);
+    try a.cmov(.l, .d, .r8, .r9);
+    try a.lockCmpxchg(.d, Mem.at(.rdi, 0), .rcx);
+    try a.lockCmpxchg(.q, Mem.at(.r8, 8), .r9);
+    try a.mfence();
+    try a.jmpReg(.rax);
+    try a.callReg(.r11);
+    try a.ret();
+    try a.push(.rbx);
+    try a.push(.r12);
+    try a.pop(.r15);
+    try a.pop(.rbp);
+    try a.int3();
+    try a.nop();
+    try a.movsdLoad(true, .xmm0, Mem.at(.rdi, 8));
+    try a.movsdLoad(false, .xmm9, Mem.at(.rsi, 0));
+    try a.movsdStore(true, Mem.at(.rbx, 0), .xmm1);
+    try a.movsdStore(false, Mem.at(.r8, 4), .xmm10);
+    try a.movapd(.xmm2, .xmm11);
+    try a.movToX(.q, .xmm3, .rax);
+    try a.movToX(.d, .xmm4, .rcx);
+    try a.movFromX(.q, .rdx, .xmm5);
+    try a.movFromX(.d, .r9, .xmm6);
+    try a.addsd(true, .xmm0, .xmm1);
+    try a.mulsd(false, .xmm2, .xmm3);
+    try a.subsd(true, .xmm8, .xmm9);
+    try a.divsd(false, .xmm4, .xmm12);
+    try a.sqrtsd(true, .xmm5, .xmm6);
+    try a.ucomisd(true, .xmm0, .xmm1);
+    try a.ucomisd(false, .xmm2, .xmm3);
+    try a.xorpd(.xmm7, .xmm7);
+    try a.cvtsi2sd(true, .xmm0, .q, .rax);
+    try a.cvtsi2sd(false, .xmm1, .d, .rcx);
+    try a.cvttsd2si(true, .q, .rax, .xmm0);
+    try a.cvttsd2si(false, .d, .rcx, .xmm1);
+    try a.cvtFloat(true, .xmm2, .xmm3);
+    try a.cvtFloat(false, .xmm4, .xmm5);
+    const want = [_]u8{
+        0x48, 0x89, 0xd8, 0x49, 0x89, 0xc8, 0x44, 0x89, 0xc8, 0x40, 0x88, 0xd6, 0x48, 0x8b, 0x43, 0x08, 0x4c, 0x8b, 
+        0x54, 0x24, 0x10, 0x8b, 0x45, 0x00, 0x4d, 0x8b, 0x9d, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x89, 0x44, 0xf7, 0x04, 
+        0x41, 0x89, 0x0c, 0x24, 0x40, 0x88, 0x72, 0x01, 0xc6, 0x40, 0x03, 0x07, 0xc7, 0x01, 0x05, 0x00, 0x00, 0x00, 
+        0x49, 0xc7, 0x41, 0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, 0xb6, 0x47, 0x08, 0x0f, 0xb7, 0x0e, 0x48, 0x0f, 0xbe, 
+        0x03, 0x49, 0x0f, 0xbf, 0x50, 0x02, 0x48, 0x63, 0x41, 0x04, 0x4c, 0x63, 0xc9, 0x48, 0x0f, 0xbe, 0xc3, 0x48, 
+        0x0f, 0xbf, 0xce, 0x40, 0x0f, 0xb6, 0xc6, 0x0f, 0xb7, 0xd1, 0xb8, 0x2a, 0x00, 0x00, 0x00, 0x41, 0xbf, 0xff, 
+        0xff, 0xff, 0xff, 0x48, 0xc7, 0xc0, 0xfb, 0xff, 0xff, 0xff, 0x49, 0xba, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 
+        0x22, 0x11, 0x48, 0x8d, 0x44, 0x77, 0x10, 0x48, 0x01, 0xd8, 0x29, 0xd1, 0x4d, 0x21, 0xc8, 0x4c, 0x09, 0xf8, 
+        0x31, 0xf6, 0x48, 0x39, 0xc8, 0x48, 0x83, 0xc0, 0x01, 0x48, 0x81, 0xec, 0xe8, 0x03, 0x00, 0x00, 0x81, 0xe1, 
+        0xff, 0x00, 0x00, 0x00, 0x48, 0x83, 0xca, 0x80, 0x49, 0x83, 0xf3, 0x07, 0x3d, 0x40, 0x42, 0x0f, 0x00, 0x48, 
+        0x83, 0x7f, 0x08, 0x00, 0x83, 0x03, 0x01, 0x48, 0x3b, 0x07, 0x48, 0x03, 0x4e, 0x08, 0x41, 0x2b, 0x00, 0x48, 
+        0x85, 0xc0, 0x85, 0xd6, 0xa8, 0x01, 0x48, 0xf7, 0xc7, 0x00, 0x01, 0x00, 0x00, 0xf6, 0x47, 0x08, 0x3f, 0x48, 
+        0x0f, 0xaf, 0xc1, 0x45, 0x0f, 0xaf, 0xc1, 0x48, 0x6b, 0xc3, 0x64, 0x48, 0xf7, 0xd0, 0xf7, 0xd9, 0x49, 0xf7, 
+        0xf8, 0xf7, 0xf9, 0x48, 0x99, 0x99, 0x48, 0xd3, 0xe0, 0xd3, 0xea, 0x49, 0xd3, 0xf9, 0x48, 0xc1, 0xe0, 0x03, 
+        0xc1, 0xe9, 0x1f, 0x49, 0xc1, 0xfa, 0x3f, 0x0f, 0x94, 0xc0, 0x40, 0x0f, 0x9c, 0xc6, 0x41, 0x0f, 0x95, 0xc1, 
+        0x48, 0x0f, 0x44, 0xc1, 0x45, 0x0f, 0x4c, 0xc1, 0xf0, 0x0f, 0xb1, 0x0f, 0xf0, 0x4d, 0x0f, 0xb1, 0x48, 0x08, 
+        0x0f, 0xae, 0xf0, 0xff, 0xe0, 0x41, 0xff, 0xd3, 0xc3, 0x53, 0x41, 0x54, 0x41, 0x5f, 0x5d, 0xcc, 0x90, 0xf2, 
+        0x0f, 0x10, 0x47, 0x08, 0xf3, 0x44, 0x0f, 0x10, 0x0e, 0xf2, 0x0f, 0x11, 0x0b, 0xf3, 0x45, 0x0f, 0x11, 0x50, 
+        0x04, 0x66, 0x41, 0x0f, 0x28, 0xd3, 0x66, 0x48, 0x0f, 0x6e, 0xd8, 0x66, 0x0f, 0x6e, 0xe1, 0x66, 0x48, 0x0f, 
+        0x7e, 0xea, 0x66, 0x41, 0x0f, 0x7e, 0xf1, 0xf2, 0x0f, 0x58, 0xc1, 0xf3, 0x0f, 0x59, 0xd3, 0xf2, 0x45, 0x0f, 
+        0x5c, 0xc1, 0xf3, 0x41, 0x0f, 0x5e, 0xe4, 0xf2, 0x0f, 0x51, 0xee, 0x66, 0x0f, 0x2e, 0xc1, 0x0f, 0x2e, 0xd3, 
+        0x66, 0x0f, 0x57, 0xff, 0xf2, 0x48, 0x0f, 0x2a, 0xc0, 0xf3, 0x0f, 0x2a, 0xc9, 0xf2, 0x48, 0x0f, 0x2c, 0xc0, 
+        0xf3, 0x0f, 0x2c, 0xc9, 0xf3, 0x0f, 0x5a, 0xd3, 0xf2, 0x0f, 0x5a, 0xe5
+    };
+    const got = a.bytes.items;
+    const n = @min(want.len, got.len);
+    for (want[0..n], got[0..n], 0..) |w, g, i| {
+        if (w != g) {
+            std.debug.print("byte {d}: want 0x{x:0>2}, got 0x{x:0>2}\n", .{ i, w, g });
+            return error.TestExpectedEqual;
+        }
+    }
+    try std.testing.expectEqual(want.len, got.len);
+}
+
+test "labels and literal slots resolve RIP-relative after the code" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    const top = try a.newLabel();
+    const out = try a.newLabel();
+    a.bind(top);
+    try a.jcc(.e, out);
+    try a.loadLit(.rax, 0xAABBCCDD11223344);
+    try a.jumpAbs(0x1000);
+    try a.jmp(top);
+    a.bind(out);
+    try a.ret();
+    const bytes = try a.finish();
+    defer std.testing.allocator.free(bytes);
+    // jcc +18 (to out at 24), mov rax,[rip+disp] (the slot at 32, from 13),
+    // jmp [rip+disp] (the slot at 40, from 19), jmp -24 (to 0), ret, padding.
+    const want = [_]u8{
+        0x0f, 0x84, 0x12, 0x00, 0x00, 0x00,
+        0x48, 0x8b, 0x05, 0x13, 0x00, 0x00, 0x00,
+        0xff, 0x25, 0x15, 0x00, 0x00, 0x00,
+        0xe9, 0xe8, 0xff, 0xff, 0xff,
+        0xc3,
+        0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+        0x44, 0x33, 0x22, 0x11, 0xdd, 0xcc, 0xbb, 0xaa,
+        0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    try std.testing.expectEqualSlices(u8, &want, bytes);
+}
+
+test "the cold section follows the hot one, and jumps between them resolve" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    const cold = try a.newLabel();
+    const back = try a.newLabel();
+    try a.jcc(.e, cold);
+    a.bind(back);
+    try a.ret();
+    a.section(true);
+    a.bind(cold);
+    try a.jmp(back);
+    a.section(false);
+    const bytes = try a.finish();
+    defer std.testing.allocator.free(bytes);
+    // jcc +1 (to the cold jump at 7), ret, then jmp -6 (back to 6).
+    const want = [_]u8{ 0x0f, 0x84, 0x01, 0x00, 0x00, 0x00, 0xc3, 0xe9, 0xfa, 0xff, 0xff, 0xff };
+    try std.testing.expectEqualSlices(u8, &want, bytes);
+}
+
+test "lock and with an immediate encodes as the system assembler encodes it" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    try a.lockAndImm(.d, Mem.at(.r10, 0x40), 0x7fffffff);
+    try a.lockAndImm(.d, Mem.at(.rax, 8), 0x7fffffff);
+    const bytes = try a.finish();
+    defer std.testing.allocator.free(bytes);
+    const want = [_]u8{ 0xf0, 0x41, 0x81, 0x62, 0x40, 0xff, 0xff, 0xff, 0x7f, 0xf0, 0x81, 0x60, 0x08, 0xff, 0xff, 0xff, 0x7f };
+    try std.testing.expectEqualSlices(u8, &want, bytes);
+}
+
+test "lock xadd encodes as the system assembler encodes it" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    try a.lockXadd(.d, Mem.at(.r10, 0x40), .r11);
+    try a.lockXadd(.d, Mem.at(.rax, 8), .r8);
+    try a.lockXadd(.q, Mem.at(.r10, 0), .r11);
+    const bytes = try a.finish();
+    defer std.testing.allocator.free(bytes);
+    const want = [_]u8{ 0xf0, 0x45, 0x0f, 0xc1, 0x5a, 0x40, 0xf0, 0x44, 0x0f, 0xc1, 0x40, 0x08, 0xf0, 0x4d, 0x0f, 0xc1, 0x1a };
+    try std.testing.expectEqualSlices(u8, &want, bytes);
+}
+
+test "16-byte SSE moves and quadword unpacks encode as the system assembler encodes them" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    try a.movdqaLoad(.xmm0, Mem.at(.rax, 0));
+    try a.movdqaLoad(.xmm8, Mem.at(.r10, 16));
+    try a.movdqaStore(Mem.at(.rbx, 32), .xmm1);
+    try a.movdqaStore(Mem.at(.r12, 0), .xmm9);
+    try a.punpcklqdq(.xmm0, .xmm1);
+    try a.punpcklqdq(.xmm3, .xmm10);
+    try a.punpckhqdq(.xmm2, .xmm2);
+    try a.punpckhqdq(.xmm11, .xmm11);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x66, 0x0f, 0x6f, 0x00, 0x66, 0x45, 0x0f, 0x6f, 0x42, 0x10, 0x66, 0x0f, 0x7f, 0x4b, 0x20,
+        0x66, 0x45, 0x0f, 0x7f, 0x0c, 0x24, 0x66, 0x0f, 0x6c, 0xc1, 0x66, 0x41, 0x0f, 0x6c, 0xda,
+        0x66, 0x0f, 0x6d, 0xd2, 0x66, 0x45, 0x0f, 0x6d, 0xdb,
+    }, a.bytes.items);
+}
+
+test "unaligned 16-byte moves encode as the system assembler encodes them" {
+    var a = Asm.init(std.testing.allocator);
+    defer a.deinit();
+    try a.movdquLoad(.xmm0, Mem.at(.rax, 0));
+    try a.movdquLoad(.xmm15, Mem.at(.r11, 48));
+    try a.movdquStore(Mem.at(.r8, 16), .xmm15);
+    try a.movdquStore(Mem.at(.rbp, 0), .xmm2);
+    try std.testing.expectEqualSlices(u8, &.{
+        0xf3, 0x0f, 0x6f, 0x00, 0xf3, 0x45, 0x0f, 0x6f, 0x7b, 0x30,
+        0xf3, 0x45, 0x0f, 0x7f, 0x78, 0x10, 0xf3, 0x0f, 0x7f, 0x55, 0x00,
+    }, a.bytes.items);
+}

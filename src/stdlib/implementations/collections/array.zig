@@ -194,6 +194,7 @@ fn longHash(bits: i64) i32 {
 fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
     switch (v) {
         .Instance, .Exception => {
+            if (ctx.host.identityKey(&v)) |id| return @bitCast(id);
             const r = ctx.host.callWellKnown(&v, .hash_code, &.{}, ctx.out) catch return kotlinValueHash(v);
             if (r) |res| switch (res) {
                 .ok => |hv| if (hv == .Int) return @truncate(hv.Int),

@@ -28,7 +28,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 30;
+pub const version: u32 = 32;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -127,7 +127,7 @@ const ClassRtImage = struct {
 
 comptime {
     for (@typeInfo(resolved.ClassRt).@"struct".fields) |f| {
-        if (!std.mem.eql(u8, f.name, "def") and !@hasField(ClassRtImage, f.name)) @compileError("the base image does not carry ClassRt." ++ f.name);
+        if (!std.mem.eql(u8, f.name, "def") and !std.mem.eql(u8, f.name, "identity_keyed") and !@hasField(ClassRtImage, f.name)) @compileError("the base image does not carry ClassRt." ++ f.name);
     }
 }
 
@@ -155,7 +155,7 @@ fn project(comptime Out: type, in: anytype) Out {
 
 /// A native's record without its host functions, which are bound again at
 /// load from `table` and `key` (`bridge.rebindNative`).
-const NativeRtImage = Without(resolved.NativeRt, &.{ "func", "host_fn", "host_try" });
+const NativeRtImage = Without(resolved.NativeRt, &.{ "func", "host_fn", "host_try", "direct", "intrinsic" });
 
 const ExceptionsImage = struct {
     fixed: Without(resolved.Exceptions, &.{"by_fqn"}),

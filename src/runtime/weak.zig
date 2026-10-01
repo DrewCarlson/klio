@@ -472,11 +472,10 @@ fn idleFinalize(_: *GcHeader) void {}
 /// tenured, `marked` carries the last sweep's epoch, `bytes` 0 is permanent.
 fn testHeader(gen: u8, marked: bool, bytes: u32) GcHeader {
     return .{
-        .gc_trace = idleTrace,
-        .gc_finalize = idleFinalize,
+        .gc_desc = gc.descOf(idleTrace, idleFinalize),
         .gc_gen = gen,
         .gc_bytes = bytes,
-        .gc_mark = if (marked) gc.sweepEpoch() else gc.sweepEpoch() +% 1,
+        .gc_mark = @truncate(if (marked) gc.sweepEpoch() else gc.sweepEpoch() +% 1),
     };
 }
 
@@ -592,7 +591,7 @@ test "a dead owner's job is marked, so the sweep keeps it for the cleaner thread
     defer resetRegistry();
     const job = try Value.newCell(testing.allocator, .{ .Int = 9 });
     defer job.Cell.destroyImmediately();
-    job.Cell.cell.hdr.gc_mark = gc.sweepEpoch() +% 1;
+    job.Cell.cell.hdr.gc_mark = @truncate(gc.sweepEpoch() +% 1);
     var owner = testHeader(0, false, 32);
     try cleaners.young.append(reg_alloc, .{ .owner = &owner, .job = job });
     testPass(false);

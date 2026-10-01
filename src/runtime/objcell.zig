@@ -12,8 +12,10 @@
 //! `init` takes one.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const trace = @import("trace.zig");
 pub const gc = @import("gc.zig");
+const slab = @import("slab.zig");
 
 /// Teardown mode for `ObjRef.deinit`. `true`, the default, runs the atomic
 /// decrement, `T.deinit` and `allocator.destroy(cell)`; it must never be false
@@ -33,6 +35,12 @@ pub fn setReclaim(on: bool) void {
 pub fn reclaimEnabled() bool {
     return reclaim_shared.load(.monotonic);
 }
+
+/// Whether a list's elements are read with no lock (`ObjRef.readAtMoving`).
+/// Set where the process runs on the collector over the slab heap, whose freed
+/// memory stays mapped until a stop that no read spans (`slab.unmapLater`);
+/// `KLIO_LOCKFREE_READS=0` leaves it off. Fixed before the program runs.
+pub var lockfree_reads: bool = false;
 
 /// Whether raw host temporaries, allocations that are not cells, must be freed
 /// explicitly. True whenever the backing allocator actually frees: the
@@ -152,68 +160,105 @@ pub fn reclaimRequested() bool {
 }
 
 /// Many readers proceed concurrently; a writer is exclusive against all.
-const SpinRwLock = struct {
-    /// `0` free, positive the reader count, `WRITER` (the sign bit) exclusive.
-    state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+const SpinRwLock = RwLock(false);
 
-    const WRITER: i32 = std.math.minInt(i32);
+/// `SpinRwLock` whose writers also turn a sequence, odd while one holds the
+/// lock, so a reader that takes no lock can tell a write overlapped it
+/// (`ObjRef.readAt`).
+const SeqRwLock = RwLock(true);
 
-    fn lockShared(self: *SpinRwLock) void {
-        // One wait-free `fetchAdd`, so concurrent readers never fail each other
-        // where a compare-exchange loop would storm. Only an active writer, a
-        // negative state, forces the undo-and-spin.
-        const prev = self.state.fetchAdd(1, .acquire);
-        if (prev >= 0) return;
-        _ = self.state.fetchSub(1, .monotonic);
-        var b: Backoff = .{};
-        while (true) {
-            b.pause();
-            const s = self.state.load(.monotonic);
-            if (s >= 0) {
-                const again = self.state.fetchAdd(1, .acquire);
-                if (again >= 0) return;
-                _ = self.state.fetchSub(1, .monotonic);
+fn RwLock(comptime sequenced: bool) type {
+    return struct {
+        const Self = @This();
+        /// `0` free, positive the reader count, `WRITER` (the sign bit) exclusive.
+        state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+        /// Even while no writer holds the lock; each writer adds one as it takes
+        /// the lock and one as it gives it back.
+        seq: if (sequenced) std.atomic.Value(u32) else void = if (sequenced) std.atomic.Value(u32).init(0) else {},
+
+        const WRITER: i32 = std.math.minInt(i32);
+
+        fn lockShared(self: *Self) void {
+            // One wait-free `fetchAdd`, so concurrent readers never fail each other
+            // where a compare-exchange loop would storm. Only an active writer, a
+            // negative state, forces the undo-and-spin.
+            const prev = self.state.fetchAdd(1, .acquire);
+            if (prev >= 0) return;
+            _ = self.state.fetchSub(1, .monotonic);
+            var b: Backoff = .{};
+            while (true) {
+                b.pause();
+                const s = self.state.load(.monotonic);
+                if (s >= 0) {
+                    const again = self.state.fetchAdd(1, .acquire);
+                    if (again >= 0) return;
+                    _ = self.state.fetchSub(1, .monotonic);
+                }
             }
         }
-    }
 
-    fn unlockShared(self: *SpinRwLock) void {
-        _ = self.state.fetchSub(1, .release);
-    }
-
-    fn lockExclusive(self: *SpinRwLock) void {
-        var b: Backoff = .{};
-        while (true) {
-            if (self.state.load(.monotonic) == 0 and
-                self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null)
-            {
-                return;
-            }
-            b.pause();
+        fn unlockShared(self: *Self) void {
+            _ = self.state.fetchSub(1, .release);
         }
-    }
 
-    fn unlockExclusive(self: *SpinRwLock) void {
-        // Entering readers may have bumped the state past `WRITER` before
-        // undoing their `fetchAdd`, so a blind zero store would erase a bump
-        // whose undo is still pending. Clear only the writer bit: the transient
-        // reader count rides in the low bits.
-        _ = self.state.fetchAnd(std.math.maxInt(i32), .release);
-    }
-
-    /// Guarded sections are short, so early retries spin on cheap hints.
-    const Backoff = struct {
-        n: u32 = 0,
-        inline fn pause(self: *Backoff) void {
-            self.n +%= 1;
-            if (self.n < 16) {
-                std.atomic.spinLoopHint();
-            } else {
-                std.Thread.yield() catch {};
+        fn lockExclusive(self: *Self) void {
+            var b: Backoff = .{};
+            while (true) {
+                if (self.state.load(.monotonic) == 0 and
+                    self.state.cmpxchgWeak(0, WRITER, .acquire, .monotonic) == null)
+                {
+                    if (sequenced) {
+                        // Odd before any store the writer makes can be seen.
+                        self.seq.store(self.seq.raw +% 1, .monotonic);
+                        storeFence();
+                    }
+                    return;
+                }
+                b.pause();
             }
         }
+
+        fn unlockExclusive(self: *Self) void {
+            if (sequenced) self.seq.store(self.seq.raw +% 1, .release);
+            // Entering readers may have bumped the state past `WRITER` before
+            // undoing their `fetchAdd`, so a blind zero store would erase a bump
+            // whose undo is still pending. Clear only the writer bit: the transient
+            // reader count rides in the low bits.
+            _ = self.state.fetchAnd(std.math.maxInt(i32), .release);
+        }
+
+        const Backoff = SpinBackoff;
     };
+}
+
+/// Guarded sections are short, so early retries spin on cheap hints.
+const SpinBackoff = struct {
+    n: u32 = 0,
+    inline fn pause(self: *SpinBackoff) void {
+        self.n +%= 1;
+        if (self.n < 16) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
 };
+
+/// Every store before it is seen before every store after it.
+pub inline fn storeFence() void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile ("dmb ishst" ::: .{ .memory = true }),
+        else => asm volatile ("" ::: .{ .memory = true }),
+    }
+}
+
+/// Every load before it is performed before every load after it.
+pub inline fn loadFence() void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile ("dmb ishld" ::: .{ .memory = true }),
+        else => asm volatile ("" ::: .{ .memory = true }),
+    }
+}
 
 /// A stand-in for `SpinRwLock` for a payload immutable for its whole lifetime,
 /// opting in with `pub const objref_immutable = true`. Nothing ever takes an
@@ -225,9 +270,22 @@ const NoopRwLock = struct {
     inline fn unlockExclusive(_: *NoopRwLock) void {}
 };
 
-/// The no-op lock when `T` declares itself immutable, else the spin lock.
+/// The no-op lock when `T` declares itself immutable or changes only through
+/// atomics (`objref_atomic`), the sequenced lock for
+/// a run of values (an `Array<T>`'s or a list's) or a payload read with no lock
+/// that opts in with `pub const objref_sequenced = true` (a map's), else the
+/// spin lock.
 fn LockFor(comptime T: type) type {
-    return if (isContainer(T) and @hasDecl(T, "objref_immutable") and T.objref_immutable) NoopRwLock else SpinRwLock;
+    if (isContainer(T) and @hasDecl(T, "objref_immutable") and T.objref_immutable) return NoopRwLock;
+    if (isContainer(T) and @hasDecl(T, "objref_atomic") and T.objref_atomic) return NoopRwLock;
+    if (isContainer(T) and @hasDecl(T, "objref_sequenced") and T.objref_sequenced) return SeqRwLock;
+    return if (sequencedRun(T)) SeqRwLock else SpinRwLock;
+}
+
+fn sequencedRun(comptime T: type) bool {
+    if (!isArrayListLike(T)) return false;
+    const Elem = @typeInfo(@FieldType(T, "items")).pointer.child;
+    return @typeInfo(Elem) == .@"union" and @hasDecl(Elem, "isNumberOrBool");
 }
 
 /// Exclusive spin lock, since Zig 0.16's std has no blocking `Thread.Mutex`.
@@ -318,12 +376,31 @@ pub fn ControlBlock(comptime T: type) type {
         /// offset through `@fieldParentPtr`. 16-byte aligned so a `Value`
         /// payload can tag a cell pointer in its low four bits.
         hdr: gc.GcHeader align(16),
-        refcount: std.atomic.Value(usize),
         lock: LockFor(T),
         data: T,
-        allocator: std.mem.Allocator,
+
+        /// The prefix before a cell outside the region heap; a region cell has none.
+        pub inline fn prefix(cb: *const Self) *CellPrefix {
+            return @ptrFromInt(@intFromPtr(cb) - prefix_bytes);
+        }
+
+        /// The allocator that made the cell: the process heap's for a region cell.
+        pub inline fn allocatorOf(cb: *const Self) std.mem.Allocator {
+            return if (gc.isRegion(&cb.hdr)) slab.allocator else cb.prefix().allocator;
+        }
     };
 }
+
+/// What a cell carries before it when it is not a region cell: the allocator
+/// that made it, which frees it, and its reference count. A region cell is made
+/// on the process heap and freed by the collector alone, so it carries neither
+/// and starts at its header.
+pub const CellPrefix = struct {
+    refcount: std.atomic.Value(usize),
+    allocator: std.mem.Allocator,
+};
+/// A cell stays 16-byte aligned after its prefix.
+pub const prefix_bytes = std.mem.alignForward(usize, @sizeOf(CellPrefix), 16);
 
 // GC trace and finalize dispatch, duck-typed so `objcell` depends on neither
 // `value` nor `class` nor `env`. A payload `T` declares how the collector walks
@@ -364,6 +441,8 @@ fn externalBytes(comptime U: type, data: *const U) usize {
     if (comptime hasDeclSafe(U, "gcExternalBytes")) return data.gcExternalBytes();
     if (comptime isArrayListLike(U)) {
         const Elem = @typeInfo(@TypeOf(data.items)).pointer.child;
+        // The region's bytes count as its holes are taken.
+        if (data.capacity != 0 and gc.region.owns(@intFromPtr(data.items.ptr))) return 0;
         return data.capacity * @sizeOf(Elem);
     }
     if (comptime isSlice(U)) return data.len * @sizeOf(@typeInfo(U).pointer.child);
@@ -430,7 +509,7 @@ fn assertLeaf(comptime U: type) void {
     }
 }
 
-/// Shading a cell is how the graph advances; its own `gc_trace` does the next
+/// Shading a cell is how the graph advances; its own trace does the next
 /// level.
 fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
     if (comptime hasDeclSafe(E, "gcMark")) {
@@ -459,12 +538,19 @@ fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
         if (data.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
     } else if (comptime isArrayListLike(U)) {
         for (data.items) |*e| gcTraceElem(@TypeOf(e.*), e, m);
+        markArrayBuffer(U, data, m);
     } else if (comptime isSlice(U)) {
         for (data.*) |*e| gcTraceElem(@TypeOf(e.*), e, m);
     } else if (comptime isHashMapLike(U)) {
         var it = data.valueIterator();
         while (it.next()) |v| gcTraceElem(@TypeOf(v.*), v, m);
     }
+}
+
+/// The lines of an array-like payload's buffer, when the region holds it.
+inline fn markArrayBuffer(comptime U: type, data: *const U, m: *gc.Marker) void {
+    const Elem = @typeInfo(@FieldType(U, "items")).pointer.child;
+    if (data.capacity != 0) m.markBuffer(@intFromPtr(data.items.ptr), data.capacity * @sizeOf(Elem));
 }
 
 fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
@@ -479,6 +565,20 @@ fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
     } else if (comptime isHashMapLike(U)) {
         data.deinit();
     }
+}
+
+/// Whether a payload's finalizer can have anything to free.
+fn mayFinalize(comptime U: type) bool {
+    return hasDeclSafe(U, "gcFinalize") or isArrayListLike(U) or isSlice(U) or isHashMapLike(U);
+}
+
+/// Whether a region cell holding `data` must be on the lists for its
+/// finalizer: a payload whose buffers may all be in its cell says so
+/// itself (`gcNeedsFinalize`).
+fn finalizeNeeded(comptime U: type, data: *const U) bool {
+    if (comptime !mayFinalize(U)) return false;
+    if (comptime hasDeclSafe(U, "gcNeedsFinalize")) return data.gcNeedsFinalize();
+    return true;
 }
 
 pub const BorrowMutError = error{AlreadyBorrowed};
@@ -571,9 +671,26 @@ pub fn ObjRef(comptime T: type) type {
             // Every cell is 16-byte aligned, so recovering the block from its
             // header re-establishes that alignment.
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
+            m.markRegion(h, @intFromPtr(cb), cellBytes(cb));
             cb.lock.lockShared();
             defer cb.lock.unlockShared();
             gcTraceData(T, &cb.data, m);
+        }
+
+        /// The cell's allocation: the block and its trailing run.
+        inline fn cellBytes(cb: *const Cell) usize {
+            const extra: usize = if (comptime hasDeclSafe(T, "trailingBytes")) cb.data.trailingBytes() else 0;
+            return @sizeOf(Cell) + extra;
+        }
+
+        /// A cell just made in region memory, `bytes` long with its trailing
+        /// run: its size and flags, and its place on the lists when its
+        /// finalizer has anything to free.
+        inline fn regionMint(cell: *Cell, bytes: usize) void {
+            const ext = externalBytes(T, &cell.data);
+            cell.hdr.gc_bytes = gc.regionBytes(bytes + ext);
+            const listed = finalizeNeeded(T, &cell.data);
+            if (listed or ext != 0) gc.regionMinted(&cell.hdr, ext, listed);
         }
 
         /// Elements `lo` through `hi` of an array-like payload, clamped to
@@ -583,16 +700,21 @@ pub fn ObjRef(comptime T: type) type {
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             cb.lock.lockShared();
             defer cb.lock.unlockShared();
+            markArrayBuffer(T, &cb.data, m);
             const items = cb.data.items;
             if (lo >= items.len) return;
             const end = @min(items.len, @as(usize, hi) + 1);
             for (items[lo..end]) |*e| gcTraceElem(@TypeOf(e.*), e, m);
         }
+        const gc_desc: gc.GcDesc = .{ .trace = gcTraceThunk, .finalize = gcFinalizeThunk, .name = @typeName(T) };
+        /// A swept cell under `KLIO_GC_POISON`: any trace of it traps, naming its type.
+        const poison_desc: gc.GcDesc = .{ .trace = gc.poisonTrap, .finalize = gcFinalizeThunk, .name = @typeName(T) };
+
         /// Shallow: child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             if (h.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
-                std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.gc_type });
+                std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.typeName() });
                 trace.dumpCurrent(.{});
             }
             if (gc.gc_poison) {
@@ -600,22 +722,32 @@ pub fn ObjRef(comptime T: type) type {
                 // scribble the payload and arm the trap, so a later live
                 // reference is caught with this cell's type. Leaks by design.
                 @memset(std.mem.asBytes(&cb.data), 0xDD);
-                h.gc_trace = gc.poisonTrap;
+                h.gc_desc = &poison_desc;
                 h.gc_mark = 0;
                 return;
             }
-            gcFinalizeData(T, &cb.data, cb.allocator);
+            gcFinalizeData(T, &cb.data, cb.allocatorOf());
             freeCell(cb);
         }
 
         /// The cell's allocation: the block, and after it the payload's
-        /// trailing run when `initTrailing` made one.
+        /// trailing run when `initTrailing` made one. A region cell's memory
+        /// comes free with its lines.
         fn freeCell(cb: *Cell) void {
-            const allocator = cb.allocator;
+            if (gc.isRegion(&cb.hdr)) return;
+            const allocator = cb.prefix().allocator;
             const extra: usize = if (comptime hasDeclSafe(T, "trailingBytes")) cb.data.trailingBytes() else 0;
-            if (extra == 0) return allocator.destroy(cb);
-            const block: [*]align(@alignOf(Cell)) u8 = @ptrCast(cb);
-            allocator.free(block[0 .. @sizeOf(Cell) + extra]);
+            const block: [*]align(@max(@alignOf(Cell), 16)) u8 = @ptrFromInt(@intFromPtr(cb) - prefix_bytes);
+            const whole: []align(@max(@alignOf(Cell), 16)) u8 = block[0 .. prefix_bytes + @sizeOf(Cell) + extra];
+            allocator.free(whole);
+        }
+
+        /// `bytes` of cell after a prefix naming `allocator`, from it.
+        fn allocWithPrefix(allocator: std.mem.Allocator, bytes: usize) std.mem.Allocator.Error!*Cell {
+            const block = try allocator.alignedAlloc(u8, .fromByteUnits(@max(@alignOf(Cell), 16)), prefix_bytes + bytes);
+            const p: *CellPrefix = @ptrCast(block.ptr);
+            p.* = .{ .refcount = std.atomic.Value(usize).init(1), .allocator = allocator };
+            return @ptrCast(@alignCast(block.ptr + prefix_bytes));
         }
 
         /// `initOwned` with the payload's trailing run of `n` `T.Trailing`s in
@@ -625,28 +757,49 @@ pub fn ObjRef(comptime T: type) type {
         pub fn initTrailing(allocator: std.mem.Allocator, v: T, n: usize) std.mem.Allocator.Error!Self {
             const Elem = T.Trailing;
             const bytes = @sizeOf(Cell) + n * @sizeOf(Elem);
-            const block = try allocator.alignedAlloc(u8, .of(Cell), bytes);
-            const cell: *Cell = @ptrCast(block.ptr);
-            cell.* = .{
-                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk, .gc_type = @typeName(T) },
-                .refcount = std.atomic.Value(usize).init(1),
-                .lock = .{},
-                .data = v,
-                .allocator = allocator,
-            };
-            const elems: [*]Elem = @ptrCast(@alignCast(block.ptr + @sizeOf(Cell)));
+            if (gc.gc_enabled) {
+                if (gc.regionAlloc(allocator, bytes)) |mem| {
+                    const cell: *Cell = @ptrCast(mem);
+                    cell.* = .{ .hdr = .{ .gc_desc = &gc_desc }, .lock = .{}, .data = v };
+                    const elems: [*]Elem = @ptrCast(@alignCast(mem + @sizeOf(Cell)));
+                    cell.data.adoptTrailing(elems[0..n]);
+                    regionMint(cell, bytes);
+                    return .{ .cell = cell };
+                }
+            }
+            const cell = try allocWithPrefix(allocator, bytes);
+            cell.* = .{ .hdr = .{ .gc_desc = &gc_desc }, .lock = .{}, .data = v };
+            const base: [*]u8 = @ptrCast(cell);
+            const elems: [*]Elem = @ptrCast(@alignCast(base + @sizeOf(Cell)));
             cell.data.adoptTrailing(elems[0..n]);
-            if (gc.gc_enabled) gc.register(&cell.hdr, bytes + externalBytes(T, &cell.data));
+            if (gc.gc_enabled) gc.register(&cell.hdr, prefix_bytes + bytes + externalBytes(T, &cell.data));
             return .{ .cell = cell };
+        }
+
+        /// Writes into `cell` the region cell `v`, `bytes` long with its
+        /// trailing run, as the process heap's region makes it: the image
+        /// `fromImage` copies. The payload must need no finalizer and hold
+        /// nothing outside the cell.
+        pub fn regionImage(cell: *Cell, v: T, bytes: usize) void {
+            cell.* = .{ .hdr = .{ .gc_desc = &gc_desc, .gc_bytes = gc.regionBytes(bytes) }, .lock = .{}, .data = v };
+        }
+
+        /// A copy of `image` (`regionImage`) in this thread's region hole,
+        /// or null when the thread has none to give; the caller sets what
+        /// differs from cell to cell.
+        pub inline fn fromImage(image: []align(16) const u8) ?Self {
+            const mem = gc.regionAlloc(slab.allocator, image.len) orelse return null;
+            @memcpy(mem[0..image.len], image);
+            return .{ .cell = @ptrCast(mem) };
         }
 
         /// Free the cell now, whatever the refcount gating or memory mode, for a
         /// hand-managed process-global cache swapping its owner. The caller
         /// asserts no live handle dereferences it afterwards, and the cell must
-        /// not be on the sweep registry, so mint it under `alloc_perm`.
+        /// not be on the sweep registry, so mint it permanent (`setAllocPerm`).
         pub fn destroyImmediately(self: Self) void {
             if (gc.gc_enabled) gc.forgetCell(&self.cell.hdr);
-            const allocator = self.cell.allocator;
+            const allocator = self.cell.allocatorOf();
             if (comptime owns_bytes) {
                 allocator.free(self.cell.data);
             } else if (comptime hasDeinit(T)) {
@@ -658,22 +811,24 @@ pub fn ObjRef(comptime T: type) type {
         /// `init` without the dupe: the cell adopts `v` verbatim, so it takes a
         /// `[]const u8` caller's buffer and frees it under the reclaim path.
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
-            const cell = try allocator.create(Cell);
-            cell.* = .{
-                .hdr = .{ .gc_trace = gcTraceThunk, .gc_finalize = gcFinalizeThunk, .gc_type = @typeName(T) },
-                .refcount = std.atomic.Value(usize).init(1),
-                .lock = .{},
-                .data = v,
-                .allocator = allocator,
-            };
-            if (gc.gc_enabled) gc.register(&cell.hdr, @sizeOf(Cell) + externalBytes(T, &cell.data));
+            if (gc.gc_enabled) {
+                if (gc.regionAlloc(allocator, @sizeOf(Cell))) |mem| {
+                    const cell: *Cell = @ptrCast(mem);
+                    cell.* = .{ .hdr = .{ .gc_desc = &gc_desc }, .lock = .{}, .data = v };
+                    regionMint(cell, @sizeOf(Cell));
+                    return .{ .cell = cell };
+                }
+            }
+            const cell = try allocWithPrefix(allocator, @sizeOf(Cell));
+            cell.* = .{ .hdr = .{ .gc_desc = &gc_desc }, .lock = .{}, .data = v };
+            if (gc.gc_enabled) gc.register(&cell.hdr, prefix_bytes + @sizeOf(Cell) + externalBytes(T, &cell.data));
             return .{ .cell = cell };
         }
 
         /// Gated exactly like `deinit`: under the arena and the tracing GC
         /// neither side of the count runs.
         pub fn clone(self: Self) Self {
-            if (reclaim_shared.load(.monotonic)) _ = self.cell.refcount.fetchAdd(1, .monotonic);
+            if (reclaim_shared.load(.monotonic)) _ = self.cell.prefix().refcount.fetchAdd(1, .monotonic);
             return .{ .cell = self.cell };
         }
 
@@ -682,7 +837,7 @@ pub fn ObjRef(comptime T: type) type {
         /// immediately, since the arena reclaims every cell on reset.
         pub fn deinit(self: Self) void {
             if (!reclaim_shared.load(.monotonic)) return;
-            const prev = self.cell.refcount.fetchSub(1, .release);
+            const prev = self.cell.prefix().refcount.fetchSub(1, .release);
             if (detectDoubleFree()) {
                 // Never destroy here, so a second decrement stays observable:
                 // `prev == 0` means a double-free.
@@ -691,7 +846,7 @@ pub fn ObjRef(comptime T: type) type {
                     trace.dumpCurrent(.{});
                 }
                 if (prev == 1) {
-                    const allocator = self.cell.allocator;
+                    const allocator = self.cell.allocatorOf();
                     if (comptime owns_bytes) {
                         allocator.free(self.cell.data);
                     } else if (comptime hasDeinit(T)) {
@@ -704,12 +859,12 @@ pub fn ObjRef(comptime T: type) type {
             if (prev == 1) {
                 // This acquire load pairs with the other handles' release
                 // decrements, so their writes happen-before this free.
-                _ = self.cell.refcount.load(.acquire);
+                _ = self.cell.prefix().refcount.load(.acquire);
                 if (self.cell.hdr.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                     std.debug.print("[gc-freed-remembered] RC h={*} type={s}\n", .{ &self.cell.hdr, @typeName(T) });
                     trace.dumpCurrent(.{});
                 }
-                const allocator = self.cell.allocator;
+                const allocator = self.cell.allocatorOf();
                 if (comptime owns_bytes) {
                     allocator.free(self.cell.data);
                 } else if (comptime hasDeinit(T)) {
@@ -742,6 +897,57 @@ pub fn ObjRef(comptime T: type) type {
 
         pub fn borrowMut(self: Self) ObjGuardMut(T) {
             return self.tryBorrowMut() catch unreachable;
+        }
+
+        /// Element `i` of a run of values read with no lock, as the JVM reads
+        /// an array's element: null when a writer held the lock or took it
+        /// during the read, or `i` is out of range, and the caller takes the
+        /// lock. Only for a run whose buffer never moves while its cell lives
+        /// (an `Array<T>`'s): a moved buffer may be gone before the sequence
+        /// says so.
+        pub inline fn readAt(self: Self, i: usize) ?@typeInfo(@FieldType(T, "items")).pointer.child {
+            comptime std.debug.assert(sequencedRun(T));
+            const Elem = @typeInfo(@FieldType(T, "items")).pointer.child;
+            const cell = self.cell;
+            const before = cell.lock.seq.load(.acquire);
+            if (before & 1 != 0) return null;
+            const items = cell.data.items;
+            if (i >= items.len) return null;
+            const words: *const [2]u64 = @ptrCast(&items[i]);
+            var out: Elem = undefined;
+            const ow: *[2]u64 = @ptrCast(&out);
+            ow[0] = @atomicLoad(u64, &words[0], .monotonic);
+            ow[1] = @atomicLoad(u64, &words[1], .monotonic);
+            loadFence();
+            if (cell.lock.seq.load(.monotonic) != before) return null;
+            return out;
+        }
+
+        /// `readAt` for a run whose buffer moves as it grows, a list's. The buffer and
+        /// its length are read between two equal even readings of the sequence, so
+        /// they are one writer's; the element is read before a third. A buffer a
+        /// writer replaces stays mapped until a stop, which no read spans, so a read
+        /// of one just freed finds garbage the third reading throws away. Only where
+        /// `lockfree_reads` holds.
+        pub inline fn readAtMoving(self: Self, i: usize) ?@typeInfo(@FieldType(T, "items")).pointer.child {
+            comptime std.debug.assert(sequencedRun(T));
+            const Elem = @typeInfo(@FieldType(T, "items")).pointer.child;
+            const cell = self.cell;
+            const before = cell.lock.seq.load(.acquire);
+            if (before & 1 != 0) return null;
+            const words: *const [2]usize = @ptrCast(&cell.data.items);
+            const ptr = @atomicLoad(usize, &words[0], .monotonic);
+            const len = @atomicLoad(usize, &words[1], .monotonic);
+            loadFence();
+            if (cell.lock.seq.load(.monotonic) != before or i >= len) return null;
+            const elem: *const [2]u64 = @ptrFromInt(ptr + i * @sizeOf(Elem));
+            var out: Elem = undefined;
+            const ow: *[2]u64 = @ptrCast(&out);
+            ow[0] = @atomicLoad(u64, &elem[0], .monotonic);
+            ow[1] = @atomicLoad(u64, &elem[1], .monotonic);
+            loadFence();
+            if (cell.lock.seq.load(.monotonic) != before) return null;
+            return out;
         }
 
         /// A mutable borrow of an array-like payload for a store into element
@@ -819,8 +1025,10 @@ pub fn ObjRef(comptime T: type) type {
             return a.cell == b.cell;
         }
 
+        /// 0 for a region cell, which keeps no count.
         pub fn strongCount(self: Self) usize {
-            return self.cell.refcount.load(.acquire);
+            if (gc.isRegion(&self.cell.hdr)) return 0;
+            return self.cell.prefix().refcount.load(.acquire);
         }
 
         pub fn asPtr(self: Self) *T {
@@ -1314,4 +1522,64 @@ test "stores into a tenured array from many threads leave every stored cell reac
     // Only the array joined the range table; nothing was remembered whole.
     try testing.expect(!arr.cell.hdr.gc_remembered);
     try testing.expect(arr.cell.hdr.gc_range != 0);
+}
+
+test "a region cell's lines stay live while it is reachable and come free once it is not" {
+    const prev_enabled = gc.gc_enabled;
+    const prev_region = gc.region_on;
+    gc.gc_enabled = true;
+    gc.region_on = true;
+    defer {
+        gc.gc_enabled = prev_enabled;
+        gc.region_on = prev_region;
+    }
+    const prev_perm = gc.allocPerm();
+    gc.setAllocPerm(false);
+    defer gc.setAllocPerm(prev_perm);
+    gc.enterMutator();
+    defer gc.exitMutator();
+    const R = struct {
+        var kept: ?*gc.GcHeader = null;
+        var registered = false;
+        fn root(m: *gc.Marker) void {
+            if (kept) |h| m.shade(h);
+        }
+    };
+    if (!R.registered) {
+        gc.registerRoot(R.root);
+        R.registered = true;
+    }
+    defer R.kept = null;
+    const Box = ObjRef(u64);
+    const keep = try Box.init(slab.allocator, 42);
+    try testing.expect(gc.isRegion(&keep.cell.hdr));
+    try testing.expect(keep.cell.hdr.gc_bytes & gc.listed_bit == 0);
+    R.kept = &keep.cell.hdr;
+    var dropped: [40]usize = undefined;
+    for (&dropped, 0..) |*d, i| d.* = @intFromPtr((try Box.init(slab.allocator, i)).cell);
+    // A payload with a buffer outside its cell is on the lists for its finalizer.
+    var bytes: std.ArrayList(u8) = .empty;
+    try bytes.appendSlice(slab.allocator, "abc");
+    const listed = try ObjRef(std.ArrayList(u8)).init(slab.allocator, bytes);
+    try testing.expect(gc.isRegion(&listed.cell.hdr));
+    try testing.expect(listed.cell.hdr.gc_bytes & gc.listed_bit != 0);
+
+    gc.collect();
+    try testing.expect(gc.region.lineMarkAt(@intFromPtr(keep.cell)) != 0);
+    try testing.expectEqual(@as(u64, 42), keep.cell.data);
+    // The cells nothing reached, past the kept cell's line, left theirs free.
+    try testing.expectEqual(@as(u8, 0), gc.region.lineMarkAt(dropped[dropped.len / 2]));
+    // New cells fill the free lines and never the kept cell's.
+    const lo = @intFromPtr(keep.cell);
+    const hi = lo + @sizeOf(Box.Cell);
+    var n: usize = 0;
+    while (n < 20_000) : (n += 1) {
+        const c = @intFromPtr((try Box.init(slab.allocator, n)).cell);
+        try testing.expect(c + @sizeOf(Box.Cell) <= lo or c >= hi);
+    }
+    try testing.expectEqual(@as(u64, 42), keep.cell.data);
+
+    R.kept = null;
+    gc.collect();
+    try testing.expectEqual(@as(u8, 0), gc.region.lineMarkAt(lo));
 }

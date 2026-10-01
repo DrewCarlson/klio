@@ -1892,7 +1892,7 @@ pub fn gcThreadEnter() void {
     if (runtime.gc.program_started and
         !std.mem.eql(u8, runtime.envOnce("KLIO_WORKER_PERM") orelse "0", "1"))
     {
-        runtime.gc.alloc_perm = false;
+        runtime.gc.setAllocPerm(false);
     }
     runtime.gc.enterMutator();
 }
@@ -3661,10 +3661,8 @@ test "pump-root scope base sits below the guard so a persisted root carries its 
     const inst = try runtime.ObjRef(runtime.InstanceData).init(a, .{
         .class = cls_ref,
         .slots = &.{},
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
     });
+    inst.cell.data.setIdentity(1);
     const scope: Value = .{ .Instance = inst };
 
     // The contract `driveRoot` relies on: with the base read before the guard's
@@ -3992,9 +3990,9 @@ test "a resume stashed before its slot has an owner stays rooted" {
     const prev_enabled = gc.gc_enabled;
     gc.gc_enabled = true;
     defer gc.gc_enabled = prev_enabled;
-    const prev_perm = gc.alloc_perm;
-    gc.alloc_perm = false;
-    defer gc.alloc_perm = prev_perm;
+    const prev_perm = gc.allocPerm();
+    gc.setAllocPerm(false);
+    defer gc.setAllocPerm(prev_perm);
     // A cell the collector finalizes stays readable: the arena outlives the test.
     const S = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

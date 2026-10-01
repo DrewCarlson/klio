@@ -73,13 +73,19 @@ pub const Activation = struct {
     try_stack: std.ArrayList(TryFrame),
     /// The activation below this one in the driver that opened it; null for the driver's first.
     caller: ?*Activation,
-    ret_block: BlockId,
-    ret_idx: usize,
-    ret_dst: Reg,
     /// The caller's streams when it called from a stream it can go on in at `ret_pc`: a return
     /// then lands in the caller's stream directly. Null sends it through the frame loop.
     ret_streams: ?*const bc.FuncStreams,
+    // Four words a call writes as two.
+    ret_block: BlockId,
+    ret_idx: u32,
     ret_pc: u32,
+    ret_dst: Reg,
+    /// Where the return goes on in the caller's compiled code, and that code, when compiled
+    /// code made the call (`bc.DirectSite.back`): the return goes there without reading the
+    /// caller's streams. 0 sends it through the caller's entry table.
+    ret_code: usize,
+    ret_codeptr: [*]const u32,
 };
 
 /// `KLIO_FLAT=0` falls back to native recursion for every call.

@@ -13,19 +13,30 @@ const tls_fast = @import("tls_fast.zig");
 const trace = @import("trace.zig");
 const clock_mod = @import("clock.zig");
 const slab = @import("slab.zig");
+pub const region = @import("region.zig");
 const platform = @import("platform.zig");
 const assertNoCellLock = @import("objcell.zig").assertNoCellLock;
 const Allocator = std.mem.Allocator;
+
+/// What the collector does with a cell of one payload type: its trace, its
+/// finalizer and its name, one per type and shared by every cell of it.
+pub const GcDesc = struct {
+    trace: *const fn (*GcHeader, *Marker) void,
+    finalize: *const fn (*GcHeader) void,
+    /// Payload `@typeName(T)`, interned per type so pointer identity keys it.
+    name: [*:0]const u8 = "",
+};
 
 /// Type-erased header on every `ControlBlock(T)`. `gc_mark` is an epoch,
 /// marked iff equal to the current one, so no clear pass is needed.
 pub const GcHeader = struct {
     gc_next: ?*GcHeader = null,
-    gc_mark: usize = 0,
-    gc_trace: *const fn (*GcHeader, *Marker) void,
-    gc_finalize: *const fn (*GcHeader) void,
-    /// Payload `@typeName(T)`, interned per type so pointer identity keys it.
-    gc_type: [*:0]const u8 = "",
+    gc_desc: *const GcDesc,
+    /// Epochs stay below 2^32 (`nextEpoch`), so a mark holds one whole.
+    gc_mark: u32 = 0,
+    /// `@sizeOf(Cell)` plus external payload bytes at mint, below the flags
+    /// `region_bit` and `listed_bit`.
+    gc_bytes: u32 = 0,
     /// 0 = nursery, swept every collection; 1 = tenured, swept only by major
     /// ones. A cell tenures on surviving its first collection.
     gc_gen: u8 = 0,
@@ -34,11 +45,51 @@ pub const GcHeader = struct {
     gc_remembered: bool = false,
     /// One past the cell's entry in `ranged`, 0 for none: a large tenured
     /// array whose element stores reported their indices remembers only the
-    /// range they touched. Rides in the padding before `gc_bytes`.
+    /// range they touched.
     gc_range: u16 = 0,
-    /// `@sizeOf(Cell)` plus external payload bytes at mint.
-    gc_bytes: u32 = 0,
+    /// A word the payload's type keeps for itself in the header's padding: an
+    /// instance's identity (`InstanceData.identityOf`), a builder's length
+    /// while every byte of it is known ASCII (`value.sbAsciiLen`).
+    gc_aux: u32 = 0,
+
+    pub inline fn traceCell(h: *GcHeader, m: *Marker) void {
+        h.gc_desc.trace(h, m);
+    }
+    pub inline fn finalizeCell(h: *GcHeader) void {
+        h.gc_desc.finalize(h);
+    }
+    pub inline fn typeName(h: *const GcHeader) [*:0]const u8 {
+        return h.gc_desc.name;
+    }
 };
+
+comptime {
+    std.debug.assert(@sizeOf(GcHeader) <= 32);
+}
+
+/// A descriptor of `trace` and `finalize`, one static per pair, for cells made
+/// by hand (tests, a weak reference's placeholder).
+pub fn descOf(comptime tr: fn (*GcHeader, *Marker) void, comptime fin: fn (*GcHeader) void) *const GcDesc {
+    return &struct {
+        const d: GcDesc = .{ .trace = tr, .finalize = fin };
+    }.d;
+}
+
+/// In `gc_bytes`: the cell was bumped out of a region block (`region.zig`),
+/// whose lines its trace marks and whose memory no sweep frees.
+pub const region_bit: u32 = 1 << 31;
+/// In `gc_bytes`: a region cell on the lists, for its finalizer.
+pub const listed_bit: u32 = 1 << 30;
+pub const bytes_mask: u32 = listed_bit - 1;
+
+pub inline fn isRegion(h: *const GcHeader) bool {
+    return h.gc_bytes & region_bit != 0;
+}
+
+/// A region cell's `gc_bytes`.
+pub inline fn regionBytes(bytes: usize) u32 {
+    return region_bit | @as(u32, @intCast(@min(bytes, bytes_mask)));
+}
 
 /// `KLIO_GC_HIST`: print live cells per payload type after each collection.
 pub var gc_hist: bool = false;
@@ -72,6 +123,20 @@ pub const Marker = struct {
     promoted_list: ?*std.ArrayList(*GcHeader) = null,
     /// Registered cells this mark reached; a permanent cell carries no bytes.
     live: usize = 0,
+    /// The cycle a region cell's trace marks its lines with; 0 for a pass
+    /// that must not mark them (a verify pass, a test's marker).
+    line_mark: u8 = 0,
+
+    /// A region cell's trace, for the lines of its `size` bytes at `addr`.
+    pub inline fn markRegion(self: *const Marker, h: *const GcHeader, addr: usize, size: usize) void {
+        if (self.line_mark != 0 and isRegion(h) and self.verify_from == null) region.markLines(addr, size, self.line_mark);
+    }
+
+    /// A buffer the cell being traced holds, `size` bytes at `addr`: its lines, when
+    /// the region bumped it (`buffer_allocator`), which live while an owner marks them.
+    pub inline fn markBuffer(self: *const Marker, addr: usize, size: usize) void {
+        if (self.line_mark != 0 and size != 0 and self.verify_from == null and region.owns(addr)) region.markLines(addr, size, self.line_mark);
+    }
 
     pub fn shade(self: *Marker, h: *GcHeader) void {
         if (self.verify_from) |from| {
@@ -82,8 +147,8 @@ pub const Marker = struct {
             }
             return;
         }
-        if (gc_poison and h.gc_trace == poisonTrap) {
-            std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s} ctx={s}:{d}\n", .{ h.gc_type, poison_ctx_name, poison_ctx_idx });
+        if (gc_poison and h.gc_desc.trace == poisonTrap) {
+            std.debug.print("\n[GC-POISON-SHADE] root reached SWEPT cell: type={s} ctx={s}:{d}\n", .{ h.typeName(), poison_ctx_name, poison_ctx_idx });
             trace.dumpCurrent(.{});
             @panic("KGC: root shaded a swept cell (incomplete root)");
         }
@@ -93,11 +158,11 @@ pub const Marker = struct {
         // is reached again from a remembered cell by the remark.
         if (self.between_stops and h.gc_gen == 0) return;
         if (h.gc_mark == self.epoch) return; // already grey or black this epoch
-        h.gc_mark = self.epoch;
+        h.gc_mark = @intCast(self.epoch);
         if (h.gc_gen == 0) {
             h.gc_gen = 1;
             self.promoted += 1;
-            self.promoted_bytes += h.gc_bytes;
+            self.promoted_bytes += h.gc_bytes & bytes_mask;
             if (self.promoted_list) |list| list.append(std.heap.page_allocator, h) catch
                 @panic("KGC: promoted list allocation failed");
         }
@@ -109,7 +174,7 @@ pub const Marker = struct {
     }
 
     pub fn drain(self: *Marker) void {
-        while (self.grey.pop()) |h| h.gc_trace(h, self);
+        while (self.grey.pop()) |h| h.traceCell(self);
     }
 
     /// Whether this mark reaches everything a structure it traces holds and
@@ -124,7 +189,7 @@ pub const Marker = struct {
         var n: usize = 0;
         while (self.grey.pop()) |h| {
             n += 1;
-            h.gc_trace(h, self);
+            h.traceCell(self);
         }
         return n;
     }
@@ -145,7 +210,8 @@ const SpinLock = struct {
 };
 
 var reg_lock: SpinLock = .{};
-/// Cells minted since the last collection; survivors move to `tenured`.
+/// Cells minted since the last collection that no thread's own nursery holds
+/// (`Minted`); survivors move to `tenured`.
 var nursery: ?*GcHeader = null;
 var tenured: ?*GcHeader = null;
 var tenured_count: usize = 0;
@@ -351,7 +417,8 @@ fn beginMajor() void {
     mm.reset();
     cur_epoch = nextEpoch(cur_epoch);
     const grey = mm.marker.grey;
-    mm.marker = .{ .epoch = cur_epoch, .arena = std.heap.page_allocator, .between_stops = true, .grey = grey };
+    region.beginMajor();
+    mm.marker = .{ .epoch = cur_epoch, .arena = std.heap.page_allocator, .between_stops = true, .grey = grey, .line_mark = region.cycle() };
     mm.active = true;
     mm.stops = 1;
     markRoots(&mm.marker);
@@ -392,10 +459,10 @@ fn majorSlice(budget: usize, comptime yield_to_stop: bool) bool {
     while (left != 0) : (left -= 1) {
         if (yield_to_stop and stopRaised()) return false;
         if (m.grey.pop()) |h| {
-            h.gc_trace(h, m);
+            h.traceCell(m);
             mm.traced += 1;
         } else if (mm.dirty.pop()) |h| {
-            if (h.gc_mark == m.epoch) h.gc_trace(h, m);
+            if (h.gc_mark == m.epoch) h.traceCell(m);
         } else if (mm.dirty_spans.pop()) |sp| {
             if (sp.h.gc_mark == m.epoch) sp.trace(sp.h, m, sp.lo, sp.hi);
         } else {
@@ -442,7 +509,8 @@ fn scrubMajor(ctx: anytype, comptime drop: fn (@TypeOf(ctx), *GcHeader) bool) vo
 
 fn nextEpoch(e: usize) usize {
     const n = e +% 1;
-    return if (n == 0) 1 else n; // 0 is the never-marked sentinel
+    // 0 is the never-marked sentinel, and a mark holds 32 bits.
+    return if (n == 0 or n > std.math.maxInt(u32)) 1 else n;
 }
 
 /// The remembered set: tenured cells mutated since promotion, re-traced at the
@@ -587,9 +655,9 @@ fn retrace(marker: *Marker, whole: []const *GcHeader, spans: []const Span, only_
         if (rem_top) {
             const t = clock_mod.monotonicNanos();
             const g = marker.grey.items.len;
-            h.gc_trace(h, marker);
+            h.traceCell(marker);
             remTopNote(h, clock_mod.monotonicNanos() - t, marker.grey.items.len -| g);
-        } else h.gc_trace(h, marker);
+        } else h.traceCell(marker);
         counts.whole += 1;
     }
     for (spans) |sp| {
@@ -628,7 +696,7 @@ fn remWatchHit(h: *GcHeader) void {
     for (&rem_watch) |*w| {
         if (w.* != h) continue;
         w.* = null;
-        std.debug.print("[kgc-rem-store] a whole-cell barrier on {s} {*}, which a retrace found large:\n", .{ h.gc_type, h });
+        std.debug.print("[kgc-rem-store] a whole-cell barrier on {s} {*}, which a retrace found large:\n", .{ h.typeName(), h });
         trace.dumpCurrent(.{});
         return;
     }
@@ -637,8 +705,8 @@ fn remWatchHit(h: *GcHeader) void {
 fn remTopNote(h: *GcHeader, ns: u64, shaded: usize) void {
     if (ns > 200 * std.time.ns_per_us) remWatch(h);
     for (&rem_top_rows) |*r| {
-        if (r.n == 0) r.ty = h.gc_type;
-        if (r.ty != h.gc_type) continue;
+        if (r.n == 0) r.ty = h.typeName();
+        if (r.ty != h.typeName()) continue;
         r.n += 1;
         r.ns += ns;
         r.shaded += shaded;
@@ -687,7 +755,7 @@ fn writeBarrierSlow(h: *GcHeader) void {
     h.gc_remembered = true;
     if (rem_top) remWatchHit(h);
     if (rememberTraceOn()) {
-        std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.gc_type, program_started });
+        std.debug.print("[gc-remember] h={*} gen={d} type={s} program_started={}\n", .{ h, h.gc_gen, h.typeName(), program_started });
     }
     remembered.append(std.heap.page_allocator, h) catch
         @panic("KGC: remembered set allocation failed");
@@ -739,6 +807,7 @@ pub fn forgetRanges(ranges: []const Range) void {
     {
         reg_lock.lock();
         defer reg_lock.unlock();
+        gatherMinted();
         nursery = unlinkInRanges(nursery, ranges);
         const before = tenured_count;
         tenured = unlinkInRanges(tenured, ranges);
@@ -886,7 +955,7 @@ pub fn freeProgramPerm() void {
     while (cur) |h| {
         cur = h.gc_next;
         h.gc_next = null;
-        h.gc_finalize(h);
+        h.finalizeCell();
         freed += 1;
     }
     if (gc_debug) std.debug.print("[kgc] program-perm freed={d}\n", .{freed});
@@ -908,13 +977,237 @@ inline fn pollCounters() *PollCounters {
     return poll_tls.get();
 }
 
-/// Permanent generation. Cells minted while this is true never join the sweep
-/// registry: they are immutable and reference only other permanent cells.
-/// They stay traceable. `vmRun` clears it before the program body.
-pub threadlocal var alloc_perm: bool = true;
+/// A thread's allocation state: whether it mints permanent cells, and the
+/// cells it minted since the last collection with their bytes not yet added
+/// to `bytes_since_gc`. A mutator links its own cells with no lock or atomic;
+/// a collection takes every thread's inside its stop, where no mutator mints.
+/// A thread outside the mutator set, which a stop does not wait for, links
+/// onto `nursery` under `reg_lock`. The owner thread's is an ordinary global
+/// (`tls_fast`); another thread's is allocated on its first use and kept,
+/// registered, for the process, so a thread that ends leaves its cells to the
+/// next collection.
+const Minted = struct {
+    /// Permanent generation. Cells minted while this is true never join the
+    /// sweep registry: they are immutable and reference only other permanent
+    /// cells. They stay traceable. `vmRun` clears it before the program body.
+    perm: bool = true,
+    /// Whether the thread is in the mutator set (`enterMutator`).
+    mutator: bool = false,
+    head: ?*GcHeader = null,
+    tail: ?*GcHeader = null,
+    bytes: usize = 0,
+    next: ?*Minted = null,
+    /// The region hole this thread bumps cells out of; empty outside the
+    /// mutator set and in the permanent generation.
+    tlab: region.Tlab = .{},
+};
+
+var owner_minted: Minted = .{};
+threadlocal var other_minted: ?*Minted = null;
+/// Every thread's `Minted`, the owner's first.
+var minted_all: ?*Minted = &owner_minted;
+var minted_lock: SpinLock = .{};
+/// Bytes a thread mints before adding them to the shared trigger count.
+const MINTED_FLUSH: usize = 64 * 1024;
+
+inline fn minted() *Minted {
+    if (tls_fast.isOwner()) return &owner_minted;
+    return other_minted orelse newMinted();
+}
+
+fn newMinted() *Minted {
+    const p = std.heap.page_allocator.create(Minted) catch @panic("out of memory for per-thread allocation state");
+    p.* = .{};
+    minted_lock.lock();
+    p.next = minted_all;
+    minted_all = p;
+    minted_lock.unlock();
+    other_minted = p;
+    return p;
+}
+
+/// Whether this thread mints permanent cells.
+pub fn allocPerm() bool {
+    return minted().perm;
+}
+
+pub fn setAllocPerm(perm: bool) void {
+    const m = minted();
+    m.perm = perm;
+    if (perm) m.tlab.retire();
+}
+
+/// Whether cells go to the region heap: set with the collector's knobs,
+/// off under every debug mode that walks or keeps every cell on the lists.
+pub var region_on: bool = false;
+
+/// `size` bytes for a cell from this thread's region hole, or null when
+/// the cell must be allocated from `a` and registered: `a` is not the
+/// process heap, the thread is outside the mutator set or minting
+/// permanent cells, the cell is over `region.max_cell` or no block could
+/// be mapped. A cell this returns is on no list; `regionMinted` puts a
+/// finalizable one there.
+pub inline fn regionAlloc(a: Allocator, size: usize) ?[*]align(16) u8 {
+    if (!slab.isMainHeap(a)) return null;
+    const m = minted();
+    const n = std.mem.alignForward(usize, size, 16);
+    const p = m.tlab.main.cursor;
+    if (m.tlab.main.limit - p >= n) {
+        m.tlab.main.cursor = p + n;
+        return @ptrFromInt(p);
+    }
+    return regionAllocSlow(m, n);
+}
+
+noinline fn regionAllocSlow(m: *Minted, n: usize) ?[*]align(16) u8 {
+    if (!region_on or m.perm or !m.mutator or n > region.max_cell) return null;
+    const p = m.tlab.allocSlow(n) orelse return null;
+    m.bytes += m.tlab.taken;
+    m.tlab.taken = 0;
+    if (m.bytes >= MINTED_FLUSH) flushMinted(m);
+    return @ptrFromInt(p);
+}
+
+/// The buffers a region cell's payload grows (a list's elements, a map's entries, a
+/// builder's bytes), bumped out of this thread's region hole as a cell is, with no
+/// header: the owner's trace marks their lines (`Marker.markBuffer`), so a buffer
+/// lives while its owner holds it and its lines come free after. What the region
+/// cannot place, the process heap allocates; the process heap leaves a region
+/// buffer alone when it is freed or resized (`slab.region_tag`), so a buffer may
+/// pass between the two. Only a region cell's payload may hold one: a permanent
+/// cell is not traced to mark it. An owner that is tenured takes the write barrier
+/// when its buffer moves (`bufferMoved`), so the next minor marks the new lines.
+pub const buffer_allocator: Allocator = .{ .ptr = undefined, .vtable = &buffer_vtable };
+
+const buffer_vtable: Allocator.VTable = .{
+    .alloc = bufferAlloc,
+    .resize = bufferResize,
+    .remap = bufferRemap,
+    .free = bufferFree,
+};
+
+fn bufferAlloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+    if (region.buffers_ok and alignment.toByteUnits() <= 16 and len <= region.max_cell) {
+        if (regionAlloc(slab.allocator, len)) |p| return p;
+    }
+    return slab.allocator.rawAlloc(len, alignment, ra);
+}
+
+fn bufferResize(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+    return slab.allocator.rawResize(buf, alignment, new_len, ra);
+}
+
+fn bufferRemap(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+    return slab.allocator.rawRemap(buf, alignment, new_len, ra);
+}
+
+fn bufferFree(_: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
+    slab.allocator.rawFree(buf, alignment, ra);
+}
+
+/// The allocator for the buffers of the payload of the cell `h` heads, made by `a`:
+/// `buffer_allocator` for a region cell's, else `a`.
+pub inline fn bufferAllocatorFor(h: *const GcHeader, a: Allocator) Allocator {
+    return if (isRegion(h)) buffer_allocator else a;
+}
+
+/// The allocator for the buffers of a payload a region cell made by `a` is about to
+/// adopt: `buffer_allocator` when `a` is the process heap and the collector runs.
+pub inline fn freshBufferAllocator(a: Allocator) Allocator {
+    return if (gc_enabled and slab.isMainHeap(a)) buffer_allocator else a;
+}
+
+/// The buffer of the payload `h` heads moved from `before` to `after`: a tenured
+/// owner is remembered, so the next minor marks the new buffer's lines.
+pub inline fn bufferMoved(h: *GcHeader, before: usize, after: usize) void {
+    if (before != after) writeBarrier(h);
+}
+
+/// A region cell this thread just made: `listed` puts it on the lists for
+/// its finalizer, and `external` bytes its payload holds outside the cell
+/// count towards the next collection.
+pub fn regionMinted(h: *GcHeader, external: usize, listed: bool) void {
+    const m = minted();
+    if (listed) {
+        h.gc_bytes |= listed_bit;
+        h.gc_next = m.head;
+        if (m.head == null) m.tail = h;
+        m.head = h;
+    }
+    if (external != 0) {
+        m.bytes += external;
+        if (m.bytes >= MINTED_FLUSH) flushMinted(m);
+    }
+}
+
+/// A region cell that has taken something its finalizer frees joins the
+/// lists, once. Any thread, holding the cell's exclusive borrow.
+pub fn noteFinalizable(h: *GcHeader) void {
+    if (!isRegion(h) or h.gc_bytes & listed_bit != 0) return;
+    h.gc_bytes |= listed_bit;
+    const m = minted();
+    if (!m.mutator) {
+        reg_lock.lock();
+        defer reg_lock.unlock();
+        h.gc_next = nursery;
+        nursery = h;
+        return;
+    }
+    // A tenured cell on the nursery list survives its sweep by generation
+    // and moves to the tenured list.
+    h.gc_next = m.head;
+    if (m.head == null) m.tail = h;
+    m.head = h;
+}
+
+/// A hole that stays empty, for code that bumps with no thread's hole to use.
+var no_tlab: region.Tlab = .{};
+
+/// The hole compiled code bumps cells out of on this thread for a run over
+/// `a`: this thread's, or one that stays empty when `a` is not the process
+/// heap. Only `regionAllocSlow` fills a hole, and only for a thread that may
+/// take region cells, so a filled hole is one compiled code may bump.
+pub fn tlabFor(a: Allocator) *region.Tlab {
+    if (!gc_enabled or !slab.isMainHeap(a)) return &no_tlab;
+    return &minted().tlab;
+}
+
+/// Every mutator stops allocating from its holes: inside a stop, before the
+/// collection takes the blocks for its sweep.
+fn retireTlabs() void {
+    minted_lock.lock();
+    defer minted_lock.unlock();
+    var cur = minted_all;
+    while (cur) |m| : (cur = m.next) m.tlab.retire();
+}
+
+/// Takes every thread's minted cells onto `nursery` and zeroes their counts:
+/// inside a stop, or where no other thread mints.
+fn gatherMinted() void {
+    minted_lock.lock();
+    defer minted_lock.unlock();
+    var cur = minted_all;
+    while (cur) |m| : (cur = m.next) {
+        if (m.head) |h| {
+            m.tail.?.gc_next = nursery;
+            nursery = h;
+            m.head = null;
+            m.tail = null;
+        }
+        m.bytes = 0;
+    }
+}
+
+fn flushMinted(m: *Minted) void {
+    const b = m.bytes;
+    m.bytes = 0;
+    const prev = bytes_since_gc.fetchAdd(b, .monotonic);
+    if (prev + b >= threshold) gc_pending.store(true, .monotonic);
+}
 
 pub fn register(h: *GcHeader, bytes: usize) void {
-    if (alloc_perm) {
+    const m = minted();
+    if (m.perm) {
         // Minted tenured so a minor mark stops here instead of walking the
         // image graph, and so mutating it at runtime trips the write barrier.
         h.gc_gen = 1;
@@ -931,12 +1224,20 @@ pub fn register(h: *GcHeader, bytes: usize) void {
         return;
     }
     h.gc_bytes = std.math.lossyCast(u32, bytes);
-    reg_lock.lock();
-    h.gc_next = nursery;
-    nursery = h;
-    reg_lock.unlock();
-    const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
-    if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
+    if (!m.mutator) {
+        reg_lock.lock();
+        h.gc_next = nursery;
+        nursery = h;
+        reg_lock.unlock();
+        const prev = bytes_since_gc.fetchAdd(bytes, .monotonic);
+        if (prev + bytes >= threshold) gc_pending.store(true, .monotonic);
+        return;
+    }
+    h.gc_next = m.head;
+    if (m.head == null) m.tail = h;
+    m.head = h;
+    m.bytes += bytes;
+    if (m.bytes >= MINTED_FLUSH) flushMinted(m);
 }
 
 /// Account heap growth the registry cannot see: frame buffers and suspension
@@ -1129,7 +1430,7 @@ pub fn registerRoot(f: RootFn) void {
 /// Keeps the closure side-table's capture store and receiver chain alive for a
 /// closure id that marking reached. A closure captured by another needs no
 /// second pass: draining the outer captures cell re-invokes this hook.
-pub var markClosureHook: ?*const fn (id: u64, m: *Marker) void = null;
+pub var markClosureHook: ?*const fn (id: u64, body: ?*const anyopaque, m: *Marker) void = null;
 
 /// Reclaims closure side-table slots no live value referenced in `epoch`.
 /// Called after the sweep, world still stopped, so the side-table is stable.
@@ -1138,11 +1439,11 @@ pub var sweepClosureHook: ?*const fn (epoch: usize) void = null;
 /// Singleton identity of a closure id: non-zero and keyed on (module, body
 /// function) when it captures nothing, 0 when it captures. Kotlin makes a
 /// non-capturing lambda literal a singleton, so `structuralEq` compares by it.
-pub var closureSingletonHook: ?*const fn (id: u64) u64 = null;
+pub var closureSingletonHook: ?*const fn (id: u64, body: ?*const anyopaque) u64 = null;
 
 /// Writes what a closure id's `toString` answers, for the host's display of
 /// a closure; false when the host renders it itself.
-pub var closureTextHook: ?*const fn (id: u64, w: *std.Io.Writer) std.Io.Writer.Error!bool = null;
+pub var closureTextHook: ?*const fn (id: u64, body: ?*const anyopaque, w: *std.Io.Writer) std.Io.Writer.Error!bool = null;
 
 /// Marks the Values reachable from a parked lazy-`sequence{}` continuation, an
 /// `ir.eval.SuspendState` box held opaquely because `runtime` cannot import
@@ -1195,7 +1496,9 @@ pub fn unregisterThreadRoot(node: *ThreadRoot) void {
     }
 }
 
-fn markThreadRoots(m: *Marker) void {
+/// Every thread's registered roots, as each stop marks them on whichever
+/// thread collects.
+pub fn markThreadRoots(m: *Marker) void {
     // Held for the whole walk: a concurrent splice would corrupt the list.
     thread_roots_lock.lock();
     defer thread_roots_lock.unlock();
@@ -1305,6 +1608,7 @@ pub fn enterMutator() void {
         mutator_lock.lock();
         if (!stopRaised()) {
             is_mutator = true;
+            minted().mutator = true;
             _ = mutators.fetchAdd(1, .acq_rel);
             lateRegister();
             mutator_lock.unlock();
@@ -1326,6 +1630,11 @@ pub fn exitMutator() void {
         mutator_lock.lock();
         if (!stopRaised()) {
             is_mutator = false;
+            const m = minted();
+            m.mutator = false;
+            // A stop no longer waits for this thread, so it must not bump
+            // into a block a sweep may be reading.
+            m.tlab.retire();
             _ = mutators.fetchSub(1, .acq_rel);
             lateUnregister();
             mutator_lock.unlock();
@@ -1628,7 +1937,7 @@ pub threadlocal var poison_ctx_idx: usize = 0;
 /// Whether poison mode already swept `h`, so a host walk can probe before
 /// dereferencing the payload.
 pub fn cellSweptPoisoned(h: *const GcHeader) bool {
-    return gc_poison and h.gc_trace == poisonTrap;
+    return gc_poison and h.gc_desc.trace == poisonTrap;
 }
 /// Whether a minor mark stops at tenured cells. `KLIO_GC_MINOR_STOP=0` turns
 /// the shortcut off; a full-trace minor still sweeps only the nursery.
@@ -1636,7 +1945,7 @@ pub var minor_stops_at_tenured: bool = true;
 
 /// Reaching this tracer means a live value referenced a swept cell.
 pub fn poisonTrap(h: *GcHeader, _: *Marker) void {
-    std.debug.print("\n[GC-POISON] live reference to SWEPT cell: type={s}\n", .{h.gc_type});
+    std.debug.print("\n[GC-POISON] live reference to SWEPT cell: type={s}\n", .{h.typeName()});
     trace.dumpCurrent(.{});
     @panic("KGC: use-after-free — a live value referenced a swept cell (incomplete root)");
 }
@@ -1726,6 +2035,8 @@ fn collectImpl(force_major: bool) void {
         cur_epoch = nextEpoch(cur_epoch);
         own.epoch = cur_epoch;
         own.minor = kind != .major;
+        if (kind == .major) region.beginMajor();
+        own.line_mark = region.cycle();
         if (kind == .slice) {
             own.promoted_list = &mm.promoted;
             mm.stops += 1;
@@ -1817,9 +2128,21 @@ fn collectImpl(force_major: bool) void {
             @max(threshold_floor, (live_bytes +| external_live.load(.monotonic)) *| growthFactor());
     }
     // Detach what this collection sweeps: the nursery, and a major's tenured
-    // list. Cells minted from here on start a fresh nursery.
+    // list, and the region blocks the mutators bumped into, with a major's
+    // every other block. Cells minted from here on start a fresh nursery in
+    // fresh holes.
+    if (major) region.finishMajor();
     reg_lock.lock();
-    const job: SweepJob = .{ .nursery = nursery, .tenured = if (major) tenured else null, .epoch = marker.epoch };
+    gatherMinted();
+    retireTlabs();
+    const job: SweepJob = .{
+        .nursery = nursery,
+        .tenured = if (major) tenured else null,
+        .epoch = marker.epoch,
+        .blocks = region.takeForSweep(major),
+        .base = region.baseCycle(),
+        .cur = region.cycle(),
+    };
     nursery = null;
     if (major) tenured = null;
     reg_lock.unlock();
@@ -1930,6 +2253,11 @@ const SweepJob = struct {
     /// A major's tenured list; a minor's stays where it is.
     tenured: ?*GcHeader,
     epoch: usize,
+    /// The region blocks to read, after the lists' dead cells are finalized,
+    /// and the cycles their lines are live between.
+    blocks: ?*region.Block = null,
+    base: u8 = 0,
+    cur: u8 = 0,
 };
 
 const Chain = struct {
@@ -1957,6 +2285,10 @@ fn sweepJob(job: SweepJob) usize {
         t.gc_next = tenured;
         tenured = kept.head;
     }
+    // A finalizer reads its cell, so the lines come free after the lists.
+    const counts = region.sweepBlocks(job.blocks, job.base, job.cur);
+    region.trim();
+    if (gc_debug and counts.blocks != 0) std.debug.print("[kgc-region] epoch={d} blocks={d} free_blocks={d} free_lines={d} mapped={d}\n", .{ job.epoch, counts.blocks, counts.free_blocks, counts.free_lines, region.mappedBlocks() });
     return freed;
 }
 
@@ -1973,7 +2305,7 @@ fn sweepChain(head: ?*GcHeader, epoch: ?usize, kept: *Chain) usize {
             h.gc_gen = 1;
             kept.push(h);
         } else {
-            h.gc_finalize(h);
+            h.finalizeCell();
             freed += 1;
         }
         cur = next;
@@ -2080,6 +2412,7 @@ fn threadsGoneInChild() callconv(.c) void {
     marking_thread.started = false;
     major_lock = .{};
     major_mark.reset();
+    region.resetLockInChild();
 }
 
 /// Returns once no handed-off sweep is in flight: one load when none is.
@@ -2144,7 +2477,7 @@ pub var verify_describe: ?*const fn (from: *GcHeader, to: *GcHeader) void = null
 fn verifyReport(from: *GcHeader, to: *GcHeader) void {
     verify_reports += 1;
     if (verify_reports > 20) return;
-    std.debug.print("[gc-verify] tenured {s} ({*}, remembered={}) -> unmarked nursery {s} ({*})\n", .{ from.gc_type, from, from.gc_remembered, to.gc_type, to });
+    std.debug.print("[gc-verify] tenured {s} ({*}, remembered={}) -> unmarked nursery {s} ({*})\n", .{ from.typeName(), from, from.gc_remembered, to.typeName(), to });
     if (verify_describe) |f| f(from, to);
     if (verify_reports == 1) trace.dumpCurrent(.{});
 }
@@ -2157,14 +2490,14 @@ fn verifyTenured(epoch: usize) void {
     var cur = tenured;
     while (cur) |t| : (cur = t.gc_next) {
         var vm: Marker = .{ .epoch = epoch, .arena = std.heap.page_allocator, .verify_from = t };
-        t.gc_trace(t, &vm);
+        t.traceCell(&vm);
     }
 }
 
 fn verifyReportMajor(from: *GcHeader, to: *GcHeader) void {
     verify_reports += 1;
     if (verify_reports > 20) return;
-    std.debug.print("[gc-verify] major: marked {s} ({*}, gen={d}) -> unmarked {s} ({*}, gen={d})\n", .{ from.gc_type, from, from.gc_gen, to.gc_type, to, to.gc_gen });
+    std.debug.print("[gc-verify] major: marked {s} ({*}, gen={d}) -> unmarked {s} ({*}, gen={d})\n", .{ from.typeName(), from, from.gc_gen, to.typeName(), to, to.gc_gen });
     if (verify_describe) |f| f(from, to);
     if (verify_reports == 1) trace.dumpCurrent(.{});
 }
@@ -2172,13 +2505,14 @@ fn verifyReportMajor(from: *GcHeader, to: *GcHeader) void {
 /// Traces every cell on the lists marked in `epoch` and not in `exempt`,
 /// reporting each child left unmarked.
 fn verifyMarkedClosed(epoch: usize, exempt: ?*const std.AutoHashMapUnmanaged(*GcHeader, void)) void {
+    gatherMinted();
     for ([2]?*GcHeader{ tenured, nursery }) |head| {
         var cur = head;
         while (cur) |c| : (cur = c.gc_next) {
             if (c.gc_mark != epoch) continue;
             if (exempt) |set| if (set.contains(c)) continue;
             var vm: Marker = .{ .epoch = epoch, .arena = std.heap.page_allocator, .verify_from = c, .verify_major = true };
-            c.gc_trace(c, &vm);
+            c.traceCell(&vm);
         }
     }
 }
@@ -2204,25 +2538,26 @@ fn verifyMajorWindow() void {
     verifyMarkedClosed(mm.marker.epoch, &exempt);
 }
 
-/// Top live-cell payload types by count, bucketed on `gc_type` pointer
+/// Top live-cell payload types by count, bucketed on the type name's pointer
 /// identity. Walks the registry under the sweep's lock.
 fn liveTypeHistogram() void {
     const Bucket = struct { name: [*:0]const u8, count: usize };
     var buckets: [128]Bucket = undefined;
     var n: usize = 0;
     reg_lock.lock();
+    gatherMinted();
     for ([2]?*GcHeader{ nursery, tenured }) |head| {
         var cur = head;
         while (cur) |h| : (cur = h.gc_next) {
             var i: usize = 0;
             while (i < n) : (i += 1) {
-                if (buckets[i].name == h.gc_type) {
+                if (buckets[i].name == h.typeName()) {
                     buckets[i].count += 1;
                     break;
                 }
             }
             if (i == n and n < buckets.len) {
-                buckets[n] = .{ .name = h.gc_type, .count = 1 };
+                buckets[n] = .{ .name = h.typeName(), .count = 1 };
                 n += 1;
             }
         }
@@ -2256,7 +2591,7 @@ test "minor mark stops at tenured cells; major stamps them" {
     const prev_stop = minor_stops_at_tenured;
     minor_stops_at_tenured = true;
     defer minor_stops_at_tenured = prev_stop;
-    var a: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin, .gc_gen = 1 };
+    var a: GcHeader = .{ .gc_desc = descOf(T.trace, T.fin), .gc_gen = 1 };
     var minor: Marker = .{ .epoch = 3, .arena = std.testing.allocator, .minor = true };
     defer minor.grey.deinit(std.testing.allocator);
     minor.shade(&a);
@@ -2271,14 +2606,14 @@ test "minor mark stops at tenured cells; major stamps them" {
 
 test "a remembered cell's tracer may run the write barrier during a minor mark" {
     const T = struct {
-        var other: GcHeader = .{ .gc_trace = idle, .gc_finalize = fin, .gc_gen = 1 };
+        var other: GcHeader = .{ .gc_desc = descOf(idle, fin), .gc_gen = 1 };
         fn idle(_: *GcHeader, _: *Marker) void {}
         fn fin(_: *GcHeader) void {}
         fn barrierTrace(_: *GcHeader, _: *Marker) void {
             writeBarrier(&other);
         }
     };
-    var cell: GcHeader = .{ .gc_trace = T.barrierTrace, .gc_finalize = T.fin, .gc_gen = 1 };
+    var cell: GcHeader = .{ .gc_desc = descOf(T.barrierTrace, T.fin), .gc_gen = 1 };
     writeBarrier(&cell);
     try std.testing.expect(cell.gc_remembered);
     var marker = Marker{ .epoch = 1, .arena = std.heap.page_allocator, .minor = true };
@@ -2297,10 +2632,10 @@ test "write barrier records a tenured cell once and skips nursery cells" {
         fn trace(_: *GcHeader, _: *Marker) void {}
         fn fin(_: *GcHeader) void {}
     };
-    var young: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin };
+    var young: GcHeader = .{ .gc_desc = descOf(T.trace, T.fin) };
     writeBarrier(&young);
     try std.testing.expect(!young.gc_remembered);
-    var old: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin, .gc_gen = 1 };
+    var old: GcHeader = .{ .gc_desc = descOf(T.trace, T.fin), .gc_gen = 1 };
     writeBarrier(&old);
     try std.testing.expect(old.gc_remembered);
     const n = remembered.items.len;
@@ -2414,7 +2749,7 @@ test "marker shades, drains, and stops at fixpoint without recursion" {
         }
         fn fin(_: *GcHeader) void {}
     };
-    var a: GcHeader = .{ .gc_trace = T.trace, .gc_finalize = T.fin };
+    var a: GcHeader = .{ .gc_desc = descOf(T.trace, T.fin) };
     var m: Marker = .{ .epoch = 7, .arena = std.testing.allocator };
     defer m.grey.deinit(std.testing.allocator);
     m.shade(&a);
@@ -2471,14 +2806,14 @@ test "a thread joining the mutator set during a collection with no other mutator
 /// Cells for the sweep tests: registered on the nursery, never reached by a
 /// root unless one shades them, and counted as they are finalized.
 const SweepTestCells = struct {
-    var cells: [4]GcHeader = @splat(.{ .gc_trace = idle, .gc_finalize = fin });
+    var cells: [4]GcHeader = @splat(.{ .gc_desc = descOf(idle, fin) });
     var finalized = std.atomic.Value(usize).init(0);
     var fin_tid = std.atomic.Value(Tid).init(0);
     var rooted = std.atomic.Value(?*GcHeader).init(null);
 
     fn idle(_: *GcHeader, _: *Marker) void {}
     fn fin(h: *GcHeader) void {
-        h.* = .{ .gc_trace = idle, .gc_finalize = fin };
+        h.* = .{ .gc_desc = descOf(idle, fin) };
         fin_tid.store(currentTid(), .release);
         _ = finalized.fetchAdd(1, .acq_rel);
     }
@@ -2496,7 +2831,7 @@ const SweepTestCells = struct {
         finalized.store(0, .release);
         fin_tid.store(0, .release);
         rooted.store(keep, .release);
-        alloc_perm = false;
+        setAllocPerm(false);
         for (&cells) |*h| register(h, 64);
         major_pending.store(false, .monotonic);
     }
@@ -2505,7 +2840,7 @@ const SweepTestCells = struct {
     fn disarm() void {
         rooted.store(null, .release);
         collect();
-        alloc_perm = true;
+        setAllocPerm(true);
     }
 };
 
@@ -2576,7 +2911,7 @@ test "a held sweeper leaves each sweep inside its collection's stop" {
 /// Each test runs under `KLIO_GC_VERIFY` and counts its reports.
 const GraphCells = struct {
     const Cell = struct {
-        hdr: GcHeader = .{ .gc_trace = traceKids, .gc_finalize = fin },
+        hdr: GcHeader = .{ .gc_desc = descOf(traceKids, fin) },
         kids: [2]?*GcHeader = .{ null, null },
     };
     var cells: [6]Cell = @splat(.{});
@@ -2611,7 +2946,7 @@ const GraphCells = struct {
     }
     fn born(i: usize) void {
         cells[i] = .{};
-        alloc_perm = false;
+        setAllocPerm(false);
         register(hdr(i), 64);
     }
     fn reports() usize {
@@ -2675,7 +3010,7 @@ const GraphCells = struct {
         verify_init = saved_verify[0];
         verify_on = saved_verify[1];
         verify_reports = reports_before;
-        alloc_perm = true;
+        setAllocPerm(true);
     }
 };
 
@@ -2755,7 +3090,7 @@ test "a cell freed by hand during a spanning major leaves the major's lists" {
     try std.testing.expectEqual(major_mark.marker.epoch, G.hdr(5).gc_mark);
     G.store(1, 1, null);
     forgetCell(G.hdr(5));
-    G.hdr(5).gc_trace = S.trap;
+    G.hdr(5).gc_desc = descOf(S.trap, GraphCells.fin);
     collectImpl(true);
     waitSweep();
     G.cells[5] = .{};
@@ -2918,7 +3253,7 @@ test "a stop waits for the marking thread's batch before it touches the major" {
     collectImpl(false);
     waitSweep();
     C.begin();
-    G.hdr(4).gc_trace = S.blockingTrace;
+    G.hdr(4).gc_desc = descOf(S.blockingTrace, GraphCells.fin);
     C.step(2);
     // 0 and 1 are traced; the next batch is 4's.
     marking_thread.steps.store(1, .release);
@@ -2931,7 +3266,7 @@ test "a stop waits for the marking thread's batch before it touches the major" {
     const marked_while_held = S.marked.load(.acquire);
     S.release.store(true, .release);
     t.join();
-    G.hdr(4).gc_trace = GraphCells.traceKids;
+    G.hdr(4).gc_desc = descOf(GraphCells.traceKids, GraphCells.fin);
     try std.testing.expect(!marked_while_held);
     try std.testing.expect(!S.marked_during.load(.acquire));
     try std.testing.expect(S.marked.load(.acquire));
@@ -2964,7 +3299,7 @@ test "a stop raised mid-batch waits for one cell of the marking thread's batch" 
     // Tenured cells off the registry, as permanent ones are: marked and
     // traced, never swept.
     for (&S.chain, 0..) |*c, i| {
-        c.* = .{ .hdr = .{ .gc_trace = S.trace, .gc_finalize = GraphCells.fin, .gc_gen = 1 } };
+        c.* = .{ .hdr = .{ .gc_desc = descOf(S.trace, GraphCells.fin), .gc_gen = 1 } };
         c.kids[0] = if (i + 1 < S.chain.len) &S.chain[i + 1].hdr else null;
     }
     if (!S.registered) {
@@ -2984,8 +3319,8 @@ test "a stop raised mid-batch waits for one cell of the marking thread's batch" 
         major_mode = saved_mode;
         marker_batch = saved_batch;
     }
-    alloc_perm = false;
-    defer alloc_perm = true;
+    setAllocPerm(false);
+    defer setAllocPerm(true);
     major_pending.store(true, .monotonic);
     collectImpl(false);
     waitSweep();
@@ -3242,4 +3577,114 @@ test "the edge word is up while a collection is wanted, an abandon asked, or a s
     edge_flags.abandon.store(false, .monotonic);
     edge_flags.stress = true;
     try std.testing.expect(edgeFlagsWord() != 0);
+}
+
+test "a region cell's buffer lives while the cell holds it, through the minor after it moves, and comes free after" {
+    const objcell = @import("objcell.zig");
+    const prev_enabled = gc_enabled;
+    const prev_region = region_on;
+    gc_enabled = true;
+    region_on = true;
+    defer {
+        gc_enabled = prev_enabled;
+        region_on = prev_region;
+    }
+    const prev_perm = allocPerm();
+    setAllocPerm(false);
+    defer setAllocPerm(prev_perm);
+    enterMutator();
+    defer exitMutator();
+    const R = struct {
+        var kept: ?*GcHeader = null;
+        var registered = false;
+        fn root(m: *Marker) void {
+            if (kept) |h| m.shade(h);
+        }
+    };
+    if (!R.registered) {
+        registerRoot(R.root);
+        R.registered = true;
+    }
+    defer R.kept = null;
+    const List = objcell.ObjRef(std.ArrayList(u64));
+    const Box = objcell.ObjRef(u64);
+    const list = try List.initOwned(slab.allocator, .empty);
+    try std.testing.expect(isRegion(&list.cell.hdr));
+    R.kept = &list.cell.hdr;
+    const items = &list.cell.data;
+    var i: u64 = 0;
+    while (i < 100) : (i += 1) try items.append(buffer_allocator, i * 7);
+    const first = @intFromPtr(items.items.ptr);
+    try std.testing.expect(region.owns(first));
+    const S = struct {
+        /// Region cells enough to fill every free line, none over the buffer.
+        fn churn(buf: usize, bytes: usize) !void {
+            var n: usize = 0;
+            while (n < 20_000) : (n += 1) {
+                const c = @intFromPtr((try Box.init(slab.allocator, n)).cell);
+                try std.testing.expect(c + @sizeOf(Box.Cell) <= buf or c >= buf + bytes);
+            }
+        }
+        fn check(l: *const std.ArrayList(u64)) !void {
+            for (l.items, 0..) |x, k| try std.testing.expectEqual(@as(u64, k) * 7, x);
+        }
+    };
+
+    // The list is reached and tenured, and its trace marks its buffer's lines.
+    collectImpl(false);
+    waitSweep();
+    try std.testing.expect(list.cell.hdr.gc_gen != 0);
+    try std.testing.expect(region.lineMarkAt(first) != 0);
+    try S.churn(first, items.capacity * 8);
+    try S.check(items);
+
+    // The tenured list's buffer moves: a minor stops at tenured cells, so only the
+    // barrier the move takes brings the new buffer's lines to its mark.
+    while (@intFromPtr(items.items.ptr) == first) : (i += 1) try items.append(buffer_allocator, i * 7);
+    const moved = @intFromPtr(items.items.ptr);
+    try std.testing.expect(region.owns(moved));
+    bufferMoved(&list.cell.hdr, first, moved);
+    collectImpl(false);
+    waitSweep();
+    try std.testing.expect(region.lineMarkAt(moved) != 0);
+    try S.churn(moved, items.capacity * 8);
+    try S.check(items);
+
+    // Once nothing holds the list, a major leaves its buffer's lines free.
+    R.kept = null;
+    collect();
+    try std.testing.expectEqual(@as(u8, 0), region.lineMarkAt(moved));
+}
+
+test "the process heap leaves a region buffer to the collector" {
+    const prev_enabled = gc_enabled;
+    const prev_region = region_on;
+    gc_enabled = true;
+    region_on = true;
+    defer {
+        gc_enabled = prev_enabled;
+        region_on = prev_region;
+    }
+    const prev_perm = allocPerm();
+    setAllocPerm(false);
+    defer setAllocPerm(prev_perm);
+    enterMutator();
+    defer exitMutator();
+    const buf = try buffer_allocator.alloc(u64, 16);
+    try std.testing.expect(region.owns(@intFromPtr(buf.ptr)));
+    // It never resizes in place, so a list handing out its slice copies it first.
+    try std.testing.expect(!slab.allocator.resize(buf, 8));
+    try std.testing.expect(!slab.allocator.resize(buf, 32));
+    // Freeing it through the process heap does not make it the heap's to hand out.
+    slab.allocator.free(buf);
+    var again: [8][]u64 = undefined;
+    for (&again) |*a| {
+        a.* = try slab.allocator.alloc(u64, 16);
+        try std.testing.expect(a.*.ptr != buf.ptr);
+    }
+    for (again) |a| slab.allocator.free(a);
+    // What the region cannot place is the process heap's own.
+    const big = try buffer_allocator.alloc(u8, region.max_cell + 1);
+    try std.testing.expect(!region.owns(@intFromPtr(big.ptr)));
+    buffer_allocator.free(big);
 }

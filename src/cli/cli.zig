@@ -399,6 +399,7 @@ fn runTranspileDumpCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
 }
 
 fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
+    ir.eval.jitDefaultOn();
     var files: std.ArrayList([]const u8) = .empty;
     defer files.deinit(gpa);
     var feature_specs: std.ArrayList([]const u8) = .empty;

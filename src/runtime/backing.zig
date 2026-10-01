@@ -53,9 +53,19 @@ pub fn configureGcFromEnv() void {
     if (objcell.envOnce("KLIO_GC_MAJOR_EVERY")) |v| {
         gc.major_every = std.fmt.parseInt(usize, v, 10) catch 0;
     }
+    // Every debug mode that walks or keeps every cell on the lists
+    // allocates every cell the old way.
+    gc.region_on = (envOn("KLIO_GC_REGION") orelse true) and !gc.gc_nofree and !gc.gc_poison and
+        !gc.gc_hist and objcell.envOnce("KLIO_GC_VERIFY") == null;
     objcell.setReclaim(false);
     // Another backend overrides this page-returning trim.
     gc.release_to_os = slab.reclaimDormant;
+}
+
+/// For a process whose program runs on the slab heap: a list's elements are
+/// read with no lock (`objcell.lockfree_reads`), unless `KLIO_LOCKFREE_READS=0`.
+pub fn enableLockfreeReads() void {
+    objcell.lockfree_reads = envOn("KLIO_LOCKFREE_READS") orelse true;
 }
 
     // The arena profile fills `arena_slot`, whose teardown the caller owns.
@@ -63,6 +73,7 @@ pub fn processAllocator(arena_slot: *?std.heap.ArenaAllocator) std.mem.Allocator
     switch (perf.allocChoice()) {
         .gc => {
             configureGcFromEnv();
+            enableLockfreeReads();
             return slab.allocator;
         },
         .smp => return std.heap.smp_allocator,

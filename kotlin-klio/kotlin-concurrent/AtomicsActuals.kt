@@ -22,7 +22,7 @@ import kotlin.internal.InlineOnly
  */
 @SinceKotlin("2.1")
 @ExperimentalAtomicApi
-public actual class AtomicInt public actual constructor(private var value: Int) {
+public actual class AtomicInt public actual constructor(@kotlin.concurrent.Volatile private var value: Int) {
 
     /** Atomically loads the value from this [AtomicInt]. */
     public actual fun load(): Int = value
@@ -104,7 +104,7 @@ public actual class AtomicInt public actual constructor(private var value: Int) 
  */
 @SinceKotlin("2.1")
 @ExperimentalAtomicApi
-public actual class AtomicLong public actual constructor(private var value: Long) {
+public actual class AtomicLong public actual constructor(@kotlin.concurrent.Volatile private var value: Long) {
 
     /** Atomically loads the value from this [AtomicLong]. */
     public actual fun load(): Long = value
@@ -186,7 +186,7 @@ public actual class AtomicLong public actual constructor(private var value: Long
  */
 @SinceKotlin("2.1")
 @ExperimentalAtomicApi
-public actual class AtomicBoolean public actual constructor(private var value: Boolean) {
+public actual class AtomicBoolean public actual constructor(@kotlin.concurrent.Volatile private var value: Boolean) {
 
     /** Atomically loads the value from this [AtomicBoolean]. */
     public actual fun load(): Boolean = value
@@ -246,7 +246,7 @@ public actual class AtomicBoolean public actual constructor(private var value: B
  */
 @SinceKotlin("2.1")
 @ExperimentalAtomicApi
-public actual class AtomicReference<T> public actual constructor(private var value: T) {
+public actual class AtomicReference<T> public actual constructor(@kotlin.concurrent.Volatile private var value: T) {
 
     /** Atomically loads the value from this [AtomicReference]. */
     public actual fun load(): T = value

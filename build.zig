@@ -36,7 +36,9 @@ const mod_list = [_]Mod{
     // generated serializer declarations for every `@Serializable` class as
     // ordinary Kotlin (parsed from generated source) before lowering.
     .{ .name = "serialization_pass", .deps = &.{ "ast", "span", "lexer", "parser", "diagnostics" }, .src = "src/serialization_pass/serialization_pass.zig", .tested = true },
-    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "sema" }, .tested = true },
+    // Executable memory and the assemblers the JIT compiles with.
+    .{ .name = "jit", .tested = true },
+    .{ .name = "ir", .deps = &.{ "span", "ast", "runtime", "diagnostics", "sema", "jit" }, .tested = true },
     .{ .name = "stdlib", .deps = &.{ "runtime", "pack" }, .tested = true },
     .{ .name = "cfa", .deps = &.{ "ast", "diagnostics", "lexer", "parser", "span", "types" }, .tested = true },
     .{ .name = "resolver", .deps = &.{ "span", "ast", "diagnostics", "types", "stdlib" }, .tested = true },
@@ -584,6 +586,11 @@ const interp_env_keys = [_][]const u8{
     "KLIO_LINK_AUDIT",
     "KLIO_STDLIB_PACK",
     "KLIO_PACK_DIAG",
+    "KLIO_JIT",
+    "KLIO_JIT_THRESHOLD",
+    "KLIO_JIT_MIN_NATIVE",
+    "KLIO_JIT_INLINE",
+    "KLIO_JIT_OPT",
 };
 
 /// Fuzzer sweep size/seed plus the kotlinc-oracle discovery overrides. Note
@@ -687,8 +694,10 @@ pub fn build(b: *std.Build) void {
     mods.get("skiko").?.link_libc = true;
 
     // ir (eval) selects std.heap.c_allocator on the GC-off path, so its test
-    // build needs libc too.
+    // build needs libc too; the JIT's executable memory calls into libc on
+    // Apple systems.
     mods.get("ir").?.link_libc = true;
+    mods.get("jit").?.link_libc = true;
 
     // Second per-(module, optimize) universe for the harness binaries.
     // Zig modules are keyed by (root source, optimize), so the harness
@@ -720,6 +729,7 @@ pub fn build(b: *std.Build) void {
         harness_mods.get("compose_ui").?.link_libc = true;
         harness_mods.get("skiko").?.link_libc = true;
         harness_mods.get("ir").?.link_libc = true;
+        harness_mods.get("jit").?.link_libc = true;
         if (apple_sdk) |sdk| {
             var it = harness_mods.valueIterator();
             while (it.next()) |m| wireAppleSdk(b, m.*, sdk);
@@ -764,6 +774,7 @@ pub fn build(b: *std.Build) void {
         host_mods.get("compose_ui").?.link_libc = true;
         host_mods.get("skiko").?.link_libc = true;
         host_mods.get("ir").?.link_libc = true;
+        host_mods.get("jit").?.link_libc = true;
         break :blk host_mods;
     };
     const embed_gen = b.addExecutable(.{

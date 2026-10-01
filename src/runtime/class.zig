@@ -2,6 +2,7 @@
 //! live `InstanceData`, and the method and property resolution walks.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ast = @import("ast");
 const span = @import("span");
 const objcell = @import("objcell.zig");
@@ -40,6 +41,13 @@ pub const ClassDef = struct {
     is_value: bool,
     is_object: bool,
     is_enum: bool,
+    /// Whether an instance's slot accesses order as a `@Volatile` field's do:
+    /// the class or an ancestor declares a `@Volatile` property, or it is a
+    /// class the lowering did not lay out. Otherwise, where the build's
+    /// processor copies a slot whole in one access (`plain_slots`), its
+    /// instances take plain loads and stores, as a JVM field not `@Volatile`
+    /// does.
+    ordered_slots: bool = true,
     has_primary_ctor: bool = true,
     is_annotation: bool = false,
     is_sealed: bool,
@@ -173,6 +181,114 @@ pub const ClassDef = struct {
         return false;
     }
 };
+
+/// Whether this build may run on a processor that loads and stores 16 aligned
+/// bytes in one access no other can split, so a slot not ordered as a
+/// `@Volatile` one is read and written plainly and never torn: AArch64 with
+/// LSE2, and x86-64, whose processors that enumerate AVX make an aligned SSE
+/// access of 16 bytes one (`plainSlotsOn` asks the processor). The access is
+/// written in inline assembly only LLVM's assembler takes (Zig's own x86-64
+/// backend, a Debug build's on Linux, has no form for it). Anywhere else every
+/// slot takes the ordered protocol.
+pub const plain_slots: bool = builtin.zig_backend == .stage2_llvm and
+    ((builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .lse2)) or builtin.cpu.arch == .x86_64);
+
+/// Whether this processor copies a slot whole in one access (`plain_slots`):
+/// on x86-64, whether it enumerates AVX, which `KLIO_PLAIN_SLOTS` (`0` or
+/// `1`) overrides for a test on one that does not report it.
+pub fn plainSlotsOn() bool {
+    if (comptime !plain_slots) return false;
+    if (comptime builtin.cpu.arch != .x86_64) return true;
+    return switch (x86_plain.load(.monotonic)) {
+        0 => x86PlainInit(),
+        1 => false,
+        else => true,
+    };
+}
+
+/// 0 until asked, then 1 for no and 2 for yes.
+var x86_plain: std.atomic.Value(u8) = .init(0);
+
+fn x86PlainInit() bool {
+    const on = if (objcell.envOnce("KLIO_PLAIN_SLOTS")) |v| !std.mem.eql(u8, v, "0") else x86Avx();
+    x86_plain.store(if (on) 2 else 1, .monotonic);
+    return on;
+}
+
+/// CPUID leaf 1's AVX bit (ECX bit 28).
+fn x86Avx() bool {
+    if (comptime builtin.cpu.arch != .x86_64) return false;
+    var ecx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [c] "={ecx}" (ecx),
+        : [leaf] "{eax}" (@as(u32, 1)),
+          [sub] "{ecx}" (@as(u32, 0)),
+        : .{ .rbx = true, .rdx = true, .rax = true });
+    return ecx & (1 << 28) != 0;
+}
+
+/// In `InstanceData.slot_seq`: the instance's slots are plain (`plain_slots`).
+/// Set when it is made and never changed; an ordered instance's sequence
+/// runs in the bits below it.
+pub const PLAIN_SLOTS: u32 = 1 << 31;
+
+/// Slot `slot`'s 16 bytes in one access.
+inline fn load16(slot: *const Value) Value {
+    var lo: u64 = undefined;
+    var hi: u64 = undefined;
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile (
+            \\movdqa (%[p]), %%xmm15
+            \\movq %%xmm15, %[a]
+            \\punpckhqdq %%xmm15, %%xmm15
+            \\movq %%xmm15, %[b]
+            : [a] "=&r" (lo),
+              [b] "=&r" (hi),
+            : [p] "r" (slot),
+            : .{ .memory = true, .xmm15 = true });
+    } else asm volatile ("ldp %[a], %[b], [%[p]]"
+        : [a] "=&r" (lo),
+          [b] "=&r" (hi),
+        : [p] "r" (slot),
+        : .{ .memory = true });
+    var out: Value = undefined;
+    const w: *[2]u64 = @ptrCast(&out);
+    w[0] = lo;
+    w[1] = hi;
+    return out;
+}
+
+/// `v` into slot `slot` in one access.
+inline fn store16(slot: *Value, v: Value) void {
+    const w: *const [2]u64 = @ptrCast(&v);
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile (
+            \\movq %[a], %%xmm14
+            \\movq %[b], %%xmm15
+            \\punpcklqdq %%xmm15, %%xmm14
+            \\movdqa %%xmm14, (%[p])
+            :
+            : [a] "r" (w[0]),
+              [b] "r" (w[1]),
+              [p] "r" (slot),
+            : .{ .memory = true, .xmm14 = true, .xmm15 = true });
+    } else asm volatile ("stp %[a], %[b], [%[p]]"
+        :
+        : [a] "r" (w[0]),
+          [b] "r" (w[1]),
+          [p] "r" (slot),
+        : .{ .memory = true });
+}
+
+/// Orders every store before it before every store after it, as the JVM
+/// orders an object's initialization before its publication: a plain slot
+/// store of a reference publishes what it points to.
+inline fn publishFence() void {
+    // x86-64 keeps stores in order.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        asm volatile ("" ::: .{ .memory = true });
+    } else asm volatile ("dmb ishst" ::: .{ .memory = true });
+}
 
 /// One slot of a class's layout: its name, and the value it holds until an
 /// initializer replaces it — the JVM zero of a declared primitive, null
@@ -327,7 +443,7 @@ pub const PropertyDef = struct {
 /// recorded, its class and the field that holds the target.
 pub fn describeGcEdge(from: *gc_mod.GcHeader, to: *gc_mod.GcHeader) void {
     const Ref = objcell.ObjRef(InstanceData);
-    if (!std.mem.eql(u8, std.mem.span(from.gc_type), @typeName(InstanceData))) return;
+    if (!std.mem.eql(u8, std.mem.span(from.typeName()), @typeName(InstanceData))) return;
     const cb: *Ref.Cell = @fieldParentPtr("hdr", @as(*align(16) gc_mod.GcHeader, @alignCast(from)));
     const d = &cb.data;
     const cls = d.class.asPtrConst();
@@ -339,8 +455,11 @@ pub fn describeGcEdge(from: *gc_mod.GcHeader, to: *gc_mod.GcHeader) void {
         std.debug.print("[gc-verify]   {s}.{s} holds a {s}\n", .{ cls.name, name, tcls });
         return;
     }
-    std.debug.print("[gc-verify]   {s}: the edge is outside its slots (outer or native state)\n", .{cls.name});
+    std.debug.print("[gc-verify]   {s}: the edge is outside its slots (its stack or native state)\n", .{cls.name});
 }
+
+/// The identity the last instance to take one took (`InstanceData.identityOf`).
+var next_identity: std.atomic.Value(u64) = .init(0);
 
 pub const InstanceData = struct {
     class: ObjRef(ClassDef),
@@ -355,11 +474,77 @@ pub const InstanceData = struct {
     /// The class's id in the tables of code lowered from sema, written once
     /// at construction; `maxInt` for an instance they do not cover.
     class_id: u32 = std.math.maxInt(u32),
-    outer: ?Value,
-    identity: u64,
-    native_state: ?NativeState,
-    /// For a user `Throwable` subclass, the stack captured at the first throw.
-    stack: ?value_mod.StackRef = null,
+    /// What few instances carry (`Extra`), made on the first need; null for the rest, so
+    /// every instance does not pay for them.
+    extra: ?*Extra = null,
+
+    /// A host-backed instance's native state and a throwable's stack, apart from the cell.
+    pub const Extra = struct {
+        native_state: ?NativeState = null,
+        /// For a user `Throwable` subclass, the stack captured at the first throw.
+        stack: ?value_mod.StackRef = null,
+    };
+
+    /// The instance's identity, taken the first time anything asks, as the JVM
+    /// takes an identity hash: an instance nothing hashes or prints takes none, and
+    /// making one touches no counter every thread shares. Racing first asks agree.
+    /// It lives in the header's spare word, 32 bits as `hashCode` is, 0 until taken.
+    pub fn identityOf(self: *const InstanceData) u64 {
+        const p = identityWord(self);
+        const cur = @atomicLoad(u32, p, .monotonic);
+        if (cur != 0) return cur;
+        const id = takeIdentity();
+        return @cmpxchgStrong(u32, p, 0, id, .monotonic, .monotonic) orelse id;
+    }
+
+    /// The identity a host numbers its own instances with, set as it makes one.
+    pub fn setIdentity(self: *InstanceData, id: u64) void {
+        const w: u32 = @truncate(id);
+        @atomicStore(u32, identityWord(self), w, .monotonic);
+    }
+
+    fn identityWord(self: *const InstanceData) *u32 {
+        const cell: *const ObjRef(InstanceData).Cell = @alignCast(@fieldParentPtr("data", self));
+        return @constCast(&cell.hdr.gc_aux);
+    }
+
+    /// The next identity: the counter's low word, never 0, which means none yet.
+    fn takeIdentity() u32 {
+        const n: u32 = @truncate(next_identity.fetchAdd(1, .monotonic) + 1);
+        return if (n == 0) 1 else n;
+    }
+
+    /// The counter `identityOf` takes from, for compiled code that takes one itself.
+    pub fn identityCounter() *std.atomic.Value(u64) {
+        return &next_identity;
+    }
+
+    /// The stack a throwable subclass's instance captured at its first throw.
+    pub fn stackRef(self: *const InstanceData) ?value_mod.StackRef {
+        return if (self.extra) |e| e.stack else null;
+    }
+
+    /// The native state a host binding keeps on the instance.
+    pub fn nativeState(self: *const InstanceData) ?NativeState {
+        return if (self.extra) |e| e.native_state else null;
+    }
+
+    /// Under the instance's exclusive borrow: the stack its first throw captured.
+    pub fn setStack(self: *InstanceData, s: ?value_mod.StackRef) std.mem.Allocator.Error!void {
+        (try self.extraOf()).stack = s;
+    }
+
+    /// The instance's `Extra`, made in its cell's allocator on the first need, under its
+    /// exclusive borrow.
+    fn extraOf(self: *InstanceData) std.mem.Allocator.Error!*Extra {
+        if (self.extra) |e| return e;
+        const cell: *ObjRef(InstanceData).Cell = @alignCast(@fieldParentPtr("data", self));
+        const e = try cell.allocatorOf().create(Extra);
+        e.* = .{};
+        self.extra = e;
+        if (objcell.gc.gc_enabled) objcell.gc.noteFinalizable(&cell.hdr);
+        return e;
+    }
 
     /// A named value a host instance is made from: the name becomes its
     /// class's slot name.
@@ -377,22 +562,76 @@ pub const InstanceData = struct {
     /// `values`, adopting one reference to each. The caller owns the one
     /// reference returned.
     pub fn new(a: std.mem.Allocator, class: ObjRef(ClassDef), values: []const Value, identity: u64) std.mem.Allocator.Error!ObjRef(InstanceData) {
-        const inst = try newTrailing(a, class, class.asPtrConst().ir_class, values.len, identity);
+        const inst = try newTrailing(a, class, class.asPtrConst().ir_class, values.len);
+        inst.cell.data.setIdentity(identity);
         @memcpy(inst.cell.data.slots, values);
         return inst;
     }
 
+    /// An instance of one class as `new` lays it out: its cell with the
+    /// class and its id, and every slot holding its seed, copied whole into
+    /// a fresh region hole before its slots are set.
+    pub const Template = struct {
+        image: []align(16) u8,
+        n_slots: u32,
+
+        comptime {
+            // A copy's slots start at a 16-byte boundary, as a plain slot needs.
+            std.debug.assert(@sizeOf(ObjRef(InstanceData).Cell) % 16 == 0);
+        }
+
+        pub fn init(a: std.mem.Allocator, class: ObjRef(ClassDef), class_id: u32, seeds: []const Value) std.mem.Allocator.Error!*Template {
+            const Cell = ObjRef(InstanceData).Cell;
+            const bytes = @sizeOf(Cell) + seeds.len * @sizeOf(Value);
+            const image = try a.alignedAlloc(u8, .of(Cell), bytes);
+            errdefer a.free(image);
+            ObjRef(InstanceData).regionImage(@ptrCast(image.ptr), .{
+                .class = class,
+                .slots = &.{},
+                .slot_seq = .init(seqOf(class)),
+                .class_id = class_id,
+            }, bytes);
+            const slots: [*]Value = @ptrCast(@alignCast(image.ptr + @sizeOf(Cell)));
+            @memcpy(slots[0..seeds.len], seeds);
+            // The count is the class's; `make` points the slots at the copy's.
+            const made: *Cell = @ptrCast(image.ptr);
+            made.data.slots = slots[0..seeds.len];
+            const t = try a.create(Template);
+            t.* = .{ .image = image, .n_slots = @intCast(seeds.len) };
+            return t;
+        }
+
+        pub fn deinit(t: *Template, a: std.mem.Allocator) void {
+            a.free(t.image);
+            a.destroy(t);
+        }
+
+        /// A new instance from the template in this thread's region hole,
+        /// or null when it has none to give.
+        pub inline fn make(t: *const Template) ?ObjRef(InstanceData) {
+            const inst = ObjRef(InstanceData).fromImage(t.image) orelse return null;
+            const base: [*]u8 = @ptrCast(inst.cell);
+            const slots: [*]Value = @ptrCast(@alignCast(base + @sizeOf(ObjRef(InstanceData).Cell)));
+            inst.cell.data.slots = slots[0..t.n_slots];
+            return inst;
+        }
+    };
+
     /// A new instance of `class` with `n` slots in its own cell, for the
     /// caller to fill before anything else sees it.
-    pub fn newTrailing(a: std.mem.Allocator, class: ObjRef(ClassDef), class_id: u32, n: usize, identity: u64) std.mem.Allocator.Error!ObjRef(InstanceData) {
+    pub fn newTrailing(a: std.mem.Allocator, class: ObjRef(ClassDef), class_id: u32, n: usize) std.mem.Allocator.Error!ObjRef(InstanceData) {
         return ObjRef(InstanceData).initTrailing(a, .{
             .class = class,
             .slots = &.{},
+            .slot_seq = .init(seqOf(class)),
             .class_id = class_id,
-            .outer = null,
-            .identity = identity,
-            .native_state = null,
         }, n);
+    }
+
+    /// The sequence an instance of `class` starts with: `PLAIN_SLOTS` when its
+    /// slots are plain.
+    pub fn seqOf(class: ObjRef(ClassDef)) u32 {
+        return if (plain_slots and !class.asPtrConst().ordered_slots and plainSlotsOn()) PLAIN_SLOTS else 0;
     }
 
     /// Slot `i` of `inst`, or null past its slots. Takes no lock.
@@ -416,6 +655,9 @@ pub const InstanceData = struct {
     /// runs inside `storeSlot`, which holds no safe point.
     pub inline fn loadSlot(self: *const InstanceData, i: usize) ?Value {
         if (i >= self.slots.len) return null;
+        if (comptime plain_slots) {
+            if (self.slot_seq.load(.monotonic) & PLAIN_SLOTS != 0) return load16(&self.slots[i]);
+        }
         const words: *const [2]u64 = @ptrCast(&self.slots[i]);
         while (true) {
             const before = self.slot_seq.load(.acquire);
@@ -446,11 +688,25 @@ pub const InstanceData = struct {
     pub fn storeSlot(self: *InstanceData, i: usize, v: Value) ?Value {
         if (i >= self.slots.len) return null;
         recordStore(self.cellHdr(), v);
+        if (comptime plain_slots) {
+            if (self.slot_seq.load(.monotonic) & PLAIN_SLOTS != 0) {
+                const old = load16(&self.slots[i]);
+                if (!v.isNumberOrBool()) publishFence();
+                store16(&self.slots[i], v);
+                return old;
+            }
+        }
         const seq = self.holdStores();
         const old = self.slots[i];
         writeWhole(&self.slots[i], v);
-        self.slot_seq.store(seq + 2, .release);
+        self.slot_seq.store(nextSeq(seq), .release);
         return old;
+    }
+
+    /// The even sequence after the store turn taken at `seq`, wrapping below
+    /// `PLAIN_SLOTS`.
+    inline fn nextSeq(seq: u32) u32 {
+        return (seq + 2) & ~PLAIN_SLOTS;
     }
 
     /// The write barrier for storing `v` into the instance whose cell is `h`:
@@ -488,8 +744,11 @@ pub const InstanceData = struct {
     /// a read-modify-write no store may split. Reads on other threads wait
     /// for the end; the holder must not read the instance through
     /// `loadSlot` meanwhile, and must reach no safe point. Each store the
-    /// update makes records its own barrier, as `storeSlot` does.
+    /// update makes records its own barrier, as `storeSlot` does. Only for an
+    /// instance whose slots are ordered, as an atomic's are: a plain store
+    /// takes no turn.
     pub fn beginUpdate(self: *InstanceData) SlotUpdate {
+        std.debug.assert(self.slot_seq.load(.monotonic) & PLAIN_SLOTS == 0);
         return .{ .data = self, .seq = self.holdStores() };
     }
 
@@ -520,7 +779,7 @@ pub const InstanceData = struct {
         }
 
         pub fn end(self: SlotUpdate) void {
-            self.data.slot_seq.store(self.seq + 2, .release);
+            self.data.slot_seq.store(nextSeq(self.seq), .release);
         }
     };
 
@@ -585,8 +844,10 @@ pub const InstanceData = struct {
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
         for (self.slots) |v| v.release(allocator);
         if (self.slots.len != 0 and !self.slotsTrail()) allocator.free(self.slots);
-        if (self.outer) |o| o.release(allocator);
-        if (self.stack) |*s| s.deinit();
+        if (self.extra) |e| {
+            if (e.stack) |*s| s.deinit();
+            allocator.destroy(e);
+        }
         self.class.deinit();
     }
 
@@ -598,16 +859,23 @@ pub const InstanceData = struct {
     pub fn gcTrace(self: *const InstanceData, m: *objcell.gc.Marker) void {
         m.shade(&self.class.cell.hdr);
         for (0..self.slots.len) |i| self.loadSlot(i).?.gcMark(m);
-        if (self.outer) |o| o.gcMark(m);
-        if (self.stack) |s| m.shade(&s.cell.hdr);
-        // The box is a cell; the state it points at is the binding's own.
-        if (self.native_state) |ns| m.shade(&ns.data.cell.hdr);
+        if (self.extra) |e| {
+            if (e.stack) |s| m.shade(&s.cell.hdr);
+            // The box is a cell; the state it points at is the binding's own.
+            if (e.native_state) |ns| m.shade(&ns.data.cell.hdr);
+        }
     }
 
     /// Shallow: the slot values, the outer and the class are independent cells
     /// swept on their own reachability.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
         if (self.slots.len != 0 and !self.slotsTrail()) allocator.free(self.slots);
+        if (self.extra) |e| allocator.destroy(e);
+    }
+    /// An instance takes its extra record later through `extraOf`, which
+    /// puts a region cell on the lists then.
+    pub fn gcNeedsFinalize(self: *const InstanceData) bool {
+        return self.extra != null or (self.slots.len != 0 and !self.slotsTrail());
     }
 
     /// The slots an instance made by `newTrailing` keeps in its own cell,
@@ -616,6 +884,8 @@ pub const InstanceData = struct {
 
     pub fn adoptTrailing(self: *InstanceData, slots: []Value) void {
         self.slots = slots;
+        // A plain slot is one access only at a 16-byte boundary.
+        if (plain_slots and @intFromPtr(slots.ptr) & 15 != 0) self.slot_seq.raw &= ~PLAIN_SLOTS;
     }
 
     /// Whether the slots are in the instance's cell, after it.
@@ -643,7 +913,7 @@ pub const InstanceData = struct {
         const g = inst.borrowMut();
         defer g.deinit();
         const self = g.get();
-        if (self.native_state) |ns| {
+        if (self.nativeState()) |ns| {
             if (!std.mem.eql(u8, ns.kind, kind)) {
                 @panic("native_state kind mismatch: instance carries one binding's state, another binding asked for a different kind");
             }
@@ -662,7 +932,7 @@ pub const InstanceData = struct {
             .ptr = payload,
             .destroy = Boxed.destroy,
         });
-        self.native_state = .{ .kind = kind, .data = data.clone() };
+        (try self.extraOf()).native_state = .{ .kind = kind, .data = data.clone() };
         return data;
     }
 
@@ -889,10 +1159,8 @@ test "list release recursively frees retained instance elements" {
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = fx.handle.clone(),
         .slots = &.{},
-        .outer = null,
-        .identity = 1,
-        .native_state = null,
     });
+    inst.cell.data.setIdentity(1);
     const inst_val = Value{ .Instance = inst };
 
     var arr: std.ArrayList(Value) = .empty;
@@ -973,7 +1241,7 @@ test "ensureNativeState creates once and returns the same payload" {
 
     const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 0);
     defer {
-        if (inst.asPtrConst().native_state) |ns| ns.data.deinit();
+        if (inst.asPtrConst().nativeState()) |ns| ns.data.deinit();
         inst.deinit();
     }
 
@@ -1062,9 +1330,18 @@ test "a slot store into a tenured instance joins the remembered set" {
 }
 
 test "a mark tracing an instance while its slots are stored shades only whole values" {
+    for ([_]bool{ true, false }) |ordered| try traceRacingStores(ordered);
+}
+
+fn traceRacingStores(ordered: bool) !void {
     const allocator = std.heap.smp_allocator;
+    // The marks below tenure the class and the values, and a store into one then
+    // remembers it: the remembered set lets go of them once they are freed.
+    var cells: [4]objcell.gc.Range = @splat(.{ .start = 0, .len = 0 });
+    defer objcell.gc.forgetRanges(&cells);
     var fx = try ClassFixture.build(allocator, "Traced", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
+    fx.ptr().ordered_slots = ordered;
     const other = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 7);
     defer other.deinit();
     const text = try value_mod.strInit(allocator, "whole");
@@ -1075,6 +1352,9 @@ test "a mark tracing an instance while its slots are stored shades only whole va
         inst.asPtr().slots[0] = .Null;
         inst.asPtr().slots[1] = .Null;
         inst.deinit();
+    }
+    for ([_]*objcell.gc.GcHeader{ &fx.handle.cell.hdr, &other.cell.hdr, &text.cell.hdr, &inst.cell.hdr }, &cells) |h, *r| {
+        r.* = .{ .start = @intFromPtr(h), .len = @sizeOf(objcell.gc.GcHeader) };
     }
 
     const Race = struct {
@@ -1099,7 +1379,7 @@ test "a mark tracing an instance while its slots are stored shades only whole va
     while (epoch < 200_000) : (epoch += 1) {
         var m: objcell.gc.Marker = .{ .epoch = epoch, .arena = allocator };
         defer m.grey.deinit(allocator);
-        inst.cell.hdr.gc_trace(&inst.cell.hdr, &m);
+        inst.cell.hdr.traceCell(&m);
         for (m.grey.items) |h| {
             const ok = for (known) |k| {
                 if (h == k) break true;
@@ -1111,10 +1391,53 @@ test "a mark tracing an instance while its slots are stored shades only whole va
     for (threads) |t| t.join();
 }
 
+test "a class with no ordered slot makes plain instances, and an ordered one's keep the sequence" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const layout = [_]LayoutSlot{ .{ .name = "x" }, .{ .name = "y" } };
+    fx.ptr().layout_slots = &layout;
+    for ([_]bool{ false, true }) |ordered| {
+        fx.ptr().ordered_slots = ordered;
+        const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{ .{ .Int = 1 }, .Null }, 0);
+        defer inst.deinit();
+        const d = inst.asPtr();
+        const plain = plainSlotsOn() and !ordered;
+        try testing.expectEqual(plain, d.slot_seq.load(.monotonic) & PLAIN_SLOTS != 0);
+        try testing.expectEqual(@as(i32, 1), d.storeSlot(0, .{ .Int = 5 }).?.Int);
+        try testing.expect(d.storeSlot(1, .{ .Long = -3 }).? == .Null);
+        try testing.expectEqual(@as(i32, 5), d.loadSlot(0).?.Int);
+        try testing.expectEqual(@as(i64, -3), d.loadSlot(1).?.Long);
+        try testing.expect(d.loadSlot(2) == null);
+        if (plain) {
+            // A plain store takes no turn.
+            try testing.expectEqual(PLAIN_SLOTS, d.slot_seq.load(.monotonic));
+            continue;
+        }
+        try testing.expectEqual(@as(u32, 4), d.slot_seq.load(.monotonic));
+        {
+            const u = d.beginUpdate();
+            defer u.end();
+            try testing.expectEqual(@as(i32, 5), u.get("x").?.Int);
+        }
+        try testing.expectEqual(@as(u32, 6), d.slot_seq.load(.monotonic));
+        // The sequence wraps below the plain flag, so an ordered instance stays ordered.
+        d.slot_seq.store(PLAIN_SLOTS - 2, .monotonic);
+        _ = d.storeSlot(0, .{ .Int = 6 });
+        try testing.expectEqual(@as(u32, 0), d.slot_seq.load(.monotonic));
+        try testing.expectEqual(@as(i32, 6), d.loadSlot(0).?.Int);
+    }
+}
+
 test "a slot read racing stores of every kind sees one whole stored value" {
+    for ([_]bool{ true, false }) |ordered| try raceSlot(ordered);
+}
+
+fn raceSlot(ordered: bool) !void {
     const allocator = std.heap.smp_allocator;
     var fx = try ClassFixture.build(allocator, "Racy", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
+    fx.ptr().ordered_slots = ordered;
     const other = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 7);
     defer other.deinit();
     const text = try value_mod.strInit(allocator, "whole");
@@ -1127,6 +1450,7 @@ test "a slot read racing stores of every kind sees one whole stored value" {
         inst.asPtr().slots[0] = .Null;
         inst.deinit();
     }
+    try testing.expectEqual(plainSlotsOn() and !ordered, inst.asPtr().slot_seq.load(.monotonic) & PLAIN_SLOTS != 0);
 
     const Race = struct {
         inst: ObjRef(InstanceData),
@@ -1173,4 +1497,21 @@ test "a slot read racing stores of every kind sees one whole stored value" {
     race.stop.store(true, .monotonic);
     for (threads) |t| t.join();
     try testing.expectEqual(@as(usize, 0), race.torn.load(.monotonic));
+}
+
+test "an identity is taken once, in the header's word, and never 0" {
+    const allocator = testing.allocator;
+    var fx = try ClassFixture.build(allocator, "Ided", &.{}, &.{}, &.{});
+    defer fx.deinit(allocator);
+    const inst = try InstanceData.new(allocator, fx.handle.clone(), &.{}, 0);
+    defer inst.deinit();
+    try testing.expectEqual(@as(u32, 0), inst.cell.hdr.gc_aux);
+    const was = next_identity.load(.monotonic);
+    defer next_identity.store(was, .monotonic);
+    next_identity.store(0xFFFF_FFFF, .monotonic);
+    try testing.expectEqual(@as(u64, 1), inst.cell.data.identityOf());
+    try testing.expectEqual(@as(u64, 1), inst.cell.data.identityOf());
+    try testing.expectEqual(@as(u32, 1), inst.cell.hdr.gc_aux);
+    inst.cell.data.setIdentity(0x1_0000_0007);
+    try testing.expectEqual(@as(u64, 7), inst.cell.data.identityOf());
 }

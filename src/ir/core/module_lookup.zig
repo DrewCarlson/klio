@@ -43,6 +43,8 @@ pub fn deinit(self: *Module, allocator: Allocator) void {
 
 /// Materialise `func`'s deferred `blocks` from the lazy-IR section, clearing `deferred_offset`.
 /// Decoded into the module's process-lifetime arena, so the patch outlives a per-program build.
+/// A run reads a function's blocks only after this answers true: another thread may be
+/// publishing them, and a plain read of `blocks` can see the new length before the pointer.
 pub fn ensureFuncBody(self: *const Module, func: *Func) bool {
     // `deferred_offset` is the publication flag: it clears, with release, only after
     // `blocks` is written, so a reader that sees it clear sees the blocks.

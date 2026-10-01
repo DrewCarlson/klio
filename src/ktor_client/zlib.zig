@@ -422,7 +422,7 @@ fn nDeflater(ctx: *CallCtx) Allocator.Error!EvalResult {
         d.destroy();
         return e;
     };
-    return net.int(@intCast(id));
+    return net.long(@intCast(id));
 }
 
 /// `__kkz_deflate(h, bytes, off, len): ByteArray?`: compresses the range and
@@ -451,7 +451,7 @@ fn nInflater(ctx: *CallCtx) Allocator.Error!EvalResult {
         inf.destroy();
         return e;
     };
-    return net.int(@intCast(id));
+    return net.long(@intCast(id));
 }
 
 /// `__kkz_inflate_input(h, bytes, off, len): Boolean`: inflates the range;

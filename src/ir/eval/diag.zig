@@ -267,6 +267,7 @@ var frame_census: [FRAME_CENSUS_SLOTS]u32 = @splat(0);
 pub var frame_census_on: bool = false;
 
 pub fn frameCountInit() void {
+    @import("baseline.zig").configure();
     parent.frame_count_on = runtime.envOnce("KLIO_FRAME_COUNT") != null;
     if (runtime.envOnce("KLIO_FRAME_WATCH")) |w| {
         parent.frame_watch_want = w;
@@ -554,10 +555,12 @@ pub fn spinDumpMaybe() void {
         var fi: usize = 0;
         while (rf) |f0| : (rf = f0.gc_link) {
             if (fi >= 3) break;
-            const n = @min(f0.regs.len, 60);
+            const n = @min(f0.regs.len, 60, @as(usize, f0.func.n_locals));
             std.debug.print("  [regs#{d} {s}]", .{ fi, f0.func.name });
+            var lbuf: [16]u64 = undefined;
+            const live = f0.liveSet(&lbuf);
             for (f0.regs[0..n], 0..) |*v, i| {
-                if (!f0.wmask.has(i)) continue;
+                if (live) |l| if (l[i >> 6] & (@as(u64, 1) << @as(u6, @truncate(i))) == 0) continue;
                 switch (v.*) {
                     .Int => |x| std.debug.print(" r{d}=i{d}", .{ i, x }),
                     .Long => |x| std.debug.print(" r{d}=L{d}", .{ i, x }),
@@ -646,7 +649,7 @@ pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?V
         .Instance => |inst| blk: {
             const g = inst.borrow();
             defer g.deinit();
-            break :blk g.get().stack;
+            break :blk g.get().stackRef();
         },
         else => null,
     };
@@ -795,7 +798,7 @@ fn formatThrowableEnclosed(
         .Instance => |inst| {
             const g = inst.borrow();
             defer g.deinit();
-            stk = g.get().stack;
+            stk = g.get().stackRef();
             if (g.get().get("cause")) |cv| {
                 if (cv != .Null) cause = cv;
             }
@@ -856,8 +859,8 @@ pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
         .Instance => |inst| {
             const g = inst.borrowMut();
             defer g.deinit();
-            if (g.get().stack != null) return;
-            g.get().stack = try captureStack(allocator);
+            if (g.get().stackRef() != null) return;
+            try g.get().setStack(try captureStack(allocator));
         },
         else => {},
     }

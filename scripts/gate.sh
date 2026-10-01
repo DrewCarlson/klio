@@ -126,7 +126,7 @@ phase "sema-census" python3 scripts/sema-census.py \
 # prints what the interpreter prints. native_coroutines stays refused until
 # the backend takes kotlinx.coroutines' constructors.
 echo "== native C backend"
-phase "native-c-build" zig build install klio-rt
+phase "native-c-build" zig build install klio-rt klio-rt-test
 phase "native-c" env NATIVE_C_ALLOW_REFUSED=native_coroutines scripts/native-c-check.sh
 
 if [ "$NO_SWEEP" = 0 ]; then

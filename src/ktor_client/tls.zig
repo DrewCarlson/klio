@@ -274,17 +274,17 @@ fn nClient(ctx: *CallCtx) Allocator.Error!EvalResult {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 setLastError("the trusted certificates are not valid PEM certificates", .{});
-                return net.int(0);
+                return net.long(0);
             },
         };
         if (added == 0 and !system_trust) {
             setLastError("no trusted certificate is currently valid", .{});
-            return net.int(0);
+            return net.long(0);
         }
     }
     const system_anchors = if (system_trust and !insecure) System.anchors() else null;
     // Trusting only an empty system store would refuse every server.
-    if (!insecure and e.anchors == null) if (system_anchors) |b| if (System.explainEmpty(b)) return net.int(0);
+    if (!insecure and e.anchors == null) if (system_anchors) |b| if (System.explainEmpty(b)) return net.long(0);
     e.client_config = .{
         .server_name = e.server_name,
         .verification = if (insecure) .insecure_accept_any else .{ .trust = .{
@@ -293,19 +293,19 @@ fn nClient(ctx: *CallCtx) Allocator.Error!EvalResult {
             .now_sec = now,
         } },
     };
-    const seed = osSeed() orelse return net.int(0);
+    const seed = osSeed() orelse return net.long(0);
     e.session = try Session.initClient(gpa, &e.client_config, seed);
     if (e.session.failure()) |f| {
         setLastError("{s}", .{f.reason});
         e.session.deinit();
-        return net.int(0);
+        return net.long(0);
     }
     const id = putSession(e) catch |err| {
         e.session.deinit();
         return err;
     };
     ok = true;
-    return net.int(@intCast(id));
+    return net.long(@intCast(id));
 }
 
 /// `__kktls_identity(chainPem, keyPem): Long`: a server identity for
@@ -322,7 +322,7 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
             setLastError("the certificate chain is not valid PEM", .{});
-            return net.int(0);
+            return net.long(0);
         },
     };
     var keep = false;
@@ -332,11 +332,11 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     if (chain.len == 0) {
         setLastError("the certificate chain holds no certificate", .{});
-        return net.int(0);
+        return net.long(0);
     }
     const leaf = ktor_tls.x509.parse(chain[0]) orelse {
         setLastError("the first certificate of the chain cannot be parsed", .{});
-        return net.int(0);
+        return net.long(0);
     };
     var key = ktor_tls.pem.privateKey(gpa, key_pem) catch |err| {
         switch (err) {
@@ -347,13 +347,13 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
             error.MissingPrivateKey => setLastError("no private key found in the key PEM", .{}),
             else => setLastError("the private key is not valid", .{}),
         }
-        return net.int(0);
+        return net.long(0);
     };
     // The identity keeps its own copy; this one is cleared on every path.
     defer ktor_tls.pem.wipe(&key);
     if (!ktor_tls.pem.keyMatches(&key, &leaf)) {
         setLastError("the private key does not match the certificate", .{});
-        return net.int(0);
+        return net.long(0);
     }
     if (key == .rsa) {
         // The modulus and exponent match the certificate; one signature,
@@ -361,7 +361,7 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
         var sig: [ktor_tls.rsa.max_bytes]u8 = undefined;
         _ = key.rsa.signPss(.sha256, "klio identity check", &([_]u8{0} ** 32), &sig) catch {
             setLastError("the RSA private exponent does not belong to the certificate's key", .{});
-            return net.int(0);
+            return net.long(0);
         };
     }
     const id = try gpa.create(Identity);
@@ -376,7 +376,7 @@ fn nIdentity(ctx: *CallCtx) Allocator.Error!EvalResult {
         return err;
     };
     keep = true;
-    return net.int(@intCast(handle));
+    return net.long(@intCast(handle));
 }
 
 fn nIdentityFree(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -400,14 +400,14 @@ fn nServer(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer table.mutex.unlock();
         const found = table.identities.get(@intCast(@max(handle, 0))) orelse {
             setLastError("unknown server identity", .{});
-            return net.int(0);
+            return net.long(0);
         };
         _ = found.refs.fetchAdd(1, .acq_rel);
         break :blk found;
     };
     const seed = osSeed() orelse {
         id.release();
-        return net.int(0);
+        return net.long(0);
     };
     const e = gpa.create(Entry) catch |err| {
         id.release();
@@ -420,7 +420,7 @@ fn nServer(ctx: *CallCtx) Allocator.Error!EvalResult {
         e.destroy();
         return err;
     };
-    return net.int(@intCast(sid));
+    return net.long(@intCast(sid));
 }
 
 /// `__kktls_feed(h, bytes, off, len): Int`: 0, or -1 once the session failed.

@@ -69,9 +69,9 @@ pub fn build(a: Allocator, src: Sources, binding: Binding) !Built {
     const out = try sema.output.build(s);
     t.mark("records");
     const layers = try a.dupe(bridge.Layer, &.{ base_layer, program_layer });
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = out.files, .layers = layers });
     t.mark("bridge");
     const prog = try lower.lowerProgram(a, s, br);
@@ -96,9 +96,9 @@ pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, bin
     t.mark("bake: bodies");
     const out = try sema.output.build(s);
     t.mark("bake: records");
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const br = try bridge.build(a, s, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = out.files, .layers = try a.dupe(bridge.Layer, &.{layer}) });
     t.mark("bake: bridge");
     const prog = try lower.lowerProgram(a, s, br);
@@ -125,9 +125,9 @@ pub fn sourceCount(base: []const sema.SourceFile) usize {
 /// `image` must outlive the result.
 pub fn buildOnImage(a: Allocator, program: []const sema.SourceFile, binding: Binding, image: []const u8, map: ?*span.SourceMap) !Built {
     var t = Timing.start();
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const loaded = try base_image.load(a, image, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries }, map);
     t.mark("load base image");
     const s = loaded.br.s;
@@ -150,9 +150,9 @@ pub fn buildOnImage(a: Allocator, program: []const sema.SourceFile, binding: Bin
 /// `buildOnImage` with nothing lowered: sema over the program alone, over
 /// the base the image carries.
 pub fn analyzeOnImage(a: Allocator, program: []const sema.SourceFile, binding: Binding, image: []const u8, map: ?*span.SourceMap) !*sema.Sema {
-    const saved_perm = runtime.gc.alloc_perm;
-    runtime.gc.alloc_perm = true;
-    defer runtime.gc.alloc_perm = saved_perm;
+    const saved_perm = runtime.gc.allocPerm();
+    runtime.gc.setAllocPerm(true);
+    defer runtime.gc.setAllocPerm(saved_perm);
     const loaded = try base_image.load(a, image, .{ .natives = binding.natives, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries }, map);
     const s = loaded.br.s;
     try s.addFiles(program);
@@ -394,6 +394,8 @@ pub const hooks = struct {
         ir.eval.frameCountDump(m);
         ir.eval.callStatsDump();
         ir.eval.opProfDump();
+        ir.eval.jitStatsDump();
+        ir.eval.frameAuditSummary();
     }
 
     pub fn traceRunOn() bool {
