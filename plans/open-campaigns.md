@@ -49,6 +49,16 @@ comptime guard, lowering translates sema's records, and about 80k lines of
 lowering guesses and runtime by-name resolution are deleted. One engine and
 the value stack follow. Foundations in progress.
 
+## The collections campaign
+
+`hashed-collections.md`: hashed sets and maps at the JVM's cost and in its
+order. Done: hash indexes, removal by holes, map entries as nodes, views
+and map operations over the map with no copies. Open: `HashMap`/`HashSet`
+iteration order (`hash/kinds`, `hash/order`), read-only maps against the
+JVM's (`hash/read-only`), and speed: loops over maps 5 to 9x the JVM's
+and sorting 9x (`interpreter-speed.md`: `collections/map-iteration`,
+`collections/sort`, `collections/copies`).
+
 ## The interpreter speed campaign
 
 `interpreter-speed.md` (with `value-classes.md`): klio's interpreter
@@ -245,7 +255,7 @@ against the code.
 ## Doc register
 
 Open: `kotlinc-box-conformance.md` (active), `compose-parity.md`,
-`cutover-map.md`, `interpreter-speed.md`, `ktor-support.md`,
+`cutover-map.md`, `hashed-collections.md`, `interpreter-speed.md`, `ktor-support.md`,
 `native-c-backend.md`, `pack-suites-to-green.md`,
 `resolved-interpreter.md`, `retire-typeck.md`, `value-classes.md`, and
 this file.

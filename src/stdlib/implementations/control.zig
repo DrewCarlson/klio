@@ -103,7 +103,7 @@ pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     var buildable = ctx.args[0];
     if (buildable.Set.mod_count.get()) |mc| mc.cell.data.freeze();
     const set_empty = blk: {
-        const g = buildable.Set.items.borrow();
+        const g = buildable.Set.dense().borrow();
         defer g.deinit();
         break :blk g.get().items.len == 0;
     };
@@ -115,21 +115,34 @@ pub fn builders_freeze_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(buildable);
 }
 
+/// `__klio_builderMap(map)`: `map`, marked as a `buildMap` builder's until `__klio_freezeMap`
+/// freezes it, so its entries fail fast as `MapBuilder`'s do (`MapStore.builder`).
+pub fn builders_builder_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    if (ctx.args.len != 1 or ctx.args[0] != .Map) {
+        return .{ .err = .{ .Type = "__klio_builderMap expects a Map" } };
+    }
+    const g = ctx.args[0].Map.entries.borrowMut();
+    defer g.deinit();
+    g.get().builder = true;
+    return ok(ctx.args[0]);
+}
+
 pub fn builders_freeze_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1 or ctx.args[0] != .Map) {
         return .{ .err = .{ .Type = "__klio_freezeMap expects a Map" } };
     }
     var buildable = ctx.args[0];
     {
-        const g = buildable.Map.entries.borrow();
+        const g = buildable.Map.entries.borrowMut();
         const mc = g.get().mod_count;
+        g.get().builder = false;
         g.deinit();
         if (mc.get()) |cell| cell.cell.data.freeze();
     }
     const map_empty = blk: {
         const g = buildable.Map.entries.borrow();
         defer g.deinit();
-        break :blk g.get().pairs.items.len == 0;
+        break :blk g.get().len() == 0;
     };
     if (map_empty) {
         return ok(try collections.sharedEmptyMap(ctx.allocator));
@@ -148,7 +161,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     // A genuine mutable Set builder: `add` dedupes under the block, so a builder
     // iterator sees `add(existing)` as a no-op.
     const buildable = try Value.newSet(ctx.allocator, .{
-        .items = try ValueList.init(ctx.allocator, .empty),
+        .elems = try ValueList.init(ctx.allocator, .empty),
         .mutable = true,
         .backing = null,
         .mod_count = .from(try runtime.ModCount.new(ctx.allocator)),
@@ -162,7 +175,7 @@ pub fn builders_build_set(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     if (buildable.Set.mod_count.get()) |mc| mc.cell.data.freeze();
     const set_empty = blk: {
-        const g = buildable.Set.items.borrow();
+        const g = buildable.Set.dense().borrow();
         defer g.deinit();
         break :blk g.get().items.len == 0;
     };
@@ -181,7 +194,7 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (try negativeCapacity(ctx)) |e| return e;
     const block = ctx.args[ctx.args.len - 1];
     const buildable = try Value.newMap(ctx.allocator, .{
-        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try runtime.ModCount.new(ctx.allocator)) }),
+        .entries = try MapEntries.init(ctx.allocator, .{ .mod_count = .from(try runtime.ModCount.new(ctx.allocator)), .builder = true }),
         .mutable = true,
     });
     {
@@ -192,15 +205,16 @@ pub fn builders_build_map(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         }
     }
     {
-        const g = buildable.Map.entries.borrow();
+        const g = buildable.Map.entries.borrowMut();
         const mc = g.get().mod_count;
+        g.get().builder = false;
         g.deinit();
         if (mc.get()) |cell| cell.cell.data.freeze();
     }
     const map_empty = blk: {
         const g = buildable.Map.entries.borrow();
         defer g.deinit();
-        break :blk g.get().pairs.items.len == 0;
+        break :blk g.get().len() == 0;
     };
     if (map_empty) {
         buildable.release(ctx.allocator);
@@ -313,7 +327,7 @@ const RecordingHost = struct {
                 for (self.append_values) |v| try g.get().append(self.allocator, v);
             },
             .Set => |s| {
-                const g = s.items.borrowMut();
+                const g = s.dense().borrowMut();
                 defer g.deinit();
                 for (self.append_values) |v| {
                     var dup = false;
@@ -428,7 +442,7 @@ test "buildSet dedups structurally equal elements" {
     defer freeListResult(r.ok);
     try testing.expect(r.ok == .Set);
     try testing.expect(!r.ok.Set.mutable);
-    const g = r.ok.Set.items.borrow();
+    const g = r.ok.Set.dense().borrow();
     defer g.deinit();
     try testing.expectEqual(@as(usize, 2), g.get().items.len);
     try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
@@ -453,9 +467,9 @@ test "buildMap freezes the produced entries" {
     try testing.expect(!r.ok.Map.mutable);
     const g = r.ok.Map.entries.borrow();
     defer g.deinit();
-    try testing.expectEqual(@as(usize, 1), g.get().pairs.items.len);
-    try testing.expectEqual(@as(i32, 1), g.get().pairs.items[0].key.Int);
-    try testing.expectEqual(@as(i32, 10), g.get().pairs.items[0].value.Int);
+    try testing.expectEqual(@as(usize, 1), g.get().len());
+    try testing.expectEqual(@as(i32, 1), g.get().slots.items[0].key.Int);
+    try testing.expectEqual(@as(i32, 10), g.get().slots.items[0].value.Int);
 }
 
 test "buildString returns the accumulated buffer" {

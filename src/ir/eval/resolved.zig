@@ -1494,6 +1494,38 @@ pub fn execArraySet(comptime H: type, a: Allocator, frame: *Frame, x: anytype, h
     return .cont;
 }
 
+/// `IterOpen`: the stamp of a loop the host can run by position, else null.
+pub fn execIterOpen(frame: *Frame, x: anytype) Allocator.Error!Step {
+    const src = frame.read(x.src);
+    try frame.write(x.dst, if (runtime.forloop.open(&src)) |at| .{ .Long = at } else .Null);
+    return .cont;
+}
+
+/// `IterHas`: whether the loop has an element at its position.
+pub fn execIterHas(a: Allocator, frame: *Frame, x: anytype) Allocator.Error!Step {
+    const src = frame.read(x.src);
+    const idx = frame.read(x.idx);
+    const at = frame.read(x.stamp);
+    if (idx != .Int or at != .Long) return internal(a, frame, "IterHas at a {s} over a {s} stamp", .{ valueTag(&idx), valueTag(&at) });
+    try frame.write(x.dst, .{ .Bool = runtime.forloop.has(&src, idx.Int, at.Long) });
+    return .cont;
+}
+
+/// `IterGet`: the loop's element at its position, or ConcurrentModificationException after a
+/// structural change.
+pub fn execIterGet(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
+    const r = frame.module.resolved orelse return noTables(frame, "IterGet");
+    const src = frame.read(x.src);
+    const idx = frame.read(x.idx);
+    const at = frame.read(x.stamp);
+    if (idx != .Int or at != .Long) return internal(a, frame, "IterGet at a {s} over a {s} stamp", .{ valueTag(&idx), valueTag(&at) });
+    switch (runtime.forloop.get(&src, idx.Int, at.Long)) {
+        .elem => |v| try frame.write(x.dst, v),
+        .changed => return throwVm(H, a, frame, host, r, r.exceptions.by_fqn.get("kotlin.ConcurrentModificationException"), "ConcurrentModificationException", null),
+    }
+    return .cont;
+}
+
 pub fn execNewArray(comptime H: type, a: Allocator, frame: *Frame, x: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const r = frame.module.resolved orelse return noTables(frame, "NewArray");

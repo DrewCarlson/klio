@@ -2,6 +2,7 @@
 //! max/min-of, distinctBy, grouping, association and sorted-by.
 
 const std = @import("std");
+const hashing = @import("hashing.zig");
 const runtime = @import("runtime");
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -40,8 +41,6 @@ const typeErr = common_mod.typeErr;
 const writeBackItems = common_mod.writeBackItems;
 
 const list_transforms_mod = @import("list_transforms.zig");
-const sortListHostAware = list_transforms_mod.sortListHostAware;
-const sortListHostAwareDesc = list_transforms_mod.sortListHostAwareDesc;
 
 const views_mod = @import("views.zig");
 const sublistComodGuard = views_mod.sublistComodGuard;
@@ -345,16 +344,18 @@ pub fn coll_iter_distinct_by(ctx: *CallCtx) Error!EvalResult {
     };
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
-    var keys: std.ArrayList(Value) = .empty;
+    var keys = hashing.Seen.init();
+    defer keys.deinit(a);
     var result: std.ArrayList(Value) = .empty;
     for (items) |v| {
         const key = switch (try invoke(ctx, &block, &.{v})) {
             .value => |val| val,
             .err => |e| return e,
         };
-        if (!try containsBoxedH(ctx.host, ctx.out, keys.items, &key)) {
-            try keys.append(a, key);
-            try result.append(a, v);
+        switch (try keys.add(ctx.host, ctx.out, a, key)) {
+            .added => try result.append(a, v),
+            .present => {},
+            .thrown => |e| return e,
         }
     }
     return ok(try makeListBorrowed(a, result, false));
@@ -573,6 +574,8 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len <= 2) return arityErr("fold expects (initial, operation)");
     const op = ctx.args[2];
     var acc: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     // The items, the keys and the accumulators are held only here across user code.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
@@ -586,7 +589,11 @@ pub fn coll_grouping_fold(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return e,
         };
         runtime.keepalivePush(k);
-        const pos = try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k);
+        const pos: ?usize = switch (try keys.find(ctx.host, ctx.out, a, acc.items, &k)) {
+            .thrown => |e| return e,
+            .at => |p| p,
+            .none => null,
+        };
         const cur = if (pos) |p| acc.items[p].value else blk: {
             if (isCallable(initial)) {
                 break :blk switch (try invoke(ctx, &initial, &.{ k, v })) {
@@ -623,6 +630,8 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len <= 1) return arityErr("reduce expects (operation)");
     const op = ctx.args[1];
     var acc: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePushSlice(gp.items);
@@ -635,7 +644,12 @@ pub fn coll_grouping_reduce(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return e,
         };
         runtime.keepalivePush(k);
-        if (try findKeyIndexBoxedH(ctx.host, ctx.out, acc.items, &k)) |p| {
+        const found: ?usize = switch (try keys.find(ctx.host, ctx.out, a, acc.items, &k)) {
+            .thrown => |e| return e,
+            .at => |p| p,
+            .none => null,
+        };
+        if (found) |p| {
             const cur = acc.items[p].value;
             const next = switch (try invoke(ctx, &op, &.{ k, cur, v })) {
                 .value => |val| val,
@@ -661,6 +675,8 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     // The items and the pairs made so far are held only here across user code.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
@@ -686,7 +702,12 @@ pub fn coll_iter_associate(ctx: *CallCtx) Error!EvalResult {
             key.retain();
             val.retain();
         }
-        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
+        const found: ?usize = switch (try keys.find(ctx.host, ctx.out, a, entries.items, &key)) {
+            .thrown => |e| return e,
+            .at => |p| p,
+            .none => null,
+        };
+        if (found) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 key.release(a); // existing key kept; drop the duplicate's retain
@@ -711,6 +732,8 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
     const key_block = ctx.args[1];
     const has_value_transform = ctx.args.len == 3;
     var entries: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     const keepalive = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(keepalive);
     runtime.keepalivePushSlice(items);
@@ -734,7 +757,12 @@ pub fn coll_iter_associate_by(ctx: *CallCtx) Error!EvalResult {
             value_owned = true;
         }
         runtime.keepalivePush(value);
-        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &key)) |i| {
+        const found: ?usize = switch (try keys.find(ctx.host, ctx.out, a, entries.items, &key)) {
+            .thrown => |e| return e,
+            .at => |p| p,
+            .none => null,
+        };
+        if (found) |i| {
             if (runtime.reclaimEnabled()) {
                 entries.items[i].value.release(a);
                 key.release(a);
@@ -759,6 +787,8 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     const block = ctx.args[1];
     var entries: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePushSlice(items);
@@ -771,7 +801,12 @@ pub fn coll_iter_associate_with(ctx: *CallCtx) Error!EvalResult {
             .err => |e| return e,
         };
         runtime.keepalivePush(val);
-        if (try findKeyIndexBoxedH(ctx.host, ctx.out, entries.items, &v)) |i| {
+        const found: ?usize = switch (try keys.find(ctx.host, ctx.out, a, entries.items, &v)) {
+            .thrown => |e| return e,
+            .at => |p| p,
+            .none => null,
+        };
+        if (found) |i| {
             if (runtime.reclaimEnabled()) entries.items[i].value.release(a);
             entries.items[i].value = val;
         } else {
@@ -797,44 +832,19 @@ fn sortByKeyInsertion(ctx: *CallCtx, items: []Value, block: Value, descending: b
             .err => |e| return e,
         };
     }
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareValues(a, keys[j - 1], keys[j])) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            const flipped = if (descending) reverseOrder(o) else o;
-            if (flipped == .gt) {
-                std.mem.swap(Value, &items[j - 1], &items[j]);
-                std.mem.swap(Value, &keys[j - 1], &keys[j]);
-                j -= 1;
-            } else break;
-        }
+    runtime.keepaliveRestore(loop_keepalive);
+    runtime.keepalivePushSlice(keys);
+    // Each element beside its key, sorted by the keys.
+    const keyed = try a.alloc(MapPair, items.len);
+    defer a.free(keyed);
+    for (keyed, items, keys) |*p, v, k| p.* = .{ .key = k, .value = v };
+    const by = common_mod.NaturalOrder{ .a = a, .descending = descending };
+    const r = try runtime.stableSort(MapPair, EvalResult, a, keyed, by, common_mod.NaturalOrder.cmpKeys);
+    for (keyed, items, keys) |p, *v, *k| {
+        v.* = p.value;
+        k.* = p.key;
     }
-    return null;
-}
-
-fn iterSortedByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
-    const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr(try fmt(a, "{s} expects (receiver, block)", .{what}));
-    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
-        .items => |xs| xs,
-        .err => |e| return e,
-    };
-    defer if (runtime.freeScratch()) a.free(items);
-    const block = ctx.args[1];
-    if (try sortByKeyInsertion(ctx, items, block, descending)) |e| return e;
-    return ok(try makeList(a, items, false));
-}
-
-pub fn coll_iter_sorted_by(ctx: *CallCtx) Error!EvalResult {
-    return iterSortedByImpl(ctx, false, "sortedBy");
-}
-
-pub fn coll_iter_sorted_by_desc(ctx: *CallCtx) Error!EvalResult {
-    return iterSortedByImpl(ctx, true, "sortedByDescending");
+    return r;
 }
 
 fn iterMaxMinByImpl(ctx: *CallCtx, descending: bool, what: []const u8) Error!EvalResult {
@@ -899,94 +909,6 @@ pub fn invokeComparatorCompare(ctx: *CallCtx, comparator: Value, x: Value, y: Va
     };
 }
 
-pub fn coll_mut_list_sort(ctx: *CallCtx) Error!EvalResult {
-    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
-    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    defer syncSublist(ctx.allocator, ctx.args[0]);
-    const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "MutableList.sort")) {
-        .items => |x| x,
-        .err => |e| return e,
-    };
-    const copy = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(copy);
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
-    runtime.keepalivePushSlice(copy);
-    // Host-aware so user `Comparable` instances sort through their `compareTo`.
-    if (try sortListHostAware(ctx, copy)) |e| return e;
-    writeBackItems(it, a, copy) catch return error.OutOfMemory;
-    return ok(Value.Unit);
-}
-
-/// Stable bottom-up merge sort driven by a Kotlin `Comparator`: an insertion
-/// sort's O(n²) comparator callbacks time out on large lists.
-pub fn mergeSortComparator(ctx: *CallCtx, cmp: Value, items: []Value) Error!?EvalResult {
-    const a = ctx.allocator;
-    const n = items.len;
-    if (n < 2) return null;
-    const buf = try a.alloc(Value, n);
-    defer if (runtime.freeScratch()) a.free(buf);
-    var width: usize = 1;
-    while (width < n) : (width *= 2) {
-        var lo: usize = 0;
-        while (lo < n) : (lo += 2 * width) {
-            const mid = @min(lo + width, n);
-            const hi = @min(lo + 2 * width, n);
-            var i = lo;
-            var j = mid;
-            var k = lo;
-            while (i < mid and j < hi) {
-                const c = switch (try invokeComparatorCompare(ctx, cmp, items[i], items[j])) {
-                    .n => |v| v,
-                    .err => |e| return e,
-                };
-                // Take the left run on a tie so the sort stays stable.
-                if (c <= 0) {
-                    buf[k] = items[i];
-                    i += 1;
-                } else {
-                    buf[k] = items[j];
-                    j += 1;
-                }
-                k += 1;
-            }
-            while (i < mid) : ({
-                i += 1;
-                k += 1;
-            }) buf[k] = items[i];
-            while (j < hi) : ({
-                j += 1;
-                k += 1;
-            }) buf[k] = items[j];
-        }
-        @memcpy(items[0..n], buf[0..n]);
-    }
-    return null;
-}
-
-pub fn coll_mut_list_sort_with(ctx: *CallCtx) Error!EvalResult {
-    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
-    if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    defer syncSublist(ctx.allocator, ctx.args[0]);
-    const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "MutableList.sortWith")) {
-        .items => |x| x,
-        .err => |e| return e,
-    };
-    if (ctx.args.len <= 1) return arityErr("sortWith expects (comparator)");
-    const cmp = ctx.args[1];
-    const copy = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(copy);
-    // The comparator is user code; the copy may become the elements' only holder.
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
-    runtime.keepalivePushSlice(copy);
-    if (try mergeSortComparator(ctx, cmp, copy)) |e| return e;
-    writeBackItems(it, a, copy) catch return error.OutOfMemory;
-    return ok(Value.Unit);
-}
-
 pub fn coll_mut_list_fill(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
@@ -1017,30 +939,6 @@ pub fn coll_mut_list_reverse(ctx: *CallCtx) Error!EvalResult {
     defer g.deinit();
     std.mem.reverse(Value, g.get().items);
     return ok(Value.Unit);
-}
-
-pub fn coll_iter_sorted_with(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    if (ctx.args.len != 2) return arityErr("sortedWith expects (receiver, comparator)");
-    const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "sortedWith")) {
-        .items => |xs| xs,
-        .err => |e| return e,
-    };
-    const comparator = ctx.args[1];
-    if (comparator == .Comparator) {
-        const descending = comparator.Comparator.descending;
-        const empty = blk: {
-            const steps_g = comparator.Comparator.steps.borrow();
-            defer steps_g.deinit();
-            break :blk steps_g.get().len == 0;
-        };
-        if (empty) {
-            if (try sortListHostAwareDesc(ctx, items, descending)) |e| return e;
-            return ok(try makeList(a, items, false));
-        }
-    }
-    if (try mergeSortComparator(ctx, comparator, items)) |e| return e;
-    return ok(try makeList(a, items, false));
 }
 
 fn iterExtreme(ctx: *CallCtx, want_max: bool, what: []const u8) Error!EvalResult {

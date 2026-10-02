@@ -1,0 +1,20 @@
+>Zeb4Q<|Q4b|7
+>Zlröw oé4Q<|Q4é|12
+>Z1z?4Q<|Q4?|8
+deleteAt StringIndexOutOfBoundsException: Index 2 out of bounds for length 2
+insert StringIndexOutOfBoundsException: Range [3, 2) out of bounds for length 2
+setCharAt StringIndexOutOfBoundsException: Index -1 out of bounds for length 2
+get StringIndexOutOfBoundsException: Index 2 out of bounds for length 2
+deleteRange past the end ok a
+deleteRange StringIndexOutOfBoundsException: Range [2, 1) out of bounds for length 3
+setRange StringIndexOutOfBoundsException: Range [4, 3) out of bounds for length 3
+insertRange IndexOutOfBoundsException: Range [2, 5) out of bounds for length 3
+appendRange IndexOutOfBoundsException: Range [1, 4) out of bounds for length 3
+append(chars, 1, 2) ok xbc
+append(chars, 3, 2) IndexOutOfBoundsException: Range [3, 5) out of bounds for length 4
+setLength StringIndexOutOfBoundsException: String index out of range: -1
+substring StringIndexOutOfBoundsException: Range [1, 5) out of bounds for length 2
+String.substring StringIndexOutOfBoundsException: Range [4, 3) out of bounds for length 3
+String(chars) StringIndexOutOfBoundsException: Range [2, 2 + 3) out of bounds for length 3
+lone: ?, split pair: 😀
+10000 10000 zzz srq qrs

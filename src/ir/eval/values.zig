@@ -760,8 +760,10 @@ pub fn remTruncI32(a: i32, b: i32) i32 {
     return @rem(a, b);
 }
 
-pub fn envVarSet(name: []const u8) bool {
-    return runtime.procEnvIsSet(std.heap.page_allocator, name);
+/// Whether environment variable `name` is set, read once: a throw asks for its trace switch
+/// every time, and reading the environment block costs a mapping and a scan.
+pub fn envVarSet(comptime name: [:0]const u8) bool {
+    return runtime.envSetOnce(name);
 }
 
 pub fn constStr(module: *const Module, id: ConstId) ?[]const u8 {

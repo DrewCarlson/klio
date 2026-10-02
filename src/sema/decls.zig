@@ -913,6 +913,47 @@ pub fn linkExpectActual(s: *Sema, first: Sym) Allocator.Error!void {
     }
 }
 
+/// A function the klio actuals declare (`stdlib/klio/...`) with the erased
+/// signature of a function the upstream library declares in the same package
+/// hides that one, as the JVM's own member hides the common extension of its
+/// signature: `StringBuilder.append(CharArray, Int, Int)`, which the common
+/// library deprecates as an error and leaves unimplemented, is the JVM's
+/// `append(char[], int, int)` member there.
+pub fn linkPlatformShadows(s: *Sema, first: Sym) Allocator.Error!void {
+    var p: usize = 0;
+    while (p < s.syms.packages.items.len) : (p += 1) {
+        var it = s.syms.packages.items[p].members.iterator();
+        while (it.next()) |entry| {
+            const list = entry.value_ptr.items;
+            if (list.len < 2) continue;
+            for (list) |k| {
+                if (s.syms.kind(k) != .function or !klioAuthored(s, k) or s.syms.flags(k).expect) continue;
+                for (list) |u| {
+                    if (u == k or s.syms.kind(u) != .function or klioAuthored(s, u)) continue;
+                    if (k.int() < first.int() and u.int() < first.int()) continue;
+                    if (s.syms.flags(u).expect or !baseDeclared(s, u)) continue;
+                    if (!try sameErasedSignature(s, k, u)) continue;
+                    s.syms.getMut(u).flags.hidden = true;
+                }
+            }
+        }
+    }
+}
+
+/// Whether `sym` is declared in one of klio's own stdlib files.
+fn klioAuthored(s: *Sema, sym: Sym) bool {
+    const f = s.syms.get(sym).file;
+    if (f >= s.files.items.len) return false;
+    const fc = s.files.items[f];
+    return fc.origin == .base and std.mem.startsWith(u8, fc.path, "stdlib/klio/");
+}
+
+/// Whether `sym` is declared in a file of the base library.
+fn baseDeclared(s: *Sema, sym: Sym) bool {
+    const f = s.syms.get(sym).file;
+    return f < s.files.items.len and s.files.items[f].origin == .base;
+}
+
 /// An `actual` declares no defaults: its parameters take the ones its
 /// `expect` declares.
 fn inheritDefaults(s: *Sema, e: Sym, a: Sym) void {

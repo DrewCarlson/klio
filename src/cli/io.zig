@@ -18,7 +18,17 @@ fn stdioIo() std.Io {
 fn writeFile(file: std.Io.File, data: []const u8) void {
     stdio_mutex.lock();
     defer stdio_mutex.unlock();
-    file.writeStreamingAll(stdioIo(), data) catch {};
+    writeEncoded(file, data);
+}
+
+/// `data` as the JVM writes a string to its standard streams (`runtime.forEachEncodedRun`).
+fn writeEncoded(file: std.Io.File, data: []const u8) void {
+    const Run = struct {
+        fn put(f: std.Io.File, run: []const u8) void {
+            f.writeStreamingAll(stdioIo(), run) catch {};
+        }
+    };
+    runtime.forEachEncodedRun(data, file, Run.put);
 }
 
 pub fn writeStdout(s: []const u8) void {
@@ -28,10 +38,9 @@ pub fn writeStdout(s: []const u8) void {
 pub fn writeStdoutLine(s: []const u8) void {
     stdio_mutex.lock();
     defer stdio_mutex.unlock();
-    const io = stdioIo();
     const f = std.Io.File.stdout();
-    f.writeStreamingAll(io, s) catch {};
-    f.writeStreamingAll(io, "\n") catch {};
+    writeEncoded(f, s);
+    f.writeStreamingAll(stdioIo(), "\n") catch {};
 }
 
 pub fn writeStderr(s: []const u8) void {

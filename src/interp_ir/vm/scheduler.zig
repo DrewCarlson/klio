@@ -384,7 +384,7 @@ fn runVmTask(task: *Task) ?RuntimeError {
         .err => |e| switch (e) {
             .Return => null,
             else => blk: {
-                if (runtime.procEnvGetVar(std.heap.page_allocator, "KLIO_PUMP_DIAG") catch null != null) {
+                if (runtime.envSetOnce("KLIO_PUMP_DIAG")) {
                     std.debug.print("[PUMP] worker task error: {any}\n", .{e});
                 }
                 break :blk e;

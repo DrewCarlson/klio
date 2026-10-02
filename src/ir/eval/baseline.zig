@@ -1786,8 +1786,9 @@ pub fn Compiler(comptime S: type) type {
                 .bin, .add, .sub, .cmp, .bin_mul, .bin_div, .bin_mod, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr, .bin_ident_eq, .bin_ident_neq, .cmp_br => c[pc + 3 .. pc + 6],
                 .un, .un_inc, .un_dec, .un_neg, .conv_byte, .conv_short, .conv_int, .conv_long, .conv_float, .conv_double, .conv_char, .fn_inv => c[pc + 3 .. pc + 5],
                 .const_int, .const_val, .move => c[pc + 1 .. pc + 3],
-                .not, .not_null, .is, .cast, .get_field, .array_get => c[pc + 2 .. pc + 4],
+                .not, .not_null, .is, .cast, .get_field, .array_get, .iter_open => c[pc + 2 .. pc + 4],
                 .set_field, .array_set => c[pc + 2 .. pc + 5],
+                .iter_has, .iter_get => c[pc + 2 .. pc + 6],
                 .br => c[pc + 1 .. pc + 2],
                 // A call's argument run and result register.
                 .call, .vcall, .callv, .native => {
@@ -1819,7 +1820,7 @@ pub fn Compiler(comptime S: type) type {
                 .const_int, .const_val, .move, .load_param, .const_str, .load_capture, .const_load, .make_cell, .cell_get => c[pc + 1],
                 .bin, .add, .sub, .cmp, .bin_mul, .bin_div, .bin_mod, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr, .bin_ident_eq, .bin_ident_neq, .cmp_br => c[pc + 3],
                 .un, .un_inc, .un_dec, .un_neg, .conv_byte, .conv_short, .conv_int, .conv_long, .conv_float, .conv_double, .conv_char, .fn_inv, .fn_to_raw_bits, .fn_to_bits, .fn_float_from_bits, .fn_double_from_bits, .fn_count_trailing_zero_bits, .fn_uint_to_float, .fn_uint_to_double, .fn_ulong_to_float, .fn_ulong_to_double, .fn_sin, .fn_cos, .fn_sqrt, .fn_to_ulong, .fn_to_uint, .fn_to_ushort, .fn_to_ubyte, .fn_unsigned_bits => c[pc + 3],
-                .not, .not_null, .get_field, .array_get, .load_object, .load_static, .is, .cast, .box_value, .unbox_value => c[pc + 2],
+                .not, .not_null, .get_field, .array_get, .load_object, .load_static, .is, .cast, .box_value, .unbox_value, .iter_open, .iter_has, .iter_get => c[pc + 2],
                 .call, .vcall, .callv, .native => c[pc + 5],
                 .new => c[pc + 6],
                 else => {
@@ -2328,6 +2329,65 @@ pub fn Compiler(comptime S: type) type {
                 .array_get => {
                     const fail = try g.slow(op, pc, blk);
                     try arrayGet(g, g.code(pc, 2), g.code(pc, 3), g.code(pc, 4), fail);
+                },
+                .iter_has => {
+                    // A list's or an array's loop: whether its position is not the size
+                    // (`forloop.has`; an array's position never passes it); any other value
+                    // in the handler.
+                    const fail = try g.slow(op, pc, blk);
+                    const src = g.code(pc, 3);
+                    const idx = g.code(pc, 4);
+                    const array = try m.label();
+                    const have = try m.label();
+                    try g.guard(idx, .Int, fail);
+                    try m.loadTag(.t0, src, tag_off);
+                    try m.cmpTagImm(.t0, tagOf(.List));
+                    try m.bCond(.ne, array);
+                    try listItems(g, src, fail);
+                    try m.loadAt(.w64, .t1, .t0, list_items + 8);
+                    try m.jump(have);
+                    m.bind(array);
+                    try arrayLen(g, src, fail);
+                    m.bind(have);
+                    try m.loadPayload(.w32, .t2, idx);
+                    try m.signExtend32(.t2, .t2);
+                    try m.cmp(.w64, .t2, .t1);
+                    try m.setCond(.t2, .ne);
+                    try g.putBool(g.code(pc, 2), .t2);
+                },
+                .iter_get => {
+                    // A list's element while its structural count's low 32 bits are the
+                    // stamp's high ones (`forloop.get`), an array's as `array_get` reads
+                    // it; a change, a position past the end, a writer at work and any
+                    // other value in the handler.
+                    const fail = try g.slow(op, pc, blk);
+                    const dst = g.code(pc, 2);
+                    const src = g.code(pc, 3);
+                    const idx = g.code(pc, 4);
+                    const stamp = g.code(pc, 5);
+                    const array = try m.label();
+                    const done = try m.label();
+                    try m.loadTag(.t0, src, tag_off);
+                    try m.cmpTagImm(.t0, tagOf(.List));
+                    try m.bCond(.ne, array);
+                    try listData(g, src, fail);
+                    try g.guard(stamp, .Long, fail);
+                    try g.guard(idx, .Int, fail);
+                    const counted = try m.label();
+                    try m.loadAt(.w64, .t1, .t0, list_data_mod_count);
+                    try m.bZero64(.t1, counted);
+                    try m.loadAt(.w32, .t1, .t1, mod_count_value);
+                    try m.loadPayload(.w64, .t2, stamp);
+                    try m.lsrImm(.w64, .t2, .t2, 32);
+                    try m.cmp(.w32, .t1, .t2);
+                    try m.bCond(.ne, fail);
+                    m.bind(counted);
+                    try m.loadAt(.w64, .t0, .t0, list_data_items);
+                    if (runtime.lockfreeReads() and !S.reclaims) try listRead(g, dst, idx, fail) else try boxedGet(g, dst, idx, fail);
+                    try m.jump(done);
+                    m.bind(array);
+                    try arrayGet(g, dst, src, idx, fail);
+                    m.bind(done);
                 },
                 .load_capture => {
                     if (g.top()) |lv| {
@@ -2990,6 +3050,37 @@ pub fn Compiler(comptime S: type) type {
             m.endCold(sec);
         }
 
+        /// `t1` = the length of the `Array<T>`, `IntArray`, `LongArray` or `DoubleArray` in
+        /// register `arr`, the kinds `arrayGet` reads; any other value goes to `fail`.
+        fn arrayLen(g: *Gen, arr: u32, fail: Masm.Label) !void {
+            const m = &g.m;
+            const boxed = try m.label();
+            const wide = try m.label();
+            const done = try m.label();
+            try g.guard(arr, .Array, fail);
+            try m.loadPayload(.w64, .t0, arr);
+            try m.andImm(.w64, .t1, .t0, 0xF);
+            try m.andImm(.w64, .t0, .t0, -16);
+            try m.cmpTagImm(.t1, 0);
+            try m.bCond(.eq, boxed);
+            try m.cmpTagImm(.t1, @intFromEnum(runtime.PrimitiveArrayKind.Long) + 1);
+            try m.bCond(.eq, wide);
+            try m.cmpTagImm(.t1, @intFromEnum(runtime.PrimitiveArrayKind.Double) + 1);
+            try m.bCond(.eq, wide);
+            try m.cmpTagImm(.t1, @intFromEnum(runtime.PrimitiveArrayKind.Int) + 1);
+            try m.bCond(.ne, fail);
+            try m.loadAt(.w64, .t1, .t0, prim_items + 8);
+            try m.lsrImm(.w64, .t1, .t1, 2);
+            try m.jump(done);
+            m.bind(wide);
+            try m.loadAt(.w64, .t1, .t0, prim_items + 8);
+            try m.lsrImm(.w64, .t1, .t1, 3);
+            try m.jump(done);
+            m.bind(boxed);
+            try m.loadAt(.w64, .t1, .t0, list_items + 8);
+            m.bind(done);
+        }
+
         /// Register `dst` = element `idx` (an Int register) of the `Array<T>` storage cell in
         /// `t0`, read with no lock as `ObjRef.readAt` reads it: between two equal even readings
         /// of the cell's write sequence. A writer holding the lock or taking it meanwhile, or an
@@ -3495,7 +3586,7 @@ pub fn Compiler(comptime S: type) type {
                 return;
             }
             switch (k) {
-                .none, .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length => unreachable,
+                .none, .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length, .iter_has_next, .iter_next, .entry_key, .entry_value => unreachable,
                 .any_hash => {
                     try g.guard(recv, .Instance, fail);
                     try m.loadPayload(.w64, .t1, recv);
@@ -3603,7 +3694,7 @@ pub fn Compiler(comptime S: type) type {
             return switch (op) {
                 .const_int, .const_val, .move, .load_param, .load_params, .jump, .br, .not, .not_null, .un_inc, .un_dec, .un_neg, .conv_long, .conv_int, .get_field, .set_field, .unbox_value, .box_value, .add, .sub, .ret => true,
                 .cmp, .cmp_br => condOf(code[pc + 2] >> 8) != null or isIdent(@enumFromInt(code[pc + 2] & 0xff)),
-                .bin_ident_eq, .bin_ident_neq, .fn_inv, .fn_to_ulong, .fn_to_uint, .fn_unsigned_bits, .fn_float_from_bits, .fn_double_from_bits, .fn_to_raw_bits, .const_str, .is, .cast, .array_get, .array_set => true,
+                .bin_ident_eq, .bin_ident_neq, .fn_inv, .fn_to_ulong, .fn_to_uint, .fn_unsigned_bits, .fn_float_from_bits, .fn_double_from_bits, .fn_to_raw_bits, .const_str, .is, .cast, .array_get, .array_set, .iter_has, .iter_get => true,
                 .load_static => objects_native,
                 .load_object => objects_native,
                 .bin, .bin_mul, .bin_div, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr => blk: {
@@ -3787,7 +3878,7 @@ pub fn Compiler(comptime S: type) type {
         fn addDsts(set: *std.DynamicBitSetUnmanaged, code: []const u32, op: Op, pc: usize) void {
             switch (op) {
                 .const_int, .const_val, .move, .load_param, .const_str, .load_capture => set.set(code[pc + 1]),
-                .load_object, .is, .cast, .array_get, .load_static => set.set(code[pc + 2]),
+                .load_object, .is, .cast, .array_get, .load_static, .iter_has, .iter_get => set.set(code[pc + 2]),
                 .array_set => {},
                 .load_params => for (0..code[pc + 1]) |k| set.set(code[pc + 2 + 2 * k]),
                 .not, .not_null, .get_field, .unbox_value, .box_value => set.set(code[pc + 2]),

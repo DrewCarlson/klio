@@ -78,10 +78,17 @@ pub const ClassDef = struct {
     /// bridge assigns; `maxInt(u32)` for a class that code never makes.
     ir_class: u32 = std.math.maxInt(u32),
 
+    /// For a map's `keys`, `values` or `entries` class (`MapViews.kt`), which view it is
+    /// and the slot holding its map, so a `for` loop over one walks the map by position
+    /// (`forloop`); null for any other class.
+    map_view: ?MapViewMark = null,
+
     /// The slots an instance holds, base classes first; program-lifetime.
     /// Seeds are scalars or null, so they hold no cell the collector must
     /// trace.
     layout_slots: []const LayoutSlot = &.{},
+
+    pub const MapViewMark = struct { kind: value_mod.MapViewKind, slot: u32 };
 
     pub const EnumEntry = struct {
         name: []const u8,

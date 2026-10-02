@@ -3032,6 +3032,7 @@ const Build = struct {
         h.suspend_invoke_slot = sslots;
         inline for (@typeInfo(runtime.PrimitiveArrayKind).@"enum".fields, 0..) |f, k| {
             h.prim_array[k] = b.classByFqn("kotlin." ++ f.name ++ "Array");
+            h.prim_iterator[k] = b.classByFqn("kotlin.collections." ++ f.name ++ "Iterator");
         }
         for (host_kinds) |k| h.by_tag[@intFromEnum(k.tag)] = b.classByFqn(k.fqn);
         // The host's `COROUTINE_SUSPENDED` is the entry of that name.
@@ -3059,6 +3060,8 @@ const Build = struct {
         h.list = b.classByFqn("kotlin.collections.List");
         h.set = b.classByFqn("kotlin.collections.Set");
         h.map = b.classByFqn("kotlin.collections.Map");
+        h.mutable_iterator = b.classByFqn("kotlin.collections.MutableIterator");
+        h.mutable_list_iterator = b.classByFqn("kotlin.collections.MutableListIterator");
         const entry = s.classByFqn("kotlin.collections.Map.Entry");
         if (entry != .none) {
             h.map_entry = b.br.classOfOpt(entry);
@@ -3642,7 +3645,18 @@ pub fn classDefOf(a: Allocator, m: *const ir.Module, c: usize, layout: []const S
     }
     def.ir_class = @intCast(ic.id.int());
     def.layout_slots = lslots;
+    def.map_view = mapViewMark(ic.fqn, layout);
     return ObjRef(runtime.ClassDef).init(a, def);
+}
+
+/// A map view class's kind and the slot of its `backing` map (`MapViews.kt`); null for
+/// any other class.
+fn mapViewMark(fqn: []const u8, layout: []const Slot) ?runtime.ClassDef.MapViewMark {
+    const kind: runtime.MapViewKind = for ([_]runtime.WellKnownClass{ .hash_map_keys, .hash_map_values, .hash_map_entry_set }, [_]runtime.MapViewKind{ .Keys, .Values, .Entries }) |c, k| {
+        if (std.mem.eql(u8, fqn, c.fqn())) break k;
+    } else return null;
+    for (layout, 0..) |sl, i| if (std.mem.eql(u8, sl.name, "backing")) return .{ .kind = kind, .slot = @intCast(i) };
+    return null;
 }
 
 /// Binds a loaded native to the host function its table has under its

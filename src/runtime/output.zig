@@ -24,6 +24,52 @@ pub const Output = struct {
     }
 };
 
+/// `s` as the JVM's UTF-8 encoder writes a string to a stream, passed to `sink` run by run: a
+/// surrogate standing alone (which a string holds as three WTF-8 bytes) as `?`, a high
+/// surrogate followed by a low one as the character they make. One run, `s` itself, for a
+/// string with no surrogate in it.
+pub fn forEachEncodedRun(s: []const u8, ctx: anytype, comptime sink: fn (@TypeOf(ctx), []const u8) void) void {
+    var start: usize = 0;
+    var i: usize = 0;
+    while (std.mem.findScalarPos(u8, s, i, 0xED)) |at| {
+        if (!float_fmt.isWtf8SurrogateAt(s, at)) {
+            i = at + 1;
+            continue;
+        }
+        if (at > start) sink(ctx, s[start..at]);
+        const high = float_fmt.wtf8SurrogateUnit(s, at);
+        if (high < 0xDC00 and float_fmt.isWtf8SurrogateAt(s, at + 3) and float_fmt.wtf8SurrogateUnit(s, at + 3) >= 0xDC00) {
+            const low = float_fmt.wtf8SurrogateUnit(s, at + 3);
+            const cp: u21 = 0x10000 + ((@as(u21, high) - 0xD800) << 10) + (@as(u21, low) - 0xDC00);
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &buf) catch unreachable;
+            sink(ctx, buf[0..n]);
+            i = at + 6;
+        } else {
+            sink(ctx, "?");
+            i = at + 3;
+        }
+        start = i;
+    }
+    if (start < s.len) sink(ctx, s[start..]);
+}
+
+test "a string goes out as the JVM's encoder writes it: a lone surrogate as ?, a split pair joined" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const Sink = struct {
+        fn put(o: *std.ArrayList(u8), run: []const u8) void {
+            o.appendSlice(std.testing.allocator, run) catch unreachable;
+        }
+    };
+    // A lone high surrogate (U+D83D), then a high and a low held apart (U+1F600), then 'x'.
+    forEachEncodedRun("a\xed\xa0\xbdb\xed\xa0\xbd\xed\xb8\x80x", &out, Sink.put);
+    try std.testing.expectEqualStrings("a?b\u{1F600}x", out.items);
+    out.clearRetainingCapacity();
+    forEachEncodedRun("plain \u{e9}", &out, Sink.put);
+    try std.testing.expectEqualStrings("plain \u{e9}", out.items);
+}
+
 pub const OutOp = union(enum) {
     write: []const u8,
     writeln: []const u8,

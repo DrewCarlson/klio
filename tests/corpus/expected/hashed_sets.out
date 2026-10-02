@@ -1,0 +1,14 @@
+false
+true
+true
+[Tag(Kotlin)] hashCode calls: 3
+points 50000 found 25000
+grid 50000 sum 1249975000
+distinct 1000 toSet 1000 first w0
+associateBy {2=w9, 3=w99, 4=w999}
+groupingBy 10 5000
+mapOf {a=3, b=2}
+union 33333 intersect 8334 subtract 16666
+removeAll/retainAll [2, 4, 8, 10, 14, 16, 20, 22]
+containsAll true false
+caught no hash

@@ -345,7 +345,8 @@ fn step(fs: *const bc.FuncStreams, sx: StepCtx, bi: u32, op: Op, pc: usize, stat
             put(state, c[pc + 2], unknown);
         },
         .set_field => put(state, c[pc + 2], accessed(get(state, c[pc + 2]), c[pc + 3])),
-        .array_get, .load_object, .load_static, .cast, .box_value, .unbox_value => put(state, c[pc + 2], unknown),
+        .array_get, .load_object, .load_static, .cast, .box_value, .unbox_value, .iter_open, .iter_get => put(state, c[pc + 2], unknown),
+        .iter_has => put(state, c[pc + 2], of(.Bool)),
         .call, .vcall, .callv, .native => put(state, c[pc + 5], unknown),
         .new => put(state, c[pc + 6], newKind(fs, sx.module, pc)),
         .cell_set => put(state, c[pc + 2], unknown),

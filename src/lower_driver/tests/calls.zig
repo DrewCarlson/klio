@@ -1546,6 +1546,21 @@ test "an actual takes the defaults its expect declares" {
     }, "3\n9\n15\n3\n");
 }
 
+test "an extension actual's defaults read the receiver its expect's expressions name" {
+    try driver.expectOutput(&.{
+        \\expect fun String.span(from: Int = 0, to: Int = length): Int
+        \\expect fun <T> List<T>.lastOf(n: Int = size - 1): T
+        ,
+        \\actual fun String.span(from: Int, to: Int): Int = to - from
+        \\actual fun <T> List<T>.lastOf(n: Int): T = get(n)
+        \\fun main() {
+        \\    println("klio".span(1))
+        \\    println("klio".span(to = 2))
+        \\    println(listOf(4, 5, 6).lastOf())
+        \\}
+    }, "3\n2\n6\n");
+}
+
 test "an adapter that fails before naming an expression reports at its reference" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

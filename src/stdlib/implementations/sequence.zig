@@ -64,7 +64,7 @@ fn makeSet(allocator: std.mem.Allocator, items: []Value, mutable: bool) std.mem.
         if (!seen) try deduped.append(allocator, v);
     }
     const ref = try ValueList.init(allocator, deduped);
-    return try Value.newSet(allocator, .{ .items = ref, .mutable = mutable, .backing = null });
+    return try Value.newSet(allocator, .{ .elems = ref, .mutable = mutable, .backing = null });
 }
 
 fn recvListItems(args: []const Value, what: []const u8) union(enum) { items: ValueList, err: RuntimeError } {
@@ -76,7 +76,7 @@ fn recvListItems(args: []const Value, what: []const u8) union(enum) { items: Val
 
 fn recvSetItems(args: []const Value, what: []const u8) union(enum) { items: ValueList, err: RuntimeError } {
     if (args.len > 0 and args[0] == .Set) {
-        return .{ .items = args[0].Set.items.clone() };
+        return .{ .items = args[0].Set.dense().clone() };
     }
     return .{ .err = .{ .Type = typeMsg(what, "a Set receiver") } };
 }
@@ -170,17 +170,23 @@ pub fn makeSeqIter(allocator: std.mem.Allocator, seq: Value) std.mem.Allocator.E
     return .{ .SeqIter = state };
 }
 
+/// Where a scope's fields are, found once for its class: every `yield` writes them.
+var value_slot: runtime.InstanceData.SlotCache = .init(0);
+var has_value_slot: runtime.InstanceData.SlotCache = .init(0);
+
 /// Stash the yielded value on the scope and suspend the builder coroutine;
 /// `builderStep` reads it and resumes the block on the next pull.
 pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .Instance) return err(.{ .Type = "yield: not a SequenceScope" });
-    const g = ctx.args[0].Instance.borrowMut();
-    const inst = g.get();
+    // Slot stores take no cell lock (`InstanceData.storeSlot`).
+    const inst = &ctx.args[0].Instance.cell.data;
     const v = if (ctx.args.len > 1) ctx.args[1] else Value.Unit;
     if (runtime.reclaimEnabled()) v.retain();
-    _ = inst.store(ctx.allocator, seq_value_field, v);
-    _ = inst.set(seq_has_value_field, .{ .Bool = true });
-    g.deinit();
+    if (inst.slotIndexCached(&value_slot, seq_value_field)) |i| {
+        const old = inst.storeSlot(i, v).?;
+        if (runtime.reclaimEnabled()) old.release(ctx.allocator);
+    }
+    if (inst.slotIndexCached(&has_value_slot, seq_has_value_field)) |i| _ = inst.storeSlot(i, .{ .Bool = true });
     return err(.{ .Suspend = -1 });
 }
 
@@ -559,7 +565,7 @@ pub fn map_entry_key(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.key requires a Map.Entry receiver" });
     }
     if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    const out = ctx.args[0].MapEntry.key.asPtrConst().*;
+    const out = ctx.args[0].MapEntry.key;
     out.retain();
     return ok(out);
 }
@@ -569,7 +575,7 @@ pub fn map_entry_value(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         return err(.{ .Type = "Map.Entry.value requires a Map.Entry receiver" });
     }
     if (try collections.mapEntryViewGuard(ctx.allocator, &ctx.args[0])) |e| return e;
-    const out = ctx.args[0].MapEntry.value.asPtrConst().*;
+    const out = ctx.args[0].MapEntry.getValue();
     out.retain();
     return ok(out);
 }
@@ -1124,7 +1130,7 @@ fn applyBufferedOp(
                         try nx.appendSlice(allocator, g.get().items);
                     },
                     .Set => |xs| {
-                        const g = xs.items.borrow();
+                        const g = xs.dense().borrow();
                         defer g.deinit();
                         try nx.appendSlice(allocator, g.get().items);
                     },
@@ -1189,7 +1195,7 @@ fn applyBufferedOp(
             items.* = nx;
         },
         .Sorted => |descending| {
-            if (try sortNatural(host, out, items.items, descending)) |e| return e;
+            if (try sortNatural(allocator, host, out, items.items, descending)) |e| return e;
         },
         .SortedBy => |sb| {
             var keyed = try allocator.alloc(Value, items.items.len);
@@ -1201,32 +1207,24 @@ fn applyBufferedOp(
                     .err => |e| return e,
                 }
             }
-            if (try sortByKey(host, out, items.items, keyed, sb.descending)) |e| return e;
+            if (try sortByKey(allocator, host, out, items.items, keyed, sb.descending)) |e| return e;
         },
         .SortedWith => |comparator| {
-            var i: usize = 1;
-            while (i < items.items.len) : (i += 1) {
-                var j = i;
-                while (j > 0) {
-                    const a = items.items[j - 1];
-                    const b = items.items[j];
-                    const mr = try host.callWellKnown(&comparator, .compare, &.{ a, b }, out);
-                    if (mr) |res| {
-                        switch (res) {
-                            .ok => |v| {
-                                const n = v.asI64() orelse 0;
-                                if (n > 0) {
-                                    std.mem.swap(Value, &items.items[j - 1], &items.items[j]);
-                                    j -= 1;
-                                } else break;
-                            },
-                            .err => |e| return e,
-                        }
-                    } else {
-                        return .{ .Type = "SortedWith: comparator has no `compare` method" };
-                    }
+            const By = struct {
+                host: IntrinsicHost,
+                comparator: Value,
+                out: Output,
+                fn cmp(self: @This(), x: *const Value, y: *const Value) std.mem.Allocator.Error!runtime.SortOrder(RuntimeError) {
+                    const res = (try self.host.callWellKnown(&self.comparator, .compare, &.{ x.*, y.* }, self.out)) orelse
+                        return .{ .err = .{ .Type = "SortedWith: comparator has no `compare` method" } };
+                    return switch (res) {
+                        .ok => |v| .{ .order = std.math.order(v.asI64() orelse 0, 0) },
+                        .err => |e| .{ .err = e },
+                    };
                 }
-            }
+            };
+            const by = By{ .host = host, .comparator = comparator, .out = out };
+            if (try runtime.stableSort(Value, RuntimeError, allocator, items.items, by, By.cmp)) |e| return e;
         },
     }
     return null;
@@ -1541,47 +1539,41 @@ fn compareValuesVia(
     }
 }
 
-fn sortNatural(host: IntrinsicHost, out: Output, items: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
-    // Insertion sort: the comparison is fallible, returning RuntimeError data,
-    // so the sort must bail out mid-way.
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            switch (try compareValuesVia(host, out, &items[j - 1], &items[j])) {
-                .order => |o| {
-                    const ord = if (descending) o.invert() else o;
-                    if (ord == .gt) {
-                        std.mem.swap(Value, &items[j - 1], &items[j]);
-                        j -= 1;
-                    } else break;
-                },
-                .err => |e| return e,
-            }
-        }
+/// Natural order through `compareValuesVia`, flipped when `descending`.
+const NaturalVia = struct {
+    host: IntrinsicHost,
+    out: Output,
+    descending: bool,
+
+    fn cmp(self: NaturalVia, x: *const Value, y: *const Value) std.mem.Allocator.Error!runtime.SortOrder(RuntimeError) {
+        return switch (try compareValuesVia(self.host, self.out, x, y)) {
+            .order => |o| .{ .order = if (self.descending) o.invert() else o },
+            .err => |e| .{ .err = e },
+        };
     }
-    return null;
+
+    fn cmpKeys(self: NaturalVia, x: *const runtime.MapPair, y: *const runtime.MapPair) std.mem.Allocator.Error!runtime.SortOrder(RuntimeError) {
+        return self.cmp(&x.key, &y.key);
+    }
+};
+
+fn sortNatural(a: std.mem.Allocator, host: IntrinsicHost, out: Output, items: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
+    const by = NaturalVia{ .host = host, .out = out, .descending = descending };
+    return runtime.stableSort(Value, RuntimeError, a, items, by, NaturalVia.cmp);
 }
 
-fn sortByKey(host: IntrinsicHost, out: Output, items: []Value, keys: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            switch (try compareValuesVia(host, out, &keys[j - 1], &keys[j])) {
-                .order => |o| {
-                    const ord = if (descending) o.invert() else o;
-                    if (ord == .gt) {
-                        std.mem.swap(Value, &items[j - 1], &items[j]);
-                        std.mem.swap(Value, &keys[j - 1], &keys[j]);
-                        j -= 1;
-                    } else break;
-                },
-                .err => |e| return e,
-            }
-        }
+/// `items` sorted by their `keys`, the two kept in step.
+fn sortByKey(a: std.mem.Allocator, host: IntrinsicHost, out: Output, items: []Value, keys: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
+    const keyed = try a.alloc(runtime.MapPair, items.len);
+    defer a.free(keyed);
+    for (keyed, items, keys) |*p, v, k| p.* = .{ .key = k, .value = v };
+    const by = NaturalVia{ .host = host, .out = out, .descending = descending };
+    const r = try runtime.stableSort(runtime.MapPair, RuntimeError, a, keyed, by, NaturalVia.cmpKeys);
+    for (keyed, items, keys) |p, *v, *k| {
+        v.* = p.value;
+        k.* = p.key;
     }
-    return null;
+    return r;
 }
 
 const testing = std.testing;
@@ -1842,11 +1834,7 @@ test "Map.Entry key and value accessors" {
 
     const key: Value = .{ .Int = 3 };
     const val: Value = .{ .Int = 9 };
-    const entry: Value = try Value.newMapEntry(h.allocator(), .{
-        .key = try Value.boxRef(h.allocator(), key),
-        .value = try Value.boxRef(h.allocator(), val),
-        .backing = .{},
-    });
+    const entry: Value = try Value.newMapEntry(h.allocator(), .{ .key = key, .value = val });
     var args = [_]Value{entry};
     var ctx = h.ctx(&args);
     const k = try map_entry_key(&ctx);

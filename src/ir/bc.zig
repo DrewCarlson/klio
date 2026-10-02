@@ -243,6 +243,13 @@ pub const Op = enum(u32) {
     /// `strings`; a Kotlin string is immutable, and the JVM interns its
     /// literals.
     const_str,
+    /// inst_idx, dst, src: `IterOpen`, a `for` loop's stamp (`runtime.forloop`).
+    iter_open,
+    /// inst_idx, dst, src, idx, stamp: `IterHas` on an Int position and a Long stamp.
+    iter_has,
+    /// inst_idx, dst, src, idx, stamp: `IterGet` on an Int position and a Long stamp; a
+    /// change since the loop began runs the arm, which throws.
+    iter_get,
     /// An op of a compiled function: the op this pc held runs as compiled code
     /// (`JitCode`), its operands still following as they were.
     jit,
@@ -254,9 +261,9 @@ pub fn opLen(op: Op, code: []const u32, pc: usize) usize {
         .block_entry, .term_exit => 1,
         .escape, .make_closure, .new_array => 2,
         .const_load, .const_val, .const_int, .move, .load_param, .cell_get, .ret, .ret_try, .make_cell, .load_capture => 3,
-        .end, .not, .not_null, .const_str, .cell_set, .store_static, .load_static, .load_object => 4,
+        .end, .not, .not_null, .const_str, .cell_set, .store_static, .load_static, .load_object, .iter_open => 4,
         .un, .un_inc, .un_dec, .un_neg, .conv_byte, .conv_short, .conv_int, .conv_long, .conv_float, .conv_double, .conv_char, .fn_inv, .fn_to_raw_bits, .fn_to_bits, .fn_float_from_bits, .fn_double_from_bits, .fn_count_trailing_zero_bits, .fn_uint_to_float, .fn_uint_to_double, .fn_ulong_to_float, .fn_ulong_to_double, .fn_sin, .fn_cos, .fn_sqrt, .fn_to_ulong, .fn_to_uint, .fn_to_ushort, .fn_to_ubyte, .fn_unsigned_bits, .get_field, .set_field, .array_get, .array_set => 5,
-        .bin, .add, .sub, .cmp, .bin_mul, .bin_div, .bin_mod, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr, .bin_ident_eq, .bin_ident_neq, .jump, .goto_try, .is, .cast, .box_value, .unbox_value => 6,
+        .bin, .add, .sub, .cmp, .bin_mul, .bin_div, .bin_mod, .bin_and, .bin_or, .bin_xor, .bin_shl, .bin_shr, .bin_ushr, .bin_ident_eq, .bin_ident_neq, .jump, .goto_try, .is, .cast, .box_value, .unbox_value, .iter_has, .iter_get => 6,
         .bin_k_add, .bin_k_sub, .bin_k_mul, .bin_k_div, .bin_k_mod, .bin_k_less, .bin_k_less_eq, .bin_k_greater, .bin_k_greater_eq, .bin_k_eq, .bin_k_not_eq, .bin_k_boxed_eq, .bin_k_boxed_not_eq, .bin_k_and, .bin_k_or, .bin_k_xor, .bin_k_shl, .bin_k_shr, .bin_k_ushr, .bin_k_ident_eq, .bin_k_ident_neq => 6,
         .cmp_br_k_less, .cmp_br_k_less_eq, .cmp_br_k_greater, .cmp_br_k_greater_eq, .cmp_br_k_eq, .cmp_br_k_not_eq, .cmp_br_k_boxed_eq, .cmp_br_k_boxed_not_eq, .cmp_br_k_ident_eq, .cmp_br_k_ident_neq => 6,
         .vcall, .native, .callv => 7,
@@ -1919,6 +1926,21 @@ fn build(blk: *const ir.Block, fx: BlockFx, consts: []const ir.Const, n_locals: 
                 }
                 code.appendSlice(a, &.{ @intFromEnum(Op.not), @intCast(i), n.dst.int(), n.src.int() }) catch return null;
             },
+            .IterOpen => |x| {
+                if (!regOk(n_locals, x.dst.int()) or !regOk(n_locals, x.src.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
+                code.appendSlice(a, &.{ @intFromEnum(Op.iter_open), @intCast(i), x.dst.int(), x.src.int() }) catch return null;
+            },
+            inline .IterHas, .IterGet => |x, tag| {
+                if (!regOk(n_locals, x.dst.int()) or !regOk(n_locals, x.src.int()) or !regOk(n_locals, x.idx.int()) or !regOk(n_locals, x.stamp.int())) {
+                    code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
+                    continue;
+                }
+                const op: Op = if (tag == .IterHas) .iter_has else .iter_get;
+                code.appendSlice(a, &.{ @intFromEnum(op), @intCast(i), x.dst.int(), x.src.int(), x.idx.int(), x.stamp.int() }) catch return null;
+            },
             inline .NotNullAssert, .LateinitCheck => |n| {
                 if (!regOk(n_locals, n.dst.int()) or !regOk(n_locals, n.src.int())) {
                     code.appendSlice(a, &.{ @intFromEnum(Op.escape), @intCast(i) }) catch return null;
@@ -2683,6 +2705,14 @@ pub fn dumpBlock(w: anytype, fs: *const FuncStreams, b: usize) !void {
             .load_object => {
                 try w.print("  {d:>4}: load_object i{d} r{d} <- class{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
                 pc += 4;
+            },
+            .iter_open => {
+                try w.print("  {d:>4}: iter_open  i{d} r{d} <- r{d}\n", .{ pc, code[pc + 1], code[pc + 2], code[pc + 3] });
+                pc += 4;
+            },
+            .iter_has, .iter_get => |o| {
+                try w.print("  {d:>4}: {s:<10} i{d} r{d} <- r{d}[r{d}] stamp r{d}\n", .{ pc, @tagName(o), code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4], code[pc + 5] });
+                pc += 6;
             },
         }
     }

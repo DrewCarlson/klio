@@ -517,9 +517,14 @@ var out_ctx: u8 = 0;
 
 fn outWrite(ctx: *anyopaque, bytes: []const u8) void {
     _ = ctx;
+    // As the JVM writes a string to its standard streams (`runtime.forEachEncodedRun`).
+    runtime.forEachEncodedRun(bytes, @as(c_int, 1), writeAll);
+}
+
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = std.c.write(1, bytes.ptr + off, bytes.len - off);
+        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
         if (n <= 0) return;
         off += @intCast(n);
     }
@@ -1032,6 +1037,28 @@ export fn klio_r_array_set(acv: CValue, index: i32, vcv: CValue) void {
     }
     const idx: Value = .{ .Int = index };
     _ = ir.eval.fastIndexSet(alloc(), &arr, &idx, fromC(vcv)) orelse raiseIndex(&arr, index);
+}
+
+export fn klio_r_iter_open(scv: CValue) CValue {
+    const src = fromC(scv);
+    return toC(if (runtime.forloop.open(&src)) |at| .{ .Long = at } else .Null);
+}
+
+export fn klio_r_iter_has(scv: CValue, idx: i32, at: CValue) i32 {
+    const src = fromC(scv);
+    return @intFromBool(runtime.forloop.has(&src, idx, fromC(at).Long));
+}
+
+export fn klio_r_iter_get(scv: CValue, idx: i32, at: CValue) CValue {
+    const src = fromC(scv);
+    switch (runtime.forloop.get(&src, idx, fromC(at).Long)) {
+        .elem => |v| return toC(v),
+        .changed => {
+            const name = "kotlin.ConcurrentModificationException";
+            const rz = tables.exceptions.by_fqn.get(name) orelse uncaughtText(name, null);
+            throwValue(build(rz, &.{Value.Null}));
+        },
+    }
 }
 
 /// An array of class `cls` (`Array` or a primitive array) over `argv`.

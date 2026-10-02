@@ -261,6 +261,29 @@ pub fn fixtureGenerated(sources: []const []const u8, generated: []const []const 
     return fx;
 }
 
+/// `fixture`, with `base` (path, text) pairs added after `sources` as files of the
+/// base library.
+pub fn fixtureWithBase(sources: []const []const u8, base: []const [2][]const u8) !Fixture {
+    const arena = try std.testing.allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var fx = Fixture{ .arena = arena, .map = undefined, .s = undefined };
+    errdefer fx.deinit();
+    const a = fx.arena.allocator();
+    fx.map = span.SourceMap.init(a);
+    var files: std.ArrayList(sema_mod.SourceFile) = .empty;
+    try addSource(a, &fx.map, &files, "mini/kotlin.kt", mini_kotlin, .base);
+    try addSource(a, &fx.map, &files, "mini/collections.kt", mini_collections, .base);
+    try addSource(a, &fx.map, &files, "mini/standard.kt", mini_standard, .base);
+    for (sources, 0..) |src, i| {
+        const path = try std.fmt.allocPrint(a, "test{d}.kt", .{i});
+        try addSource(a, &fx.map, &files, path, src, .program);
+    }
+    for (base) |b| try addSource(a, &fx.map, &files, b[0], b[1], .base);
+    fx.s = try Sema.init(a);
+    try fx.s.addFiles(files.items);
+    return fx;
+}
+
 fn addSource(a: std.mem.Allocator, map: *span.SourceMap, files: *std.ArrayList(sema_mod.SourceFile), path: []const u8, src: []const u8, origin: sema_mod.Origin) !void {
     const id = try map.add(path, src);
     const text = map.get(id).source;
@@ -2437,6 +2460,21 @@ test "a builder's type argument is inferred from the calls in its lambda" {
     try fx.expectRef("^build { send(1)", .op, "kotlin/Int.plus");
     try fx.expectTarget("first().^length", "kotlin/String.length");
     try fx.expectRef("return ^v + 1", .op, "kotlin/Int.plus");
+}
+
+test "a function klio's library declares hides the upstream one of its signature, as a JVM member hides the common extension" {
+    var fx = try fixtureWithBase(&.{
+        \\fun use(): Int = 3.span(2)
+    }, &.{
+        .{ "stdlib/kotlin/libraries/stdlib/src/demo.kt", "package kotlin\nfun Int.span(n: Int): Int = 0\nfun Int.other(n: Int): Int = 0\n" },
+        .{ "stdlib/klio/kotlin-demo/Demo.kt", "package kotlin\nfun Int.span(n: Int): Int = this * n\n" },
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try std.testing.expectEqual(@as(u64, 0), fx.s.census.count(.ambiguous));
+    const s = fx.s;
+    const r = try fx.refAt("3.^span(2)", .call);
+    try std.testing.expect(std.mem.startsWith(u8, s.files.items[s.syms.get(r.target).file].path, "stdlib/klio/"));
 }
 
 test "an actual's omitted argument takes its expect's default, resolved in the expect's scope" {

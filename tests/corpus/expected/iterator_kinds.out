@@ -1,0 +1,14 @@
+list: Iterator, MutableIterator
+read-only list: Iterator, MutableIterator
+list iterator: Iterator, MutableIterator, ListIterator, MutableListIterator
+set: Iterator, MutableIterator
+map: Iterator, MutableIterator
+map keys: Iterator, MutableIterator
+array: Iterator
+int array: Iterator, IntIterator
+string: Iterator, CharIterator
+range: Iterator, IntIterator
+sequence: Iterator
+[build, test, ship]
+[BUILD, test, ship, celebrate] [celebrate, ship, test, BUILD]
+13 [72, 233, 33]

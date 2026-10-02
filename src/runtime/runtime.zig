@@ -100,7 +100,11 @@ pub const CollBacking = value_mod.CollBacking;
 pub const CollBackingRef = value_mod.CollBackingRef;
 pub const MapPair = value_mod.MapPair;
 pub const MapStore = value_mod.MapStore;
+pub const mapBorrowDense = value_mod.mapBorrowDense;
+pub const mapLenNoLock = value_mod.mapLenNoLock;
 pub const MapEntries = value_mod.MapEntries;
+pub const MapWalk = value_mod.MapWalk;
+pub const IterSource = value_mod.IterSource;
 pub const lookupNoLock = value_mod.lookupNoLock;
 pub const lookupIntNoLock = value_mod.lookupIntNoLock;
 pub const numericKeyEq = value_mod.numericKeyEq;
@@ -132,6 +136,7 @@ pub const StringData = value_mod.StringData;
 pub const Utf16View = value_mod.Utf16View;
 pub const SbMemo = value_mod.SbMemo;
 pub const sbMemoInvalidate = value_mod.sbMemoInvalidate;
+pub const sbMemoAscii = value_mod.sbMemoAscii;
 pub const sbMemoFor = value_mod.sbMemoFor;
 pub const sbAsciiLen = value_mod.sbAsciiLen;
 pub const decimal = value_mod.decimal;
@@ -181,6 +186,9 @@ pub const pairRefOf = value_mod.pairRefOf;
 pub const comparatorRefOf = value_mod.comparatorRefOf;
 pub const resultRefOf = value_mod.resultRefOf;
 pub const SetData = value_mod.SetData;
+pub const ValueIndex = value_mod.ValueIndex;
+pub const ValueIndexRef = value_mod.ValueIndexRef;
+pub const javaStringHash = value_mod.javaStringHash;
 pub const SetRef = value_mod.SetRef;
 pub const setRefOf = value_mod.setRefOf;
 
@@ -217,6 +225,7 @@ pub const Output = output_mod.Output;
 pub const OutOp = output_mod.OutOp;
 pub const RecordingSink = output_mod.RecordingSink;
 pub const StdoutOutput = output_mod.StdoutOutput;
+pub const forEachEncodedRun = output_mod.forEachEncodedRun;
 pub const CaptureOutput = output_mod.CaptureOutput;
 pub const kotlinFloatToString = output_mod.kotlinFloatToString;
 pub const kotlinDoubleToString = output_mod.kotlinDoubleToString;
@@ -254,6 +263,7 @@ pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;
 pub const ringParkedGates = clock_mod.ringParkedGates;
+pub const parkedRings = clock_mod.parkedRings;
 pub const janitor = @import("janitor.zig");
 
 pub const floatToString = float_fmt_mod.floatToString;
@@ -301,6 +311,12 @@ pub const stackLow = safety_mod.stackLow;
 pub const openStackReserve = safety_mod.openReserve;
 pub const closeStackReserve = safety_mod.closeReserve;
 
+const sort_mod = @import("sort.zig");
+pub const forloop = @import("forloop.zig");
+/// The stable sort the stdlib's sorts run (`sort.zig`).
+pub const stableSort = sort_mod.stableSort;
+pub const SortOrder = sort_mod.Order;
+
 test {
     std.testing.refAllDecls(@This());
     _ = objcell;
@@ -315,6 +331,8 @@ test {
     _ = clock_mod;
     _ = float_fmt_mod;
     _ = safety_mod;
+    _ = sort_mod;
+    _ = forloop;
     _ = threads_mod;
     _ = alloc_track_mod;
     _ = platform;

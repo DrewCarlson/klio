@@ -261,7 +261,8 @@ fn step(ctx: Ctx, kinds: []Kind, cls: []Cls, inst: *const ir.Inst) Allocator.Err
             const native = sigs.r.func_native.len > x.ctor.int() and sigs.r.func_native[x.ctor.int()] != .none;
             return define(kinds, cls, x.dst, T.ty(.object), if (native) .many else .{ .known = x.class });
         },
-        inline .MakeClosure, .FunctionRef, .RPropertyRef, .ClassLiteral, .ClassOf, .NewArray, .ArrayGet, .RCallValue, .UnboxValue => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
+        inline .MakeClosure, .FunctionRef, .RPropertyRef, .ClassLiteral, .ClassOf, .NewArray, .ArrayGet, .RCallValue, .UnboxValue, .IterOpen, .IterGet => |x| return define(kinds, cls, x.dst, T.ty(.object), .many),
+        .IterHas => |x| return define(kinds, cls, x.dst, T.ty(.boolean), .many),
         .BoxValue => |x| return define(kinds, cls, x.dst, T.ty(.object), .{ .known = x.class }),
         inline .RInstanceOf, .InstanceOfDyn, .Not => |x| return define(kinds, cls, x.dst, T.ty(.boolean), .many),
         .RCast => |x| {

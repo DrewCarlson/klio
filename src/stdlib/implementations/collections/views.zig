@@ -1,4 +1,4 @@
-//! Live map-view and `subList` write-through synchronisation.
+//! Map iterators, and `subList` write-through synchronisation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -14,63 +14,31 @@ const common_mod = @import("common.zig");
 const eqBoxed = common_mod.eqBoxed;
 const thrown = common_mod.thrown;
 
-const MapView = struct { entries: MapEntries, kind: MapViewKind };
-const MapViewRef = struct { items: ValueList, backing: MapView };
-
-fn mapBackingOf(receiver: Value) ?MapView {
-    const cell = switch (receiver) {
-        .Set => |s| s.backing,
-        .List => |l| l.backing,
-        else => null,
-    } orelse return null;
-    return switch (cell.data) {
-        .map => |m| .{ .entries = m.entries, .kind = m.kind },
-        else => null,
+/// An iterator that walks map store `entries`'s slots, yielding `kind` of each entry: its
+/// keys, its values, or its nodes' entry objects. A mutable map's (`mutable`, not frozen by a
+/// builder) removes through `remove` and fails fast once the map changes otherwise.
+pub fn mapIterator(a: Allocator, entries: MapEntries, kind: MapViewKind, mutable: bool) Error!Value {
+    const at = blk: {
+        const g = entries.borrow();
+        defer g.deinit();
+        const st = g.get();
+        break :blk .{ st.head, st.epoch, st.mod_count, st.len() == 0 };
     };
-}
-
-pub fn syncMapView(a: Allocator, receiver: Value) void {
-    _ = a;
-    const backing = mapBackingOf(receiver) orelse return;
-    const items_vl = switch (receiver) {
-        .Set => |s| s.items,
-        .List => |l| l.items,
-        else => return,
-    };
-    const view: MapViewRef = .{ .items = items_vl, .backing = backing };
-    const items_g = view.items.borrow();
-    defer items_g.deinit();
-    const items = items_g.get().items;
-    const kind = view.backing.kind;
-    const entries_g = view.backing.entries.borrowMut();
-    defer entries_g.deinit();
-    const entries = entries_g.get();
-    var j: usize = 0;
-    var w: usize = 0;
-    var r: usize = 0;
-    while (r < entries.pairs.items.len) : (r += 1) {
-        const kv = entries.pairs.items[r];
-        const proj = switch (kind) {
-            .Values => kv.value,
-            else => kv.key,
-        };
-        var matched = false;
-        if (j < items.len) {
-            const it = items[j];
-            const target = switch (kind) {
-                .Entries => if (it == .MapEntry) it.MapEntry.key.asPtrConst().* else it,
-                else => it,
-            };
-            matched = eqBoxed(&proj, &target);
-        }
-        if (matched) {
-            entries.pairs.items[w] = kv;
-            w += 1;
-            j += 1;
-        }
-    }
-    entries.pairs.shrinkRetainingCapacity(w);
-    entries.forgetHashes();
+    const mc = at[2].get();
+    const live = mutable and !(if (mc) |c| c.cell.data.frozen() else false);
+    return Value.newIterator(a, .{
+        .items = try runtime.ObjRef(std.ArrayList(Value)).init(a, .empty),
+        .prim = null,
+        .mod_count = .from(if (mc) |c| c.clone() else null),
+        .mutable = live,
+        .pos = at[0],
+        .exp_mod = if (mc) |c| c.cell.data.load() else 0,
+        .map_store = .from(entries.clone()),
+        .source = .collection,
+        .map_kind = kind,
+        .map_epoch = at[1],
+        .ended = at[3],
+    });
 }
 
 pub fn sublistBackingOf(receiver: Value) ?*runtime.CollBackingRef.Cell {
@@ -136,39 +104,23 @@ pub fn sublistComodGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     return try thrown(a, "kotlin.ConcurrentModificationException", null);
 }
 
-/// After a structural map change every `Map.Entry` access throws CME; before
-/// that the value box is refreshed so non-structural updates show through.
+/// A live `Map.Entry` read: its value box brought up to its node's value while the node is in
+/// the map, so a change through the map shows; a `buildMap` builder's entry throws CME once
+/// the map changed structurally (`MapEntryData.read`).
 pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     if (v.* != .MapEntry) return null;
     const me = v.MapEntry;
     const entries = me.backing.get() orelse return null;
-    var stale = false;
-    var live: ?Value = null;
-    {
+    const r = blk: {
         const g = entries.borrow();
         defer g.deinit();
-        if (g.get().mod_count.get()) |cell| stale = cell.cell.data.load() != me.exp_mod;
-        if (!stale) {
-            for (g.get().pairs.items) |*slot| {
-                if (Value.structuralEq(&slot.key, me.key.asPtrConst())) {
-                    live = slot.value;
-                    break;
-                }
-            }
-        }
-    }
-    if (stale) return try thrown(a, "kotlin.ConcurrentModificationException", null);
-    // The box is a cell of its own: the refreshed value is stored under its lock.
-    if (live) |lv| {
-        const vg = me.value.borrowMut();
-        defer vg.deinit();
-        if (!Value.structuralEq(vg.get(), &lv)) {
-            if (runtime.reclaimEnabled()) {
-                lv.retain();
-                vg.get().release(a);
-            }
-            vg.get().* = lv;
-        }
-    }
+        break :blk me.read(g.get());
+    };
+    const live: ?Value = switch (r) {
+        .stale => return try thrown(a, "kotlin.ConcurrentModificationException", null),
+        .live => |x| x,
+        .detached => null,
+    };
+    if (live) |lv| me.putValue(lv);
     return null;
 }

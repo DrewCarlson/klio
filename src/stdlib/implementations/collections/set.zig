@@ -16,14 +16,12 @@ const containsBoxedH = common_mod.containsBoxedH;
 const indexOfBoxedH = common_mod.indexOfBoxedH;
 const invoke = common_mod.invoke;
 const iterableItemsCtx = common_mod.iterableItemsCtx;
-const listLen = common_mod.listLen;
 const listLenOf = common_mod.listLenOf;
-const makeList = common_mod.makeList;
 const makeListVL = common_mod.makeListVL;
 const makeSetVL = common_mod.makeSetVL;
-const mapViewAddGuard = common_mod.mapViewAddGuard;
 const ok = common_mod.ok;
 const readOnlyMutationGuard = common_mod.readOnlyMutationGuard;
+const recvSet = common_mod.recvSet;
 const recvSetItems = common_mod.recvSetItems;
 const snapshotItems = common_mod.snapshotItems;
 const structuralBump = common_mod.structuralBump;
@@ -34,13 +32,13 @@ const collToString = list_mod.collToString;
 const withIndexImpl = list_mod.withIndexImpl;
 
 const list_transforms_mod = @import("list_transforms.zig");
-const sortListHostAware = list_transforms_mod.sortListHostAware;
 
 const sequence_mod = @import("sequence.zig");
 const materialiseSequence = sequence_mod.materialiseSequence;
 
 const views_mod = @import("views.zig");
-const syncMapView = views_mod.syncMapView;
+const map_mod = @import("map.zig");
+const hashing = @import("hashing.zig");
 
 fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
@@ -48,24 +46,23 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    var out: std.ArrayList(Value) = .empty;
-    try appendVL(&out, a, it);
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
+    const own = try snapshotItems(a, it);
+    defer if (runtime.freeScratch()) a.free(own);
+    var seen = hashing.Seen.init();
+    defer seen.deinit(a);
+    if (try seenAddAll(ctx, &seen, own)) |e| return e;
     switch (arg) {
         .List => |l| {
             const src = try snapshotItems(a, l.items);
             defer if (runtime.freeScratch()) a.free(src);
-            for (src) |v| {
-                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
-            }
+            if (try seenAddAll(ctx, &seen, src)) |e| return e;
         },
-        .Set => |s| {
-            const src = try snapshotItems(a, s.items);
+        .Set => |st| {
+            const src = try snapshotItems(a, st.dense());
             defer if (runtime.freeScratch()) a.free(src);
-            for (src) |v| {
-                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
-            }
+            if (try seenAddAll(ctx, &seen, src)) |e| return e;
         },
         .Array, .Range, .Sequence => {
             const xs = switch (try iterableItemsCtx(ctx, arg, what)) {
@@ -73,17 +70,40 @@ fn setPlusImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {
                 .err => |e| return e,
             };
             defer if (runtime.freeScratch()) a.free(xs);
-            for (xs) |v| {
-                if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
-            }
+            if (try seenAddAll(ctx, &seen, xs)) |e| return e;
         },
-        else => {
-            if (!try containsBoxedH(ctx.host, ctx.out, out.items, &arg)) try out.append(a, arg);
-        },
+        else => if (try seenAddAll(ctx, &seen, &.{arg})) |e| return e,
     }
-    // `out` holds borrowed elements, so retain each before the set adopts them.
-    if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
+    return ok(try seen.intoSet(a, false));
+}
+
+/// Keeps each of `xs` in `seen` unless an equal element is kept: the exception when a
+/// `hashCode` override throws.
+fn seenAddAll(ctx: *CallCtx, seen: *hashing.Seen, xs: []const Value) Error!?EvalResult {
+    for (xs) |v| switch (try seen.add(ctx.host, ctx.out, ctx.allocator, v)) {
+        .added, .present => {},
+        .thrown => |e| return e,
+    };
+    return null;
+}
+
+/// The elements of `xs` as a dedupe to test membership against.
+fn seenOf(ctx: *CallCtx, xs: []const Value) Error!union(enum) { seen: hashing.Seen, thrown: EvalResult } {
+    var seen = hashing.Seen.init();
+    if (try seenAddAll(ctx, &seen, xs)) |e| {
+        seen.deinit(ctx.allocator);
+        return .{ .thrown = e };
+    }
+    return .{ .seen = seen };
+}
+
+/// Whether `seen` holds an element equal to `v`.
+fn seenHas(ctx: *CallCtx, seen: *hashing.Seen, v: Value) Error!union(enum) { yes: bool, thrown: EvalResult } {
+    return switch (try seen.find(ctx.host, ctx.out, ctx.allocator, v)) {
+        .at => .{ .yes = true },
+        .none => .{ .yes = false },
+        .thrown => |e| .{ .thrown = e },
+    };
 }
 
 pub fn coll_set_plus(ctx: *CallCtx) Error!EvalResult {
@@ -105,7 +125,7 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) removals.deinit(a);
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
-        .Set => |s| try appendVL(&removals, a, s.items),
+        .Set => |s| try appendVL(&removals, a, s.dense()),
         .Array, .Range, .Sequence => {
             const xs = switch (try iterableItemsCtx(ctx, arg, "minus")) {
                 .items => |x| x,
@@ -116,14 +136,20 @@ pub fn coll_set_minus(ctx: *CallCtx) Error!EvalResult {
         },
         else => try removals.append(a, arg),
     }
+    var gone = switch (try seenOf(ctx, removals.items)) {
+        .seen => |x| x,
+        .thrown => |e| return e,
+    };
+    defer gone.deinit(a);
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
-    for (src) |v| {
-        if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
-    }
+    for (src) |v| switch (try seenHas(ctx, &gone, v)) {
+        .yes => |y| if (!y) try out.append(a, v),
+        .thrown => |e| return e,
+    };
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
+    return ok(try Value.newSet(a, .{ .elems = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
 pub fn coll_set_subtract(ctx: *CallCtx) Error!EvalResult {
     return coll_set_minus(ctx);
@@ -141,126 +167,97 @@ pub fn coll_set_intersect(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) other.deinit(a);
     switch (arg) {
         .List => |l| try appendVL(&other, a, l.items),
-        .Set => |s| try appendVL(&other, a, s.items),
-        else => return typeErr("intersect requires a collection"),
+        .Set => |s| try appendVL(&other, a, s.dense()),
+        else => switch (try iterableItemsCtx(ctx, arg, "Set.intersect")) {
+            .items => |x| try other.appendSlice(a, x),
+            .err => |e| return e,
+        },
     }
+    var kept = switch (try seenOf(ctx, other.items)) {
+        .seen => |x| x,
+        .thrown => |e| return e,
+    };
+    defer kept.deinit(a);
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
-    for (src) |v| {
-        if (try containsBoxedH(ctx.host, ctx.out, other.items, &v)) try out.append(a, v);
-    }
+    for (src) |v| switch (try seenHas(ctx, &kept, v)) {
+        .yes => |y| if (y) try out.append(a, v),
+        .thrown => |e| return e,
+    };
     if (runtime.reclaimEnabled()) for (out.items) |e| e.retain();
-    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, out), .mutable = false, .backing = null }));
+    return ok(try Value.newSet(a, .{ .elems = try ValueList.init(a, out), .mutable = false, .backing = null }));
 }
 
 pub fn coll_set_size(ctx: *CallCtx) Error!EvalResult {
-    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.size")) {
-        .items => |x| x,
+    const st = switch (try recvSet(ctx.allocator, ctx.args, "Set.size")) {
+        .set => |x| x,
         .err => |e| return e,
     };
-    return ok(Value.newInt(@intCast(listLen(it))));
+    return ok(Value.newInt(@intCast(st.len())));
 }
 pub fn coll_set_is_empty(ctx: *CallCtx) Error!EvalResult {
-    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.isEmpty")) {
-        .items => |x| x,
+    const st = switch (try recvSet(ctx.allocator, ctx.args, "Set.isEmpty")) {
+        .set => |x| x,
         .err => |e| return e,
     };
-    return ok(.{ .Bool = listLen(it) == 0 });
+    return ok(.{ .Bool = st.len() == 0 });
 }
 pub fn coll_set_is_not_empty(ctx: *CallCtx) Error!EvalResult {
-    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.isNotEmpty")) {
-        .items => |x| x,
+    const st = switch (try recvSet(ctx.allocator, ctx.args, "Set.isNotEmpty")) {
+        .set => |x| x,
         .err => |e| return e,
     };
-    return ok(.{ .Bool = listLen(it) != 0 });
+    return ok(.{ .Bool = st.len() != 0 });
 }
 pub fn coll_set_contains(ctx: *CallCtx) Error!EvalResult {
-    const it = switch (try recvSetItems(ctx.allocator, ctx.args, "Set.contains")) {
-        .items => |x| x,
+    switch (try recvSet(ctx.allocator, ctx.args, "Set.contains")) {
+        .set => {},
         .err => |e| return e,
-    };
+    }
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    const items = try snapshotItems(ctx.allocator, it);
-    defer if (runtime.freeScratch()) ctx.allocator.free(items);
-    return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
+    const l = try hashing.setFind(ctx.host, ctx.out, ctx.allocator, ctx.args[0].Set, &needle);
+    return switch (l.found) {
+        .thrown => |e| e,
+        .at => ok(.{ .Bool = true }),
+        .none => ok(.{ .Bool = false }),
+    };
 }
 
-pub fn coll_set_sorted(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const it = switch (try recvSetItems(a, ctx.args, "Set.sorted")) {
-        .items => |x| x,
-        .err => |e| return e,
-    };
-    const copy = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortListHostAware(ctx, copy)) |e| return e;
-    return ok(try makeList(a, copy, false));
-}
-pub fn coll_set_sorted_descending(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const v = try coll_set_sorted(ctx);
-    if (v == .err) return v;
-    const items = try snapshotItems(a, v.ok.List.items);
-    defer if (runtime.freeScratch()) a.free(items);
-    std.mem.reverse(Value, items);
-    return ok(try makeList(a, items, false));
-}
 pub fn coll_set_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Set.toString");
 }
 
 pub fn coll_mut_set_add(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
-    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
-    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.add")) {
-        .items => |x| x,
+    switch (try recvSet(a, ctx.args, "MutableSet.add")) {
+        .set => {},
         .err => |e| return e,
-    };
+    }
     if (ctx.args.len < 2) return arityErr("add requires an argument");
-    const arg = ctx.args[1];
-    // Snapshot for the membership check: dispatching `equals` re-enters the VM,
-    // which must not happen under the mutable borrow.
-    const snap = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(snap);
-    if (try containsBoxedH(ctx.host, ctx.out, snap, &arg)) return ok(.{ .Bool = false });
-    const g = it.borrowMut();
-    defer g.deinit();
-    if (runtime.reclaimEnabled()) arg.retain();
-    try g.get().append(a, arg);
-    return ok(.{ .Bool = true });
+    return switch (try hashing.setAdd(ctx.host, ctx.out, a, ctx.args[0].Set, ctx.args[1])) {
+        .thrown => |e| e,
+        .done => |added| ok(.{ .Bool = added }),
+    };
 }
 pub fn coll_mut_set_remove(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
-    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.remove")) {
-        .items => |x| x,
+    switch (try recvSet(a, ctx.args, "MutableSet.remove")) {
+        .set => {},
         .err => |e| return e,
-    };
-    if (ctx.args.len < 2) return arityErr("remove requires an argument");
-    const arg = ctx.args[1];
-    // Found on a snapshot: dispatching `equals` re-enters the VM, which must
-    // not happen under the mutable borrow.
-    const snap = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(snap);
-    const at = try indexOfBoxedH(ctx.host, ctx.out, snap, &arg);
-    var removed = false;
-    if (at) |pos| {
-        const g = it.borrowMut();
-        defer g.deinit();
-        if (pos < g.get().items.len) {
-            const gone = g.get().orderedRemove(pos);
-            if (runtime.reclaimEnabled()) gone.release(a);
-            removed = true;
-        }
     }
-    if (removed) syncMapView(a, ctx.args[0]);
+    if (ctx.args.len < 2) return arityErr("remove requires an argument");
+    const removed = switch (try hashing.setRemove(ctx.host, ctx.out, a, ctx.args[0].Set, ctx.args[1])) {
+        .thrown => |e| return e,
+        .done => |x| x,
+    };
     return ok(.{ .Bool = removed });
 }
 pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
@@ -278,7 +275,6 @@ pub fn coll_mut_set_clear(ctx: *CallCtx) Error!EvalResult {
         if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
-    syncMapView(a, ctx.args[0]);
     return ok(Value.Unit);
 }
 
@@ -286,7 +282,7 @@ pub fn collectColl(a: Allocator, v: ?Value) Error!?[]Value {
     if (v) |val| {
         switch (val) {
             .List => |l| return try snapshotItems(a, l.items),
-            .Set => |s| return try snapshotItems(a, s.items),
+            .Set => |s| return try snapshotItems(a, s.dense()),
             .Array => |arr| return try arr.snapshot(a),
             else => {},
         }
@@ -303,7 +299,7 @@ fn isPredicateArg(v: Value) bool {
     };
 }
 
-fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, recv: Value, retain: bool) Error!EvalResult {
+fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, retain: bool) Error!EvalResult {
     const a = ctx.allocator;
     const pred = ctx.args[1];
     const snap = try snapshotItems(a, items);
@@ -337,19 +333,18 @@ fn mutCollRemoveRetainPred(ctx: *CallCtx, items: ValueList, recv: Value, retain:
         list.shrinkRetainingCapacity(w);
         changed = list.items.len != before;
     }
-    if (changed) syncMapView(a, recv);
     return ok(.{ .Bool = changed });
 }
 
-pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: []const u8, retain: bool, allow_array: bool) Error!EvalResult {
+pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, what: []const u8, retain: bool, allow_array: bool) Error!EvalResult {
     const a = ctx.allocator;
     const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
-    if (isPredicateArg(arg)) return mutCollRemoveRetainPred(ctx, items, recv, retain);
+    if (isPredicateArg(arg)) return mutCollRemoveRetainPred(ctx, items, retain);
     _ = allow_array; // `removeAll`/`retainAll` accept an Array overload too.
     const other = blk: {
         switch (arg) {
             .List => |l| break :blk try snapshotItems(a, l.items),
-            .Set => |s| break :blk try snapshotItems(a, s.items),
+            .Set => |s| break :blk try snapshotItems(a, s.dense()),
             .Array => |arr| break :blk try arr.snapshot(a),
             else => break :blk switch (try iterableItemsCtx(ctx, arg, what)) {
                 .items => |x| x,
@@ -363,8 +358,16 @@ pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: [
     defer if (runtime.freeScratch()) a.free(snap);
     const keep_flags = try a.alloc(bool, snap.len);
     defer if (runtime.freeScratch()) a.free(keep_flags);
+    var others = switch (try seenOf(ctx, other)) {
+        .seen => |x| x,
+        .thrown => |e| return e,
+    };
+    defer others.deinit(a);
     for (snap, 0..) |v, i| {
-        const present = try containsBoxedH(ctx.host, ctx.out, other, &v);
+        const present = switch (try seenHas(ctx, &others, v)) {
+            .yes => |y| y,
+            .thrown => |e| return e,
+        };
         keep_flags[i] = if (retain) present else !present;
     }
     var changed = false;
@@ -387,7 +390,6 @@ pub fn mutCollRemoveRetain(ctx: *CallCtx, items: ValueList, recv: Value, what: [
         list.shrinkRetainingCapacity(w);
         changed = list.items.len != before;
     }
-    if (changed) syncMapView(a, recv);
     return ok(.{ .Bool = changed });
 }
 
@@ -400,7 +402,7 @@ pub fn coll_mut_set_remove_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, true);
+    return mutCollRemoveRetain(ctx, it, "removeAll", false, true);
 }
 pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
@@ -411,21 +413,27 @@ pub fn coll_mut_set_retain_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return mutCollRemoveRetain(ctx, it, ctx.args[0], "retainAll", true, true);
+    return mutCollRemoveRetain(ctx, it, "retainAll", true, true);
 }
 
 pub fn coll_set_contains_all(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    const it = switch (try recvSetItems(a, ctx.args, "Set.containsAll")) {
+    switch (try recvSet(a, ctx.args, "Set.containsAll")) {
+        .set => {},
+        .err => |e| return e,
+    }
+    if (ctx.args.len < 2) return arityErr("containsAll requires a collection");
+    const other = switch (try iterableItemsCtx(ctx, ctx.args[1], "Set.containsAll")) {
         .items => |x| x,
         .err => |e| return e,
     };
-    const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
-        return typeErr("containsAll requires a collection");
-    const items = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
-        if (!try containsBoxedH(ctx.host, ctx.out, items, &o)) return ok(.{ .Bool = false });
+        const l = try hashing.setFind(ctx.host, ctx.out, a, ctx.args[0].Set, &o);
+        switch (l.found) {
+            .thrown => |e| return e,
+            .none => return ok(.{ .Bool = false }),
+            .at => {},
+        }
     }
     return ok(.{ .Bool = true });
 }
@@ -452,7 +460,7 @@ pub fn coll_set_to_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSetVL(a, it, false));
+    return ok(try copySet(a, it, false));
 }
 pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -460,7 +468,20 @@ pub fn coll_set_to_mutable_set_(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return ok(try makeSetVL(a, it, true));
+    return ok(try copySet(a, it, true));
+}
+
+/// A new set of a set's elements, which are distinct already.
+fn copySet(a: Allocator, it: ValueList, mutable: bool) Error!Value {
+    var copy: std.ArrayList(Value) = .empty;
+    try appendVL(&copy, a, it);
+    if (runtime.reclaimEnabled()) for (copy.items) |e| e.retain();
+    return Value.newSet(a, .{
+        .elems = try ValueList.init(a, copy),
+        .mutable = mutable,
+        .backing = null,
+        .mod_count = try common_mod.modCountFor(a, mutable),
+    });
 }
 pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -472,14 +493,13 @@ pub fn coll_set_with_index(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
-    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     const _szb = listLenOf(&ctx.args[0]);
     defer structuralBump(&ctx.args[0], _szb);
     const a = ctx.allocator;
-    const it = switch (try recvSetItems(a, ctx.args, "MutableSet.addAll")) {
-        .items => |x| x,
+    switch (try recvSet(a, ctx.args, "MutableSet.addAll")) {
+        .set => {},
         .err => |e| return e,
-    };
+    }
     const arg = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
     const to_add = if (arg == .Sequence)
         switch (try materialiseSequence(a, ctx.host, ctx.out, arg)) {
@@ -491,27 +511,10 @@ pub fn coll_mut_set_add_all(ctx: *CallCtx) Error!EvalResult {
             .items => |x| x,
             .err => |e| return e,
         };
-    // Collect the new items under a snapshot, key `equals` re-entering the VM,
-    // then append them in one borrow.
-    const initial = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(initial);
-    var seen: std.ArrayList(Value) = .empty;
-    defer seen.deinit(a);
-    try seen.appendSlice(a, initial);
-    var new_items: std.ArrayList(Value) = .empty;
-    defer new_items.deinit(a);
-    for (to_add) |v| {
-        if (!try containsBoxedH(ctx.host, ctx.out, seen.items, &v)) {
-            try seen.append(a, v);
-            try new_items.append(a, v);
-        }
-    }
-    if (new_items.items.len == 0) return ok(.{ .Bool = false });
-    const g = it.borrowMut();
-    defer g.deinit();
-    for (new_items.items) |v| {
-        if (runtime.reclaimEnabled()) v.retain();
-        try g.get().append(a, v);
-    }
-    return ok(.{ .Bool = true });
+    var changed = false;
+    for (to_add) |v| switch (try hashing.setAdd(ctx.host, ctx.out, a, ctx.args[0].Set, v)) {
+        .thrown => |e| return e,
+        .done => |added| changed = changed or added,
+    };
+    return ok(.{ .Bool = changed });
 }

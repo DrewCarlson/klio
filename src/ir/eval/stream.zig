@@ -223,6 +223,9 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                 .native => opNative,
                 .array_get => opArrayGet,
                 .array_set => opArraySet,
+                .iter_open => opIterOpen,
+                .iter_has => opIterHas,
+                .iter_get => opIterGet,
                 .load_object => opLoadObject,
                 .not => opNot,
                 .not_null => opNotNull,
@@ -1088,6 +1091,10 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                 .map_size => @intFromPtr(&IntrinsicEntry(.map_size).call),
                 .sb_append => @intFromPtr(&IntrinsicEntry(.sb_append).call),
                 .sb_length => @intFromPtr(&IntrinsicEntry(.sb_length).call),
+                .iter_has_next => @intFromPtr(&IntrinsicEntry(.iter_has_next).call),
+                .iter_next => @intFromPtr(&IntrinsicEntry(.iter_next).call),
+                .entry_key => @intFromPtr(&IntrinsicEntry(.entry_key).call),
+                .entry_value => @intFromPtr(&IntrinsicEntry(.entry_value).call),
                 else => unreachable,
             };
         }
@@ -1103,7 +1110,10 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                         .map_size => intrinsics.mapSize(args[0]),
                         .sb_append => intrinsics.sbAppend(c.allocator, args[0], &args[1]),
                         .sb_length => intrinsics.sbLength(args[0]),
-                        else => intrinsics.run(k, c.allocator, module, args[0..comptime k.arity()]),
+                        else => blk: {
+                            var got: Value = undefined;
+                            break :blk if (intrinsics.run(k, c.allocator, module, args[0..comptime k.arity()], &got)) got else null;
+                        },
                     }) orelse return false;
                     dst.* = v;
                     return true;
@@ -1328,6 +1338,10 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                 if (!is_call) keepVcallee(c, frame, code, pc, null, nid);
                 return runNative(c, frame, code, pc, blk, nid, op_len);
             };
+            if (!is_call and fid == NO_TARGET) if (hostSlotNative(frame, code[pc + 2], code[pc + 3])) |nid| {
+                keepVcallee(c, frame, code, pc, null, nid);
+                return runNative(c, frame, code, pc, blk, nid, op_len);
+            };
             const inst = instAt(frame, blk, idx);
             frame.at(@enumFromInt(blk), idx);
             const r = ev_inst.execInst(H, c.allocator, frame, inst, c.host) catch return leave(c, .oom, frame, blk);
@@ -1522,10 +1536,11 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                 const run_ = argRun(frame, @enumFromInt(code[pc + 3]), code[pc + 4]);
                 if (!reclaim and !c.ev.hooks) {
                     const k = intrinsics.cached(frame.module, @enumFromInt(code[pc + 2]));
-                    if (k != .none) if (intrinsics.run(k, c.allocator, frame.module, run_)) |v| {
+                    var v: Value = undefined;
+                    if (k != .none and intrinsics.run(k, c.allocator, frame.module, run_, &v)) {
                         put(c, frame, regs, code[pc + 5], v);
                         return next(c, frame, regs, code, pc + 7, blk);
-                    };
+                    }
                 }
                 const direct = c.host.callNativeDirect(c.allocator, @enumFromInt(code[pc + 2]), run_) catch return leave(c, .oom, frame, blk);
                 if (direct) |res| {
@@ -1593,6 +1608,37 @@ pub fn Stream(comptime H: type, comptime reclaim: bool) type {
                 }
             };
             return toCold(.array_get_wide, c, frame, regs, code, pc, blk);
+        }
+
+        /// A `for` loop's start: its stamp, a Long, when the host can run it by position.
+        fn opIterOpen(c: *Ctx, frame: *Frame, regs: [*]Value, code: [*]const u32, pc: usize, blk: u32) callconv(handler_cc) Exit {
+            const src = regs[code[pc + 3]];
+            put(c, frame, regs, code[pc + 2], if (runtime.forloop.open(&src)) |at| .{ .Long = at } else .Null);
+            return next(c, frame, regs, code, pc + 4, blk);
+        }
+
+        fn opIterHas(c: *Ctx, frame: *Frame, regs: [*]Value, code: [*]const u32, pc: usize, blk: u32) callconv(handler_cc) Exit {
+            const src = regs[code[pc + 3]];
+            const idx = regs[code[pc + 4]];
+            const at = regs[code[pc + 5]];
+            if (idx != .Int or at != .Long) return slow(6, c, frame, regs, code, pc, blk);
+            put(c, frame, regs, code[pc + 2], .{ .Bool = runtime.forloop.has(&src, idx.Int, at.Long) });
+            return next(c, frame, regs, code, pc + 6, blk);
+        }
+
+        /// The loop's element; a change since it began takes the arm, which throws.
+        fn opIterGet(c: *Ctx, frame: *Frame, regs: [*]Value, code: [*]const u32, pc: usize, blk: u32) callconv(handler_cc) Exit {
+            const src = regs[code[pc + 3]];
+            const idx = regs[code[pc + 4]];
+            const at = regs[code[pc + 5]];
+            if (idx == .Int and at == .Long) switch (runtime.forloop.get(&src, idx.Int, at.Long)) {
+                .elem => |v| {
+                    put(c, frame, regs, code[pc + 2], v);
+                    return next(c, frame, regs, code, pc + 6, blk);
+                },
+                .changed => {},
+            };
+            return slow(6, c, frame, regs, code, pc, blk);
         }
 
         /// `array_get` on any other array or a string, then the instruction's arm.
@@ -1927,6 +1973,21 @@ inline fn virtualTarget(frame: *const Frame, slot: u32, args: u32) ?u32 {
     return f.int();
 }
 
+/// The native the VM answers slot `slot` with for the receiver at `args`, a host value whose
+/// class leaves the slot to the kind of value it is (an iterator's `hasNext`, an entry's
+/// `key`), as the arm's dispatch finds it (`ev_resolved.dispatchRun`); null for any other
+/// receiver. It is the same for every receiver of the class, which the site may keep.
+inline fn hostSlotNative(frame: *const Frame, slot: u32, args: u32) ?ir.NativeId {
+    const r = frame.module.resolved orelse return null;
+    if (parent.call_hooks_on) return null;
+    if (slot >= r.host_slot.len or r.host_slot[slot] == .none) return null;
+    const recv = &frame.regs.ptr[args];
+    if (recv.* == .Instance) return null;
+    const cls = siteClass(frame, recv) orelse return null;
+    if (ir.resolved.slotTarget(r, ir.ClassId.from(cls), ir.MethodSlotId.from(slot)) != null) return null;
+    return r.host_slot[slot];
+}
+
 /// The class `ir.resolved.classOf` gives the receiver `v`, where it reads with no call or borrow,
 /// as the key of a `vcall` site's cache; null for a receiver whose call always resolves in full:
 /// a null, a function value or a property name (which answer some slots themselves), an
@@ -1966,10 +2027,11 @@ noinline fn hostCall(comptime H: type, allocator: Allocator, frame: *Frame, host
     const run = argRun(frame, @enumFromInt(args), n);
     if (!reclaim and !frame.tls.hooks) {
         const k = intrinsics.cached(frame.module, nid);
-        if (k != .none) if (intrinsics.run(k, allocator, frame.module, run)) |v| {
+        var v: Value = undefined;
+        if (k != .none and intrinsics.run(k, allocator, frame.module, run, &v)) {
             writeFastR(frame, @enumFromInt(dst), v, allocator, reclaim);
             return null;
-        };
+        }
     }
     const direct: ?EvalResult = if (comptime @hasDecl(H, "callNativeDirect")) try host.callNativeDirect(allocator, nid, run) else null;
     const res = if (direct) |d| d else if (comptime @hasDecl(H, "callNativeSite"))

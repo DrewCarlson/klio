@@ -234,6 +234,11 @@ klio_value klio_r_lambda_text(const char *stem, klio_value v);
 klio_value klio_r_array_get(klio_value a, int32_t index);
 void       klio_r_array_set(klio_value a, int32_t index, klio_value v);
 klio_value klio_r_new_array(uint32_t cls, const klio_value *argv, uint32_t argc);
+/* A `for` loop by position over a list, set, array or string: the stamp (null for any
+ * other value), whether position `idx` has an element, and the element. */
+klio_value klio_r_iter_open(klio_value src);
+int32_t    klio_r_iter_has(klio_value src, int32_t idx, klio_value stamp);
+klio_value klio_r_iter_get(klio_value src, int32_t idx, klio_value stamp);
 
 /* Raises the exception of kind `which` with `message` (a String or null). */
 KLIO_NORETURN void klio_r_raise(uint32_t which, klio_value message);

@@ -277,8 +277,24 @@ pub fn evalClosure(
     var c = captures;
     defer a.deinit(allocator);
     defer c.deinit(allocator);
-    const ar = try ArgArea.push(ev_state.evtlsPtr(), a.items, c.items);
-    const np = a.items.len;
+    return evalSlices(H, allocator, module, owning, func, a.items, c.items, closure, host);
+}
+
+/// `evalClosure` over parameter and capture slices, which the argument area copies before the
+/// body runs: a host's call into Kotlin needs no list of its own.
+pub fn evalSlices(
+    comptime H: type,
+    allocator: Allocator,
+    module: *const Module,
+    owning: ?*const Module,
+    func: *const Func,
+    args: []const Value,
+    captures: []const Value,
+    closure: ?runtime.IrClosureRef,
+    host: *H,
+) Allocator.Error!EvalResult {
+    const ar = try ArgArea.push(ev_state.evtlsPtr(), args, captures);
+    const np = args.len;
     return evalView(H, allocator, module, owning, func, ar.vals[0..np], ar.vals[np..], ar.mark, closure, host);
 }
 

@@ -1799,19 +1799,67 @@ fn charIndexToByte(s: []const u8, n: i64) usize {
     return s.len;
 }
 
+/// `byteToChar` over a string the host holds: the byte offset itself when every byte is
+/// ASCII, else counted on from the string's cursor (`StringData.cursorGet`), which it moves,
+/// so the offsets of successive matches convert in one pass over the input.
+fn byteToCharIn(sd: *const runtime.StringData, byte: usize) i64 {
+    const s = sd.bytes;
+    if (sd.ascii) return @intCast(@min(byte, s.len));
+    var count: i64 = 0;
+    var i: usize = 0;
+    const c = sd.cursorGet();
+    if (c.byte_pos <= byte and c.byte_pos <= s.len) {
+        count = @intCast(c.u16_pos);
+        i = c.byte_pos;
+    }
+    const end = @min(byte, s.len);
+    while (i < end) {
+        const u = unitAt(s, i);
+        if (i + u.bytes > end) break;
+        count += u.units;
+        i += u.bytes;
+    }
+    sd.cursorSet(@intCast(count), i);
+    return count;
+}
+
+/// The byte offset of UTF-16 index `n` of a string the host holds, counted as
+/// `byteToCharIn` counts: an index inside a surrogate pair is the pair's start.
+fn charIndexToByteIn(sd: *const runtime.StringData, n: i64) usize {
+    const s = sd.bytes;
+    if (n <= 0) return 0;
+    if (sd.ascii) return @intCast(@min(n, @as(i64, @intCast(s.len))));
+    var count: i64 = 0;
+    var i: usize = 0;
+    const c = sd.cursorGet();
+    if (c.u16_pos <= n and c.byte_pos <= s.len) {
+        count = @intCast(c.u16_pos);
+        i = c.byte_pos;
+    }
+    while (i < s.len and count < n) {
+        const u = unitAt(s, i);
+        if (count + u.units > n) break;
+        count += u.units;
+        i += u.bytes;
+    }
+    sd.cursorSet(@intCast(count), i);
+    return i;
+}
+
 fn buildMatch(
     allocator: std.mem.Allocator,
     r: ObjRef(RegexData),
     input: StringRef,
     caps: []const Capture,
 ) !MatchData {
-    const s = input.asPtrConst().bytes;
+    const sd = input.asPtrConst();
+    const s = sd.bytes;
     var groups = try allocator.alloc(?MatchGroupData, caps.len);
     for (caps, 0..) |c, i| {
         if (c.start) |start_b| {
             const end_b = c.end orelse start_b;
-            const start = byteToChar(s, start_b);
-            const end_char = byteToChar(s, end_b);
+            const start = byteToCharIn(sd, start_b);
+            const end_char = byteToCharIn(sd, end_b);
             const value_bytes = s[start_b..end_b];
             const end_inclusive: i64 = if (end_char == 0 and start == 0 and value_bytes.len == 0)
                 -1
@@ -1975,7 +2023,7 @@ fn optionsToFlags(opt_arg: ?Value) Flags {
     const arg = opt_arg orelse return flags;
     switch (arg) {
         .Set => |s| {
-            const g = s.items.borrow();
+            const g = s.dense().borrow();
             defer g.deinit();
             for (g.get().items) |it| applyRegexOption(it, &flags);
         },
@@ -2015,7 +2063,7 @@ pub fn regex_ctor(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
                     try items.append(ctx.allocator, oa);
                 },
                 .Set => |st| {
-                    const g = st.items.borrow();
+                    const g = st.dense().borrow();
                     defer g.deinit();
                     for (g.get().items) |v| {
                         v.retain();
@@ -2052,7 +2100,7 @@ pub fn regex_options(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             try items.append(ctx.allocator, v);
         }
     }
-    return ok(try Value.newSet(ctx.allocator, .{ .items = try ValueList.init(ctx.allocator, items), .mutable = false, .backing = null }));
+    return ok(try Value.newSet(ctx.allocator, .{ .elems = try ValueList.init(ctx.allocator, items), .mutable = false, .backing = null }));
 }
 
 pub fn regex_pattern(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -2113,13 +2161,13 @@ pub fn regex_find(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const v = ctx.args[2];
         if (v.isIntegral()) {
             const n = v.asI64().?;
-            const length = byteToChar(s, s.len);
+            const length: i64 = sr.asPtrConst().u16_len;
             if (n < 0 or n > length) {
                 const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ n, length });
                 defer ctx.allocator.free(msg);
                 return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
             }
-            start = if (n == 0) 0 else charIndexToByte(s, n);
+            start = if (n == 0) 0 else charIndexToByteIn(sr.asPtrConst(), n);
         } else {
             return typeErr("Regex.find startIndex must be Int");
         }
@@ -2147,7 +2195,7 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     // An optional `startIndex` char index starts the scan; outside `[0, length]`
     // it throws IndexOutOfBoundsException eagerly, as `findAll` does.
-    const length = byteToChar(s, s.len);
+    const length: i64 = sr.asPtrConst().u16_len;
     const start_index: i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     if (start_index < 0 or start_index > length) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "Start index out of bounds: {d}, input length: {d}", .{ start_index, length });
@@ -2157,7 +2205,7 @@ pub fn regex_find_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     var items: std.ArrayList(Value) = .empty;
     defer items.deinit(ctx.allocator);
-    var pos: usize = charIndexToByte(s, start_index);
+    var pos: usize = charIndexToByteIn(sr.asPtrConst(), start_index);
     while (true) {
         const caps = (try runMatch(ctx.allocator, prog, s, pos)) orelse break;
         defer ctx.allocator.free(caps);
@@ -2208,14 +2256,14 @@ pub fn regex_match_at(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const idx = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (idx == null) return typeErr("Regex.matchAt requires Int index");
     {
-        const length = byteToChar(s, s.len);
+        const length: i64 = sr.asPtrConst().u16_len;
         if (idx.? < 0 or idx.? > length) {
             const msg = try std.fmt.allocPrint(ctx.allocator, "index out of bounds: {d}, input length: {d}", .{ idx.?, length });
             defer ctx.allocator.free(msg);
             return .{ .err = .{ .Thrown = try makeException(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg) } };
         }
     }
-    const byte = charIndexToByte(s, idx.?);
+    const byte = charIndexToByteIn(sr.asPtrConst(), idx.?);
     const prog = progFromRegex(r) orelse return typeErr("Regex.matchAt requires a Regex receiver");
     if (try runMatch(ctx.allocator, prog, s, byte)) |caps| {
         defer ctx.allocator.free(caps);
@@ -2934,6 +2982,31 @@ test "kotlin literal escape splits on embedded E sentinel" {
     const a = arena.allocator();
     const e = try kotlinLiteralEscape(a, "a\\Eb");
     try testing.expectEqualStrings("\\Qa\\E\\E\\\\E\\Q\\Qb\\E", e);
+}
+
+test "a string's byte offsets and UTF-16 indices convert from its cursor, forward and back" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // 'é' is 2 bytes and 1 unit, U+1F600 4 bytes and 2 units.
+    const sr = try runtime.strInit(a, "h\u{e9}y \u{1F600}z!");
+    const sd = sr.asPtrConst();
+    try testing.expect(!sd.ascii);
+    // Forward, as successive matches ask, then back before the cursor.
+    try testing.expectEqual(@as(i64, 1), byteToCharIn(sd, 1));
+    try testing.expectEqual(@as(i64, 4), byteToCharIn(sd, 5));
+    try testing.expectEqual(@as(i64, 6), byteToCharIn(sd, 9));
+    try testing.expectEqual(@as(i64, 8), byteToCharIn(sd, 11));
+    try testing.expectEqual(@as(i64, 2), byteToCharIn(sd, 3));
+    try testing.expectEqual(@as(usize, 9), charIndexToByteIn(sd, 6));
+    try testing.expectEqual(@as(usize, 3), charIndexToByteIn(sd, 2));
+    // An index inside the surrogate pair is the pair's start.
+    try testing.expectEqual(@as(usize, 5), charIndexToByteIn(sd, 5));
+    try testing.expectEqual(@as(usize, 10), charIndexToByteIn(sd, 7));
+    // Every byte ASCII: the offset is the index.
+    const ascii = try runtime.strInit(a, "plain text");
+    try testing.expectEqual(@as(i64, 7), byteToCharIn(ascii.asPtrConst(), 7));
+    try testing.expectEqual(@as(usize, 4), charIndexToByteIn(ascii.asPtrConst(), 4));
 }
 
 test "byte to char counts utf16 units" {

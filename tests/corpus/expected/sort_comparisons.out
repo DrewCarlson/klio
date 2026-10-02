@@ -1,0 +1,29 @@
+[fig, pear, kiwi, plum, date, lime, apple, grape, banana, cherry]
+22 comparisons: [fig/pear, apple/fig, apple/pear, kiwi/pear, kiwi/apple, banana/kiwi]
+[fig, pear, kiwi, plum, date, lime, apple, grape, banana, cherry]
+[banana, cherry, apple, grape, pear, kiwi, plum, date, lime, fig]
+[fig, plum, pear, lime, kiwi, date, grape, apple, cherry, banana]
+h, b, e, f, a, c, g, d
+compareTo calls: 16
+d, a, c, g, f, b, e, h
+compareTo calls: 17
+d, a, c, g, f, b, e, h
+random: 55189 comparisons, 2..99999
+nearly sorted: 5372 comparisons
+descending run: 4999 comparisons
+delta, alpha, bravo, charlie, echo, foxtrot
+alpha, bravo, charlie, delta, echo, foxtrot
+alpha, bravo, charlie, foxtrot, echo, delta
+alpha, bravo, charlie, foxtrot, echo, delta
+IllegalArgumentException: fromIndex(4) > toIndex(2)
+IndexOutOfBoundsException: Array index out of range: 9
+dev/1/cy, dev/3/ana, dev/3/bob, ops/1/lee, ops/2/al, ops/2/kim (40 selects)
+ana, bob, al, kim, cy, lee
+10
+s0, s1, s0, s1, s2, s3, s4, s7
+s1, s2, s3, s4, s7, s3, s4, s7
+0, 0, 10, 20, 30, 40
+ArrayIndexOutOfBoundsException: arraycopy: last destination index 10 out of bounds for object array[8]
+ArrayIndexOutOfBoundsException: arraycopy: length -2 is negative
+ArrayIndexOutOfBoundsException: arraycopy: last destination index 6 out of bounds for int[2]
+IllegalArgumentException: Comparison method violates its general contract!

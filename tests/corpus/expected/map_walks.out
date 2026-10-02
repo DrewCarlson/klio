@@ -1,0 +1,16 @@
+{Sku(id=1, region=eu)=$19.99, note=null, null=[1, 2], self=(this Map)}
+true true true
+false false
+true true
+{C1=uno, C4=four, C7=seven, C2=two}
+{C1=uno, C4=four, C7=seven, C2=two}
+{C1=uno, C4=quatre, C7=seven, C2=two, C10=ten}
+31 25 0 [5, 100, 1, 2]
+{rent=950, food=300} {tax=100, rent=950, food=300} 4
+{a=1, b=2} {a=100, b=2} {a=1, b=2} true
+{a=1, b=2, c=3} {a=9, b=2} {a=1, b=5, z=0} {a=2, b=2, x=1}
+{b=2} {} {a=1, b=2} {1=a, 2=b, 3=c}
+{x=10, y=20} {y=20} y
+{1=a, 2=b, 3=c}
+[red, blue, green]
+ConcurrentModificationException

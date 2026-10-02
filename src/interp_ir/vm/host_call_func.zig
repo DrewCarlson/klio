@@ -8,6 +8,7 @@ const runtime = @import("runtime");
 const stdlib = @import("stdlib");
 
 const vmhost = @import("vmhost.zig");
+const host_util = @import("host_util.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -64,15 +65,46 @@ pub fn evalResultOf(allocator: Allocator, r: runtime.EvalResult) EvalResult {
     };
 }
 
+/// A suspend state a generator's step handed back (`recycleSuspendState`), its frame list
+/// empty with its buffer kept, for the next suspension on this thread; stamped with the
+/// program it was allocated in, as a later program's allocator is another. Held in
+/// `tls_fast`, as a `threadlocal` costs a call into dyld per access on Darwin.
+const Spare = struct { state: ?*SuspendState = null, gen: u32 = 0 };
+const spare_tls = runtime.tls_fast.PerThread(Spare);
+
+/// Keeps `st`, whose frames were resumed and emptied, for the next suspension on this thread
+/// to fill in place of a new one; frees it when a spare is kept already.
+pub fn recycleSuspendState(allocator: Allocator, st: *SuspendState) void {
+    const spare = spare_tls.get();
+    if (spare.state != null and spare.gen == host_util.dispatchCacheGen()) {
+        st.frames.deinit(allocator);
+        allocator.destroy(st);
+        return;
+    }
+    st.frames.clearRetainingCapacity();
+    spare.* = .{ .state = st, .gen = host_util.dispatchCacheGen() };
+}
+
 fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
     return switch (e) {
         .Thrown => |v| .{ .Throw = v },
         .Return => |v| .{ .NonLocalReturn = v },
-        // A suspending primitive asked to park: seed a fresh SuspendState, which
-        // each enclosing `eval` frame fills as it unwinds for the driver to park.
+        // A suspending primitive asked to park: seed a SuspendState, fresh or the spare a
+        // generator handed back, which each enclosing `eval` frame fills as it unwinds for the
+        // driver to park.
         .Suspend => |wake| blk: {
-            const st = allocator.create(SuspendState) catch break :blk EvalError{ .Type = "out of memory seeding suspend" };
-            st.* = .{ .token = 0, .frames = .empty, .wake_in_millis = wake, .pending_resume_reg = null };
+            var frames: std.ArrayList(ir.eval.FrameSnapshot) = .empty;
+            const spare = spare_tls.get();
+            const st = if (spare.state != null and spare.gen == host_util.dispatchCacheGen()) kept: {
+                const sp = spare.state.?;
+                spare.state = null;
+                frames = sp.frames;
+                break :kept sp;
+            } else fresh: {
+                spare.state = null;
+                break :fresh allocator.create(SuspendState) catch break :blk EvalError{ .Type = "out of memory seeding suspend" };
+            };
+            st.* = .{ .token = 0, .frames = frames, .wake_in_millis = wake, .pending_resume_reg = null };
             break :blk EvalError{ .Suspended = st };
         },
         .Unbound => |s| .{ .Unbound = s },
@@ -85,4 +117,25 @@ fn runtimeErrorToEval(allocator: Allocator, e: RuntimeError) EvalError {
         .LabeledReturn => |lr| .{ .LabeledReturn = .{ .label = lr.label, .value = lr.value } },
         else => .{ .Type = std.fmt.allocPrint(allocator, "{s}", .{@tagName(e)}) catch "IR type error" },
     };
+}
+
+test "a suspension takes the state a generator step recycled, but not one an earlier program left" {
+    const a = std.testing.allocator;
+    const first = runtimeErrorToEval(a, .{ .Suspend = -1 }).Suspended;
+    try first.frames.ensureTotalCapacity(a, 1);
+    recycleSuspendState(a, first);
+    // The next suspension fills the same state, its frame buffer kept.
+    const second = runtimeErrorToEval(a, .{ .Suspend = 5 }).Suspended;
+    try std.testing.expectEqual(first, second);
+    try std.testing.expect(second.frames.capacity >= 1);
+    try std.testing.expectEqual(@as(i64, 5), second.wake_in_millis);
+    recycleSuspendState(a, second);
+    // A program boundary: the spare belongs to the program before, and is left alone.
+    host_util.bumpDispatchCacheGen();
+    const third = runtimeErrorToEval(a, .{ .Suspend = -1 }).Suspended;
+    try std.testing.expect(third != second);
+    third.frames.deinit(a);
+    a.destroy(third);
+    second.frames.deinit(a);
+    a.destroy(second);
 }

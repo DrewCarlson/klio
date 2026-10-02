@@ -70,7 +70,7 @@ pub fn sleepMillis(ms: i64) void {
         const now = monotonicNanos();
         if (now >= deadline) return;
         const seen = sleep_gate.epochNow();
-        if (!sleep_gate.parkFrom(seen, (deadline - now) / std.time.ns_per_us)) return;
+        if (!sleep_gate.parkFrom(seen, null, (deadline - now) / std.time.ns_per_us)) return;
     }
 }
 
@@ -113,23 +113,31 @@ pub const EventGate = struct {
     /// Parks until the gate rings or `timeout_us` (`forever` for no limit)
     /// passes; an abandonment request that concerns this thread wakes it.
     pub fn waitFrom(self: *EventGate, seen: u64, timeout_us: u64) void {
+        self.waitAfter(seen, null, timeout_us);
+    }
+
+    /// `waitFrom` for a waiter that read `parkedRings()` as `rings_seen` before it checked
+    /// what `ringParkedGates` announces (a failed pool task): a ring between that check and
+    /// this park ends the wait at once instead of being missed.
+    pub fn waitAfter(self: *EventGate, seen: u64, rings_seen: ?u64, timeout_us: u64) void {
         if (comptime !platform.has_os_sync) {
             sleepMicros(@intCast(@min(timeout_us, 1_000)));
             return;
         }
         gc.enterBlockingSafe();
         defer gc.exitBlockingSafe();
-        _ = self.parkFrom(seen, timeout_us);
+        _ = self.parkFrom(seen, rings_seen, timeout_us);
     }
 
-    /// `waitFrom` for a thread already GC-safe; false when abandonment,
+    /// `waitAfter` for a thread already GC-safe; false when abandonment,
     /// not the gate or the time, ended the wait.
-    fn parkFrom(self: *EventGate, seen: u64, timeout_us: u64) bool {
+    fn parkFrom(self: *EventGate, seen: u64, rings_seen: ?u64, timeout_us: u64) bool {
         parked_gates.join(self);
         defer parked_gates.leave(self);
-        // Read after joining: a request made before is seen here, one made
-        // after rings this gate.
+        // Read after joining: a request or a ring made before is seen here, one
+        // made after rings this gate.
         if (threads_mod.shouldAbandon()) return false;
+        if (rings_seen) |r| if (parked_rings.load(.acquire) != r) return true;
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.epoch.load(.acquire) != seen) return true;
@@ -173,11 +181,20 @@ const ParkedGates = struct {
 
 var parked_gates: ParkedGates = .{};
 
+/// How many times `ringParkedGates` has rung, counted under `parked_gates.mutex`
+/// (`EventGate.waitAfter`).
+var parked_rings: std.atomic.Value(u64) = .init(0);
+
+pub fn parkedRings() u64 {
+    return parked_rings.load(.acquire);
+}
+
 /// Rings every gate a thread is parked on (an abandonment request).
 pub fn ringParkedGates() void {
     if (comptime !platform.has_os_sync) return;
     parked_gates.mutex.lock();
     defer parked_gates.mutex.unlock();
+    _ = parked_rings.fetchAdd(1, .release);
     var it = parked_gates.head;
     while (it) |g| : (it = g.parked_next) g.ring();
 }
@@ -204,4 +221,15 @@ test "monotonicNanos is non-decreasing" {
     const a = monotonicNanos();
     const b = monotonicNanos();
     try testing.expect(b >= a);
+}
+
+test "a ring of the parked gates that came before a waiter parked ends its wait at once" {
+    if (comptime !platform.has_os_sync) return;
+    var g: EventGate = .{};
+    const rings = parkedRings();
+    // Not parked yet: the ring reaches no gate, only the count.
+    ringParkedGates();
+    const t0 = monotonicNanos();
+    g.waitAfter(g.epochNow(), rings, 2_000_000);
+    try testing.expect(monotonicNanos() - t0 < std.time.ns_per_s);
 }

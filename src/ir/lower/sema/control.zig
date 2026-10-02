@@ -365,6 +365,7 @@ fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     if (try countedFor(b, e, &g)) |c| return loopCounted(b, e, label, c);
     const groups = try compose.LoopGroups.begin(b, e, f.body, label);
     const src = try body.lowerExpr(b, f.iter);
+    if (!groups.per_iteration and byPosition(b, &g)) return loopByPosition(b, e, label, &g, src, groups);
     const iter = try operator.callOn(b, &g.iterator, src, &.{});
     const head = try b.newBlock();
     const body_blk = try b.newBlock();
@@ -382,6 +383,85 @@ fn loopFor(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
     b.terminate(.{ .Branch = .{ .cond = more, .t = body_blk, .f = exit } });
     b.switchTo(body_blk);
     const elem = try operator.callOn(b, &g.next, iter, &.{});
+    if (f.vars.len == 1 and !f.destructured) {
+        try env.bindLocal(b, try b.decl(f.id), elem);
+    } else {
+        try body.destructure(b, f.id, f.vars, f.var_sources, elem);
+    }
+    try loopBody(b, f.body, label, exit, head, groups);
+    if (!b.terminated()) b.terminate(.{ .Goto = head });
+    b.switchTo(exit);
+    try groups.end(b);
+    return b.unit();
+}
+
+/// Whether a loop's `iterator()` is the host's own when the iterable is a list, set, map,
+/// array or string the host holds: a member (an override is a class's whose instances the
+/// host does not hold), or the standard library's `CharSequence.iterator()` or
+/// `Map.iterator()`, which a declaration of the program's may shadow.
+fn byPosition(b: *Builder, g: *const records.ForGroup) bool {
+    const s = b.p.s;
+    const callee = g.iterator.callee;
+    const owner = s.syms.owner(callee);
+    if (owner == .none) return false;
+    return switch (s.syms.kind(owner)) {
+        .class => true,
+        .package => blk: {
+            const pkg = s.str(s.syms.packageInfo(owner).fqn);
+            const stdlib = std.mem.eql(u8, pkg, "kotlin.text") or std.mem.eql(u8, pkg, "kotlin.collections");
+            break :blk stdlib and std.mem.eql(u8, s.str(s.syms.name(callee)), "iterator");
+        },
+        else => false,
+    };
+}
+
+/// A `for` loop over a value the host may hold as a list, set, array or string: by position
+/// where it does (`IterOpen`, `IterHas`, `IterGet`), as kotlinc runs a loop over an array;
+/// through `iterator()`, `hasNext()` and `next()` on anything else. Both bind the element
+/// where they meet, before the body.
+fn loopByPosition(b: *Builder, e: *const ast.Expr, label: ?[]const u8, g: *const records.ForGroup, src: Reg, groups: compose.LoopGroups) Error!Reg {
+    const f = e.For;
+    // The iterable is read once, whatever the body assigns to what it came from.
+    const coll = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = coll, .src = src } });
+    const stamp = b.newReg();
+    try b.emit(.{ .IterOpen = .{ .dst = stamp, .src = coll } });
+    const by_calls = b.newReg();
+    try b.emit(.{ .BinOp = .{ .dst = by_calls, .op = .IdentEq, .lhs = stamp, .rhs = try b.emitConst(.Null) } });
+    const idx = b.newReg();
+    try b.emit(.{ .Move = .{ .dst = idx, .src = try b.emitConst(.{ .Int = 0 }) } });
+    const iter = b.newReg();
+    const elem = b.newReg();
+    const open_iter = try b.newBlock();
+    const head = try b.newBlock();
+    const step = try b.newBlock();
+    const read = try b.newBlock();
+    const call_step = try b.newBlock();
+    const call_next = try b.newBlock();
+    const body_blk = try b.newBlock();
+    const exit = try b.newBlock();
+    b.terminate(.{ .Branch = .{ .cond = by_calls, .t = open_iter, .f = head } });
+    b.switchTo(open_iter);
+    try b.emit(.{ .Move = .{ .dst = iter, .src = try operator.callOn(b, &g.iterator, coll, &.{}) } });
+    b.terminate(.{ .Goto = head });
+    b.switchTo(head);
+    try b.emit(.{ .Trace = .{ .span = e.span() } });
+    b.terminate(.{ .Branch = .{ .cond = by_calls, .t = call_step, .f = step } });
+    b.switchTo(step);
+    const more = b.newReg();
+    try b.emit(.{ .IterHas = .{ .dst = more, .src = coll, .idx = idx, .stamp = stamp } });
+    b.terminate(.{ .Branch = .{ .cond = more, .t = read, .f = exit } });
+    b.switchTo(read);
+    try b.emit(.{ .IterGet = .{ .dst = elem, .src = coll, .idx = idx, .stamp = stamp } });
+    try b.emit(.{ .UnOp = .{ .dst = idx, .op = .Inc, .operand = idx } });
+    b.terminate(.{ .Goto = body_blk });
+    b.switchTo(call_step);
+    const has = try operator.callOn(b, &g.has_next, iter, &.{});
+    b.terminate(.{ .Branch = .{ .cond = has, .t = call_next, .f = exit } });
+    b.switchTo(call_next);
+    try b.emit(.{ .Move = .{ .dst = elem, .src = try operator.callOn(b, &g.next, iter, &.{}) } });
+    b.terminate(.{ .Goto = body_blk });
+    b.switchTo(body_blk);
     if (f.vars.len == 1 and !f.destructured) {
         try env.bindLocal(b, try b.decl(f.id), elem);
     } else {

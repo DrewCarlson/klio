@@ -148,6 +148,9 @@ pub const HostClasses = struct {
     array: ?ClassId = null,
     /// By `runtime.PrimitiveArrayKind`: `IntArray`, `LongArray`, ...
     prim_array: [prim_array_kinds]?ClassId = @splat(null),
+    /// By `runtime.PrimitiveArrayKind`: `IntIterator`, `LongIterator`, ..., the class of
+    /// a primitive array's iterator, and `CharIterator` a string's.
+    prim_iterator: [prim_array_kinds]?ClassId = @splat(null),
     /// By arity: the `FunctionN` class a closure of that arity is.
     function: []const ClassId = &.{},
     /// By arity: the root slot of `FunctionN.invoke`.
@@ -188,6 +191,10 @@ pub const HostClasses = struct {
     list: ?ClassId = null,
     set: ?ClassId = null,
     map: ?ClassId = null,
+    /// `MutableIterator` and `MutableListIterator`, the classes of a collection's own
+    /// iterator and of a list's `listIterator()` (`runtime.IterSource`).
+    mutable_iterator: ?ClassId = null,
+    mutable_list_iterator: ?ClassId = null,
     /// By value tag, the class a host value of that kind is an instance of
     /// (a list is an `ArrayList`, a string builder a `StringBuilder`), for
     /// its type tests; the host serves its members.
@@ -615,6 +622,12 @@ pub fn classOf(r: *const Resolved, v: *const Value) ?ClassId {
         // A name-only property reference: a local delegated property's `KProperty0`.
         .PropertyRef => if (h.property.len != 0) h.property[0] else null,
         .Range => |rd| if (rd.progression) h.progression[@intFromEnum(rd.kind)] else h.range[@intFromEnum(rd.kind)],
+        // Written when the iterator is made, so read without a borrow.
+        .Iterator => |it| switch (it.asPtrConst().source) {
+            .other => if (it.asPtrConst().prim) |k| h.prim_iterator[@intFromEnum(k)] orelse h.by_tag[@intFromEnum(std.meta.Tag(Value).Iterator)] else h.by_tag[@intFromEnum(std.meta.Tag(Value).Iterator)],
+            .collection => h.mutable_iterator orelse h.by_tag[@intFromEnum(std.meta.Tag(Value).Iterator)],
+            .list => h.mutable_list_iterator orelse h.by_tag[@intFromEnum(std.meta.Tag(Value).Iterator)],
+        },
         // A host exception is replaced by an instance before code lowered
         // from sema sees it; one that got through is a `Throwable`.
         .Exception => |e| blk: {
@@ -811,5 +824,26 @@ test "a primitive value's class comes from the host table" {
     const longs = try runtime.ArrayData.initPacked(a, .Long, &.{ .{ .Long = 1 }, .{ .Long = 2 } });
     defer longs.Array.deinitStorage();
     try std.testing.expectEqual(ClassId.from(9), classOf(&r, &longs).?);
+}
+
+test "a host iterator's class follows what made it: a collection, a list's listIterator, a primitive array, anything else" {
+    var r: Resolved = .{ .host_class = .{ .mutable_iterator = ClassId.from(3), .mutable_list_iterator = ClassId.from(4) } };
+    r.host_class.by_tag[@intFromEnum(std.meta.Tag(Value).Iterator)] = ClassId.from(2);
+    r.host_class.prim_iterator[@intFromEnum(runtime.PrimitiveArrayKind.Int)] = ClassId.from(5);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cases = [_]struct { source: runtime.IterSource, prim: ?runtime.PrimitiveArrayKind, want: u32 }{
+        .{ .source = .collection, .prim = null, .want = 3 },
+        .{ .source = .list, .prim = null, .want = 4 },
+        .{ .source = .other, .prim = .Int, .want = 5 },
+        .{ .source = .other, .prim = null, .want = 2 },
+        // A primitive kind the tables have no iterator class for is a plain iterator.
+        .{ .source = .other, .prim = .Long, .want = 2 },
+    };
+    for (cases) |c| {
+        const it = try Value.newIterator(a, .{ .items = try runtime.ValueList.init(a, .empty), .prim = c.prim, .source = c.source });
+        try std.testing.expectEqual(ClassId.from(c.want), classOf(&r, &it).?);
+    }
 }
 

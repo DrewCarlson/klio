@@ -90,6 +90,17 @@ pub const Inst = union(enum) {
     CastDyn: struct { dst: Reg, src: Reg, ty: Reg, nullable: bool, safe: bool },
     ArrayGet: struct { dst: Reg, array: Reg, index: Reg },
     ArraySet: struct { array: Reg, index: Reg, value: Reg },
+    /// The start of a `for` loop over the value in `src`: when the host holds it as a list,
+    /// set, array or string, the stamp `IterHas` and `IterGet` read it by position from
+    /// (`runtime.forloop`), a Long; null for any other value, whose loop calls `iterator()`.
+    IterOpen: struct { dst: Reg, src: Reg },
+    /// Whether the loop over `src` that `IterOpen` stamped `stamp` has an element at the Int
+    /// position `idx`, as its iterator's `hasNext()` answers.
+    IterHas: struct { dst: Reg, src: Reg, idx: Reg, stamp: Reg },
+    /// The element at `idx` of the loop over `src` stamped `stamp`, as its iterator's `next()`
+    /// gives it: a structural change since the loop began throws
+    /// ConcurrentModificationException.
+    IterGet: struct { dst: Reg, src: Reg, idx: Reg, stamp: Reg },
     /// An array of `class` holding the argument run.
     NewArray: struct { dst: Reg, class: ClassId, args: Reg, n_args: u32 },
     /// The instance of scalar value class `class` over the number in `src`, held in its

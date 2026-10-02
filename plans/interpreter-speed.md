@@ -62,6 +62,11 @@ Operations, ns per loop iteration (`bench/interp/programs/mb_ops.kt`):
 | `gc/young` | A minor collection marks about 11,000 cells at about 130 ns each, and half of its pause is the remembered set (2,500 to 3,000 whole cells and a few ranges of large arrays). A cell tenures on surviving one collection. The 300 changing texts run 67 collections (40 minor, 14 initial marks, 13 remarks), about 5% of the run. A floor of 32 MB or 64 MB instead of 8 MB speeds them 3% and 4% and slows the idle form frames. To do: tenure after more than one survival or by age, a floor that adapts to the collection's cost, and a faster mark. | open |
 | `dispatch/layout` | The dispatch function was about 60 KB of machine code, and an edit anywhere in it moved unrelated cases by up to 40% either way: the register allocator placed the values the loop carries (frame, code, pc, block, streams, thread state, try stack, ...) differently each build, and an arm could find `frame` in the wrong register and spill it on its fast path. Done: each op is a function of its own (`src/ir/eval/stream.zig`) that tail-calls the next op's, with the frame, its registers, the code, the pc and the block in argument registers and everything else in a context in memory; slow paths are functions of their own reached through a table the optimizer cannot fold, so no fast path contains a call and none saves registers; a static call, its callee's activation and its return take a path with no call when the pool, the value stack and the window allow it. Left: frame pointers, which put a frame record (three instructions) in most ops; omitting them in the `ir` module measured 2-3% on the compose frames, at the cost of the ir frames in sampled call stacks. | done |
 | `strings/builder` | `StringBuilder.append(Int)` cost 3.3x the JVM interpreter's: the builder's length is counted in UTF-16 units from a memo each append dropped, so reading `length` after an append rescanned the buffer. Done: an append carries the memo over. | done |
+| `loops/by-position` | A `for` over a list, set, array or string made an iterator (a copy of an array's or a read-only list's elements) and called `hasNext()` and `next()` through the generic host-call path for every element: 150 ns an element, 70x an indexed loop. Done: the loop opens a stamp (`IterOpen`) and reads by position (`IterHas`, `IterGet`, `runtime.forloop`), checking the structural count as the JVM's iterators do, where the iterable is one the host holds and its `iterator()` the host's; any other iterable keeps its iterator's calls. The baseline compiles the two ops for lists and `Int`/`Long`/`Double`/boxed arrays. Faithful to the JVM where the iterator path was not: a list's loop ends at its live size (an element removed at the last one throws), an array's reads its elements as they are now. | done |
+| `calls/host-values` | A virtual call on a host value whose class leaves the slot to the kind of value (an iterator's `hasNext`, an entry's `key`) resolved in full every time through the instruction's arm. Done: the site keeps that host function for the receiver's class as it keeps any other, and an iterator's `hasNext()` and `next()` are intrinsics, which compiled code calls straight. | done |
+| `collections/sort` | Every stdlib sort was an insertion sort: O(n^2) comparisons, 17 s for `sortedDescending` of 20,000 Ints. Done: one stable merge sort over a comparison that may throw (`runtime.stableSort`), which merges positions so the slice keeps every element during a comparison and is unchanged after a throw. Then: object sorts run the JDK's TimSort in Kotlin (`kotlin-collections/Sorting.kt`), `copyInto` moves blocks, and `compareBy` over several selectors runs in Kotlin. Left, 100,000 elements against the JVM (with its JIT): `sortedWith` of a lambda 99 ms against 11, `sortedBy` 123 against 11, `compareBy` of two selectors 387 against 43, `sortedBy` of a `String` key 348 against 36. Where the time goes in `sortedWith` of a lambda (ReleaseFast, JIT on): 65% in compiled code (the TimSort loop and the comparator call), 14% in the `copyInto` native's call and argument unpacking (`callNativeDirect`, `arrayOptIndex`), 9% in single element stores the JIT leaves to the interpreter (its inline store refuses an old array whose barrier remembers a range, `gc_range`), 4% in GC marking. A boxed `Array<Any?>` store costs 22 ns against the JVM's 1.7 (a lock and a barrier each), `copyInto` 4.8 ns an element against 0.1. | in progress |
+| `collections/map-iteration` | Loops over a map and its views read the map's slots by position, but still cost 5 to 9x the JVM's: fifty loops over 20,000 entries, `for ((k, v) in map)` 54 ms against 6, over `entries` 49 against 6, `keys` 24 against 3, `values` 24 against 3; draining a map through `keys.first()` 9 against 2; removing half through a view's iterator 5 to 9 against 1. Not profiled yet. | open |
+| `collections/copies` | Copies the JVM does not make, outside maps: an iterator over a read-only list or set copies its elements (`builtinIterator`'s `cloneItemsList`), a string's iterator copies its characters into a list, a user collection passed to a native is drained into a slice (`iterableItemsCtx`), and the natives that call a lambda copy their list or set receiver first (`snapshotItems`) so no lock is held across Kotlin code; a walk in place (as `MapWalk` does for maps) removes each. | open |
 
 ## Where it stands (2026-09-28, `6262dc47`)
 
@@ -413,3 +418,84 @@ inlined and with the allocations removed, where klio's interpreter takes
   from a static analysis of where the frame stands, which has to leave out
   the writes the stream skips (a constant folded into its reader, a fused
   compare's boolean).
+- 2026-10-01: `collections/sort`, `loops/by-position`, `calls/host-values`,
+  and a live map entry finding its slot from where it last was (an entry's
+  `key` scanned the map, so iterating a map's entries was quadratic). With
+  the JIT on as it is by default, against the commit before, ms: 20,000
+  elements `sorted` 913 to 5, strings 3,378 to 15, `sortedDescending`
+  17,020 to 50, `sortedBy` 46,649 to 141, `sortedWith` 26,820 to 83,
+  `MutableList.sort` 843 to 6, a sequence's `sorted` 861 to 7; `toSortedMap`
+  of 20,000 entries 33,835 to 133; iterating 20,000 map entries 987 to 4.
+  200,000 elements a loop: `for` over a list 30.6 to 0.79, over an
+  `IntArray` 31.6 to 0.76, `map` 34 to 3.0, `filter` 33 to 2.1, `sumOf`,
+  `forEach`, `count`, `any` 31 to 0.8, `maxBy` 35 to 8.1, a sequence's
+  `map` and `filter` 50 to 9.1.
+- 2026-10-01: a native's call into Kotlin (a comparator's `compare`, a
+  lambda a stdlib function runs) copied its arguments into two heap lists
+  that `evalClosure` copied again into the argument area and freed; it
+  passes slices now (`evalSlices`), and `runFrame` looks its thread state up
+  once. Comparator sorts of 20,000 Ints 50 to 44 ms. A regex match converted
+  each group's byte offsets to UTF-16 indices by scanning from the start of
+  the input, so `findAll` was quadratic (4,000 matches in 100 KB: 1,188 ms,
+  the JVM's 1); an ASCII string's offsets are its indices, and any other
+  counts on from the string's cursor (1,188 to 2 ms). A start index counted
+  code points where Kotlin counts UTF-16 units; it counts units.
+- 2026-10-01: a throw checked `KLIO_THROW_TRACE` by reading and parsing the
+  process's whole environment block (a mapping, a scan, an unmapping) every
+  time; it reads it once. 200,000 throws through four frames 1,890 to 130 ms.
+  `StringBuilder`'s `insert`, `deleteAt`, `deleteRange`, `set`, `setCharAt`
+  and `substring` converted the whole buffer to UTF-16 and back each call, and
+  `reverse` inserted each character at the front: an ASCII builder is edited
+  in its bytes and keeps its length known (5,000 `insert(0, c)` 113 to 0 ms,
+  5,000 `deleteAt` at the end 116 to 0), and `reverse` writes each character
+  once.
+- 2026-10-02: a suspended frame that a host-entered evaluation ran (a
+  builder's producer, a coroutine's body) was copied into a snapshot at every
+  suspension and rebuilt on the native stack at every resume. A resume now
+  rebuilds it as an activation, which its next suspension parks live, so a
+  frame is copied once; a builder resumes its one live frame directly
+  (`resumeSingleLive`) and hands its spent suspend state to the next
+  suspension; the builder scope's fields are found by cached slot and read
+  without the instance lock; intrinsics and the resume answer through a
+  pointer, not an optional union the caller copied in pieces. A
+  `sequence { yield(i) }` step about 550 to 300 ns (the JVM's 15), 2,000
+  `launch`es and 200 `async`s a round 3.06 to 2.47 s. What is left of a step
+  is the host-call plumbing between `hasNext()` and the producer (the call's
+  result unions copied through the stack at each layer).
+- 2026-10-02: object sorts ran in the host, a merge sort calling each
+  comparator back through a host call into Kotlin (about 150 ns a compare),
+  and a user `Comparable`'s `compareTo` the same way. They run in Kotlin now
+  (`kotlin-collections/Sorting.kt`): the JDK's TimSort, comparing the same
+  pairs in the same order as `Arrays.sort`, so the compares are calls the
+  JIT compiles; the natural order or its reverse over numbers, characters,
+  strings or Booleans of one kind still sorts in the host
+  (`__klio_sortNatively`). Every sort path (`sorted`, `sortedWith`,
+  `sortedBy`, `sortedDescending`, `MutableList.sort`/`sortWith`,
+  `Array.sort`/`sortWith`) reaches one of the two through the upstream
+  functions. 20,000 elements, ms, before and after: `sortedWith` of a
+  lambda 37 to 16, of `naturalOrder()` 43 to 5, `sortedDescending` 43 to 5,
+  a `Comparable` class's `sorted()` 36 to 15, `sortedBy` 74 to 51,
+  `MutableList.sortWith` 46 to 26. A comparator's call count and order, the
+  stability of `sortedDescending` over equal elements, the contract
+  violation and the range checks' messages are now the JVM's. A sort with a
+  default `toIndex` found that an `actual`'s inherited default lost the
+  `expect`'s extension receiver; the default stub binds it now.
+- 2026-10-02: a sort's array writes were half its time. `copyInto` copied the
+  source range out, then stored each element under its own lock and write
+  barrier; it now moves the block under one lock per array, the
+  destination's barrier remembering the range (`ArrayData.copyRangeFrom`,
+  `ObjRef.borrowMutRange`), and the binary insertion of a TimSort run moves
+  the elements after the insertion point with one `copyInto`, as the JDK's
+  `binarySort` uses `System.arraycopy`. `compareBy` over several selectors
+  and `compareValuesBy` were host functions calling each selector back into
+  Kotlin; the library's own Kotlin runs them now. 100,000 elements, ms,
+  before and after: `sortedWith` of a lambda 136 to 99, `sortedBy` 161 to
+  123, `compareBy` of two selectors 788 to 387; `copyInto` of an
+  `Array<Any?>` 13.5 to 4.8 ns an element (the JVM's 0.1). What is left is
+  the comparator's call and the single stores the JIT leaves to the
+  interpreter in an array old enough to remember its writes by range.
+  `copyInto` out of range now throws `ArrayIndexOutOfBoundsException` with
+  `System.arraycopy`'s message, and `compareValues` answers what the JVM's
+  `compareTo` answers (a difference for strings, chars, shorts, bytes and
+  enum entries, a user `compareTo`'s own value).
+

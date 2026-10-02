@@ -1,5 +1,6 @@
-//! Comparison intrinsics: `compareValues`, `compareValuesBy`, the `Comparator`
-//! SAM factory, `compareBy` and the `naturalOrder` comparator factories.
+//! Comparison intrinsics: `compareValues`, the `Comparator` SAM factory and the
+//! `naturalOrder` comparator factories. `compareBy` and `compareValuesBy` are the
+//! library's own Kotlin, whose selectors run without leaving the interpreter.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -154,42 +155,6 @@ fn orderToInt(o: std.math.Order) i64 {
     };
 }
 
-pub fn cmp_compare_values_by(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    if (ctx.args.len < 3) {
-        return .{ .err = .{ .Arity = "compareValuesBy expects (a, b, selector, ...)" } };
-    }
-    const a = ctx.args[0];
-    const b = ctx.args[1];
-    const selectors = ctx.args[2..];
-    for (selectors) |sel| {
-        if (!isCallable(sel)) {
-            return .{ .err = .{ .Type = "compareValuesBy expects key-selector lambdas" } };
-        }
-        const ka = switch (try ctx.host.invokeCallable(&sel, &.{a}, ctx.out)) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
-        };
-        const kb = switch (try ctx.host.invokeCallable(&sel, &.{b}, ctx.out)) {
-            .ok => |v| v,
-            .err => |e| return .{ .err = e },
-        };
-        const ord: std.math.Order = if (isNull(ka) and isNull(kb))
-            .eq
-        else if (isNull(ka))
-            .lt
-        else if (isNull(kb))
-            .gt
-        else switch (try compareValues(ctx, &ka, &kb)) {
-            .ord => |o| o,
-            .err => |e| return .{ .err = e },
-        };
-        if (ord != .eq) {
-            return .{ .ok = Value.newInt(orderToInt(ord)) };
-        }
-    }
-    return .{ .ok = Value.newInt(0) };
-}
-
 pub fn cmp_comparator_sam(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 1) {
         return .{ .err = .{ .Arity = "Comparator { … } expects a 2-arg comparison lambda" } };
@@ -200,39 +165,6 @@ pub fn cmp_comparator_sam(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     const steps = try ctx.allocator.alloc(ComparatorStep, 1);
     steps[0] = .{ .selector = lam, .descending = false };
-    return .{ .ok = try Value.newComparator(ctx.allocator, .{
-        .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
-        .descending = false,
-    }) };
-}
-
-pub fn cmp_compare_by(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    return makeComparator(ctx, false);
-}
-
-pub fn cmp_compare_by_descending(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    return makeComparator(ctx, true);
-}
-
-/// Build a `Comparator` whose steps are each argument used as a key selector;
-/// reversal is per step, so the comparator-level flag stays false.
-fn makeComparator(ctx: *CallCtx, descending: bool) std.mem.Allocator.Error!EvalResult {
-    // `compareBy(comparator, selector)` and the vararg `compareBy(s1, s2)` both
-    // take two args, distinguished by arg[0] being a comparator or a callable.
-    if (ctx.args.len == 2 and isCallable(ctx.args[1]) and
-        (ctx.args[0] == .Comparator or !isCallable(ctx.args[0])))
-    {
-        const steps = try ctx.allocator.alloc(ComparatorStep, 1);
-        steps[0] = .{ .selector = ctx.args[1], .descending = descending, .key_comparator = ctx.args[0] };
-        return .{ .ok = try Value.newComparator(ctx.allocator, .{
-            .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
-            .descending = false,
-        }) };
-    }
-    const steps = try ctx.allocator.alloc(ComparatorStep, ctx.args.len);
-    for (ctx.args, 0..) |arg, i| {
-        steps[i] = .{ .selector = arg, .descending = descending };
-    }
     return .{ .ok = try Value.newComparator(ctx.allocator, .{
         .steps = try ObjRef([]ComparatorStep).init(ctx.allocator, steps),
         .descending = false,
@@ -251,11 +183,52 @@ pub fn cmp_compare_values(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         -1
     else if (isNull(b))
         1
-    else switch (try compareValues(ctx, &a, &b)) {
+    else if (compareToDifference(&a, &b)) |d|
+        d
+    else if (a == .Instance) blk: {
+        // A `compareTo` of the program's own answers what it answers.
+        if (try ctx.host.callWellKnown(&a, .compare_to, &.{b}, ctx.out)) |r| switch (r) {
+            .ok => |v| if (v.asI64()) |x| break :blk x,
+            .err => |e| return .{ .err = e },
+        };
+        break :blk switch (try compareValues(ctx, &a, &b)) {
+            .ord => |o| orderToInt(o),
+            .err => |e| return .{ .err = e },
+        };
+    } else switch (try compareValues(ctx, &a, &b)) {
         .ord => |o| orderToInt(o),
         .err => |e| return .{ .err = e },
     };
     return .{ .ok = Value.newInt(n) };
+}
+
+/// What the JVM's `compareTo` answers for a pair whose answer is a difference, not a sign:
+/// two strings, the first unequal UTF-16 units' or else the lengths'; two chars, shorts or
+/// bytes, the values'; two entries of one enum, the ordinals'. Null for any other pair, the
+/// other numbers and Booleans answering a sign.
+fn compareToDifference(a: *const Value, b: *const Value) ?i64 {
+    switch (a.*) {
+        .String => |x| if (b.* == .String) {
+            const gx = x.borrow();
+            defer gx.deinit();
+            const gy = b.String.borrow();
+            defer gy.deinit();
+            return text.compareUtf16Difference(gx.get().bytes, gy.get().bytes);
+        },
+        .Char => |x| if (b.* == .Char) return @as(i64, x) - b.Char,
+        .Short => |x| if (b.* == .Short) return @as(i64, x) - b.Short,
+        .Byte => |x| if (b.* == .Byte) return @as(i64, x) - b.Byte,
+        .Instance => |x| if (b.* == .Instance) {
+            const cx = x.asPtrConst().class.asPtrConst();
+            const cy = b.Instance.asPtrConst().class.asPtrConst();
+            if (!cx.is_enum or !cy.is_enum or !std.mem.eql(u8, cx.fqn, cy.fqn)) return null;
+            const ox = (x.asPtrConst().get("ordinal") orelse return null).asI64() orelse return null;
+            const oy = (b.Instance.asPtrConst().get("ordinal") orelse return null).asI64() orelse return null;
+            return ox - oy;
+        },
+        else => {},
+    }
+    return null;
 }
 
 pub fn comparator_natural_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -295,40 +268,6 @@ fn makeCtx(host: runtime.IntrinsicHost, out: runtime.Output, args: []const Value
     };
 }
 
-const SelectorHost = struct {
-    keyFn: *const fn (arg: Value) Value,
-
-    fn init(allocator: std.mem.Allocator, keyFn: *const fn (arg: Value) Value) SelectorHost {
-        _ = allocator;
-        return .{ .keyFn = keyFn };
-    }
-    fn deinit(self: *SelectorHost) void {
-        _ = self;
-    }
-    fn vtInvokeCallable(c: *anyopaque, callable: *const Value, args: []const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
-        _ = callable;
-        _ = out;
-        const self: *SelectorHost = @ptrCast(@alignCast(c));
-        const arg: Value = if (args.len > 0) args[0] else .Unit;
-        return .{ .ok = self.keyFn(arg) };
-    }
-    fn vtInvokeCallableWithThis(c: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: runtime.Output) std.mem.Allocator.Error!EvalResult {
-        _ = this_value;
-        return vtInvokeCallable(c, callable, args, out);
-    }
-    const vtable: runtime.IntrinsicHost.VTable = .{
-        .invoke_callable = vtInvokeCallable,
-        .invoke_callable_with_this = vtInvokeCallableWithThis,
-    };
-    fn host(self: *SelectorHost) runtime.IntrinsicHost {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-};
-
-fn identityKey(arg: Value) Value {
-    return arg;
-}
-
 test "compareValues orders numerics" {
     var h = runtime.NoopHost.init(testing.allocator);
     defer h.deinit();
@@ -354,6 +293,30 @@ test "compareValues orders numerics" {
     });
     r = try cmp_compare_values(&ctx);
     try testing.expectEqual(@as(i32, 1), r.ok.Int);
+}
+
+test "compareValues answers a difference where the JVM's compareTo does, a sign elsewhere" {
+    var h = runtime.NoopHost.init(testing.allocator);
+    defer h.deinit();
+    var cap = runtime.CaptureOutput.init(testing.allocator);
+    defer cap.deinit();
+    const kim = try runtime.strInit(testing.allocator, "kim");
+    defer kim.deinit();
+    const al = try runtime.strInit(testing.allocator, "al");
+    defer al.deinit();
+    const cases = [_]struct { a: Value, b: Value, want: i32 }{
+        .{ .a = .{ .String = kim }, .b = .{ .String = al }, .want = 10 },
+        .{ .a = .{ .Char = 'a' }, .b = .{ .Char = 'k' }, .want = -10 },
+        .{ .a = .{ .Short = 3 }, .b = .{ .Short = 9 }, .want = -6 },
+        .{ .a = .{ .Byte = 9 }, .b = .{ .Byte = -3 }, .want = 12 },
+        .{ .a = .{ .Int = 3 }, .b = .{ .Int = 9 }, .want = -1 },
+        .{ .a = .{ .Bool = true }, .b = .{ .Bool = false }, .want = 1 },
+    };
+    for (cases) |cs| {
+        var ctx = makeCtx(h.host(), cap.output(), &.{ cs.a, cs.b });
+        const r = try cmp_compare_values(&ctx);
+        try testing.expectEqual(cs.want, r.ok.Int);
+    }
 }
 
 test "compareValues totals NaN above infinity" {
@@ -409,47 +372,6 @@ test "compareValues not-comparable type error" {
     try testing.expect(r.err == .Type);
 }
 
-test "compareValuesBy returns 0 when all selectors tie" {
-    var h = SelectorHost.init(testing.allocator, identityKey);
-    defer h.deinit();
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-    const sel = testClosure(0);
-    defer freeTestClosure(sel);
-    var ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 3 }, .{ .Int = 3 }, sel });
-    const r = try cmp_compare_values_by(&ctx);
-    try testing.expect(r == .ok);
-    try testing.expectEqual(@as(i32, 0), r.ok.Int);
-}
-
-test "compareValuesBy uses the first differing selector" {
-    var h = SelectorHost.init(testing.allocator, identityKey);
-    defer h.deinit();
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-    const sel = testClosure(0);
-    defer freeTestClosure(sel);
-    var ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 7 }, .{ .Int = 9 }, sel });
-    const r = try cmp_compare_values_by(&ctx);
-    try testing.expectEqual(@as(i32, -1), r.ok.Int);
-}
-
-test "compareValuesBy arity and type errors" {
-    var h = SelectorHost.init(testing.allocator, identityKey);
-    defer h.deinit();
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-
-    var ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 1 }, .{ .Int = 2 } });
-    var r = try cmp_compare_values_by(&ctx);
-    try testing.expect(r.err == .Arity);
-
-    const not_lambda = Value{ .Int = 0 };
-    ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 1 }, .{ .Int = 2 }, not_lambda });
-    r = try cmp_compare_values_by(&ctx);
-    try testing.expect(r.err == .Type);
-}
-
 test "Comparator SAM wraps one step" {
     var h = runtime.NoopHost.init(testing.allocator);
     defer h.deinit();
@@ -482,45 +404,6 @@ test "Comparator SAM rejects wrong arity and non-lambda" {
     ctx = makeCtx(h.host(), cap.output(), &.{not_lambda});
     r = try cmp_comparator_sam(&ctx);
     try testing.expect(r.err == .Type);
-}
-
-test "compareBy tags steps ascending" {
-    var h = runtime.NoopHost.init(testing.allocator);
-    defer h.deinit();
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-    const a = testClosure(1);
-    defer freeTestClosure(a);
-    const b = testClosure(2);
-    defer freeTestClosure(b);
-    var ctx = makeCtx(h.host(), cap.output(), &.{ a, b });
-    const r = try cmp_compare_by(&ctx);
-    try testing.expect(r.ok == .Comparator);
-    defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
-    defer testing.allocator.free(r.ok.Comparator.steps.asPtrConst().*);
-    const steps = r.ok.Comparator.steps.asPtrConst().*;
-    try testing.expectEqual(@as(usize, 2), steps.len);
-    try testing.expect(!r.ok.Comparator.descending);
-    try testing.expect(!steps[0].descending);
-    try testing.expect(!steps[1].descending);
-}
-
-test "compareByDescending tags steps descending" {
-    var h = runtime.NoopHost.init(testing.allocator);
-    defer h.deinit();
-    var cap = runtime.CaptureOutput.init(testing.allocator);
-    defer cap.deinit();
-    const a = testClosure(1);
-    defer freeTestClosure(a);
-    var ctx = makeCtx(h.host(), cap.output(), &.{a});
-    const r = try cmp_compare_by_descending(&ctx);
-    try testing.expect(r.ok == .Comparator);
-    defer runtime.comparatorRefOf(r.ok.Comparator).deinit();
-    defer testing.allocator.free(r.ok.Comparator.steps.asPtrConst().*);
-    const steps = r.ok.Comparator.steps.asPtrConst().*;
-    try testing.expectEqual(@as(usize, 1), steps.len);
-    try testing.expect(!r.ok.Comparator.descending);
-    try testing.expect(steps[0].descending);
 }
 
 test "naturalOrder and reverseOrder build empty-step comparators" {

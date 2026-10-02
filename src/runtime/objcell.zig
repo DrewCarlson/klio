@@ -950,6 +950,20 @@ pub fn ObjRef(comptime T: type) type {
             return out;
         }
 
+        /// The length of a run whose buffer moves as it grows, read as `readAtMoving`
+        /// reads it: null when a writer held the lock or took it during the read.
+        pub inline fn lenMoving(self: Self) ?usize {
+            comptime std.debug.assert(sequencedRun(T));
+            const cell = self.cell;
+            const before = cell.lock.seq.load(.acquire);
+            if (before & 1 != 0) return null;
+            const words: *const [2]usize = @ptrCast(&cell.data.items);
+            const len = @atomicLoad(usize, &words[1], .monotonic);
+            loadFence();
+            if (cell.lock.seq.load(.monotonic) != before) return null;
+            return len;
+        }
+
         /// A mutable borrow of an array-like payload for a store into element
         /// `index` and nowhere else. A tenured array at least `range_min_len`
         /// long remembers only the range such stores touch, so the next minor
@@ -964,6 +978,27 @@ pub fn ObjRef(comptime T: type) type {
             if (comptime mayHoldRefs(T)) {
                 if (cell.data.items.len >= range_min_len) {
                     gc.writeBarrierAt(&cell.hdr, index, gcTraceRangeThunk);
+                } else {
+                    gc.writeBarrier(&cell.hdr);
+                }
+            }
+            return .{ .cell = cell };
+        }
+
+        /// A mutable borrow of an array-like payload for stores into elements `lo`
+        /// through `hi` and nowhere else, as `borrowMutAt` takes one for a single
+        /// element: a tenured array at least `range_min_len` long remembers the
+        /// range.
+        pub fn borrowMutRange(self: Self, lo: usize, hi: usize) ObjGuardMut(T) {
+            comptime std.debug.assert(isArrayListLike(T));
+            const cell = self.cell;
+            raceJitter();
+            cell.lock.lockExclusive();
+            noteLock(T, 1);
+            if (comptime mayHoldRefs(T)) {
+                if (cell.data.items.len >= range_min_len) {
+                    gc.writeBarrierAt(&cell.hdr, lo, gcTraceRangeThunk);
+                    gc.writeBarrierAt(&cell.hdr, hi, gcTraceRangeThunk);
                 } else {
                     gc.writeBarrier(&cell.hdr);
                 }

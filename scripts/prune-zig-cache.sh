@@ -67,7 +67,8 @@ fi
 # then fails on the missing .o (cost one corpus-gate run). h/ is a few
 # hundred MB; wiping it costs one revalidation pass, not a rebuild of
 # anything whose artifact survived.
-rm -f "$CACHE/h"/* 2>/dev/null || true
+# `find -delete`, not a glob: h/ holds more names than one command line takes.
+find "$CACHE/h" -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true
 
 after=$(du -sh "$CACHE" | cut -f1)
 echo "pruned .zig-cache (> ${DAYS}d, target ${TARGET_GB}G): $before -> $after"

@@ -236,6 +236,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "kotlin-collections/AbstractMutableSet.kt",
     "kotlin-collections/AbstractMutableMap.kt",
     "kotlin-collections/SequencesActuals.kt",
+    "kotlin-collections/Sorting.kt",
     "kotlin-comparisons/ComparisonsActuals.kt",
     "kotlin-io/Closeable.kt",
     "kotlin-io/Console.kt",
@@ -266,6 +267,7 @@ pub const KLIO_STDLIB_ACTUAL_FILES = [_][]const u8{
     "klio/util/regex/Exceptions.kt",
     "klio/io/InputStream.kt",
     "kotlin-collections/MapActuals.kt",
+    "kotlin-collections/MapViews.kt",
     "kotlin-uuid/UuidActuals.kt",
     "kotlin-reflect/ReflectActuals.kt",
 };

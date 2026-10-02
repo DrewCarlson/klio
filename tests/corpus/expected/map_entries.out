@@ -1,0 +1,21 @@
+HashMap: b=20
+HashMap after a new key: b=20 118 true
+HashMap setValue: 20 -> 21
+HashMap removed: b=21
+HashMap re-added: 21, setValue 21, entry b=7, map has 99
+LinkedHashMap: b=20
+LinkedHashMap after a new key: b=20 118 true
+LinkedHashMap setValue: 20 -> 21
+LinkedHashMap removed: b=21
+LinkedHashMap re-added: 21, setValue 21, entry b=7, map has 99
+mutableMapOf: b=20
+mutableMapOf after a new key: b=20 118 true
+mutableMapOf setValue: 20 -> 21
+mutableMapOf removed: b=21
+mutableMapOf re-added: 21, setValue 21, entry b=7, map has 99
+kept [x=10, y=2], map {x=100}
+e700 = -1, size 501
+e700 = -1, size 201
+builder entry b=20
+builder entry after a new key: ConcurrentModificationException
+{a=1, b=20, c=3}

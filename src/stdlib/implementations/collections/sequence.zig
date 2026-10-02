@@ -2,6 +2,7 @@
 //! drivers, the op pipeline and the builder-cursor helpers.
 
 const std = @import("std");
+const hashing = @import("hashing.zig");
 const runtime = @import("runtime");
 const RuntimeError = runtime.RuntimeError;
 const Value = runtime.Value;
@@ -9,6 +10,8 @@ const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
 const IntrinsicHost = runtime.IntrinsicHost;
 const Output = runtime.Output;
+const MapPair = runtime.MapPair;
+const EvalResult = runtime.EvalResult;
 const SeqOp = runtime.SeqOp;
 const Allocator = std.mem.Allocator;
 const Error = std.mem.Allocator.Error;
@@ -712,7 +715,7 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
                 };
                 switch (mapped) {
                     .List => |xs| try appendVL(&nx, a, xs.items),
-                    .Set => |xs| try appendVL(&nx, a, xs.items),
+                    .Set => |xs| try appendVL(&nx, a, xs.dense()),
                     .Sequence => {
                         const sub = switch (try materialiseSequence(a, host, out, mapped)) {
                             .items => |xs| xs,
@@ -735,27 +738,29 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
             return .{ .items = try nx.toOwnedSlice(a) };
         },
         .Distinct => {
-            var seen: std.ArrayList(Value) = .empty;
-            var nx: std.ArrayList(Value) = .empty;
-            for (items) |v| {
-                if (!try containsBoxedH(host, out, seen.items, &v)) {
-                    try seen.append(a, v);
-                    try nx.append(a, v);
-                }
-            }
+            var seen = hashing.Seen.init();
+            defer seen.deinit(a);
+            for (items) |v| switch (try seen.add(host, out, a, v)) {
+                .added, .present => {},
+                .thrown => |r| return .{ .err = r.err },
+            };
+            var nx = seen.items;
+            seen.items = .empty;
             return .{ .items = try nx.toOwnedSlice(a) };
         },
         .DistinctBy => |f| {
-            var seen: std.ArrayList(Value) = .empty;
+            var seen = hashing.Seen.init();
+            defer seen.deinit(a);
             var nx: std.ArrayList(Value) = .empty;
             for (items) |v| {
                 const key = switch (try seqCall(host, &f, &.{v}, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
                 };
-                if (!try containsBoxedH(host, out, seen.items, &key)) {
-                    try seen.append(a, key);
-                    try nx.append(a, v);
+                switch (try seen.add(host, out, a, key)) {
+                    .added => try nx.append(a, v),
+                    .present => {},
+                    .thrown => |r| return .{ .err = r.err },
                 }
             }
             return .{ .items = try nx.toOwnedSlice(a) };
@@ -765,70 +770,47 @@ fn applySeqOp(a: Allocator, host: IntrinsicHost, out: Output, op: SeqOp, items: 
             return .{ .items = items };
         },
         .SortedBy => |sb| {
-            const keyed = try a.alloc(Value, items.len);
-            for (items, 0..) |v, i| {
-                keyed[i] = switch (try seqCall(host, &sb.selector, &.{v}, out)) {
+            const ka = runtime.keepaliveMark();
+            defer runtime.keepaliveRestore(ka);
+            // Each element beside its key, sorted by the keys.
+            const keyed = try a.alloc(MapPair, items.len);
+            defer a.free(keyed);
+            for (keyed, items) |*p, v| p.* = .{ .key = Value.Null, .value = v };
+            runtime.keepalivePushPairs(keyed);
+            for (keyed) |*p| {
+                p.key = switch (try seqCall(host, &sb.selector, &.{p.value}, out)) {
                     .value => |x| x,
                     .err => |e| return .{ .err = e },
                 };
             }
-            var i: usize = 1;
-            while (i < items.len) : (i += 1) {
-                var j = i;
-                while (j > 0) {
-                    const o = switch (try compareValues(a, keyed[j - 1], keyed[j])) {
-                        .order => |o| o,
-                        .err => |e| return .{ .err = e.err },
-                    };
-                    const flipped = if (sb.descending) reverseOrder(o) else o;
-                    if (flipped == .gt) {
-                        std.mem.swap(Value, &items[j - 1], &items[j]);
-                        std.mem.swap(Value, &keyed[j - 1], &keyed[j]);
-                        j -= 1;
-                    } else break;
-                }
-            }
+            const by = common_mod.NaturalOrder{ .a = a, .descending = sb.descending };
+            if (try runtime.stableSort(MapPair, EvalResult, a, keyed, by, common_mod.NaturalOrder.cmpKeys)) |e| return .{ .err = e.err };
+            for (items, keyed) |*v, p| v.* = p.value;
             return .{ .items = items };
         },
         .SortedWith => |comparator| {
-            var i: usize = 1;
-            while (i < items.len) : (i += 1) {
-                var j = i;
-                while (j > 0) {
-                    const m = try host.callWellKnown(&comparator, .compare, &.{ items[j - 1], items[j] }, out);
+            const By = struct {
+                host: IntrinsicHost,
+                comparator: Value,
+                out: Output,
+                fn cmp(self: @This(), x: *const Value, y: *const Value) Error!runtime.SortOrder(RuntimeError) {
+                    const m = try self.host.callWellKnown(&self.comparator, .compare, &.{ x.*, y.* }, self.out);
                     const ord_val = if (m) |mr| switch (mr) {
                         .ok => |v| v,
                         .err => |e| return .{ .err = e },
                     } else return .{ .err = .{ .Type = "SortedWith: comparator has no `compare` method" } };
-                    const n = ord_val.asI64() orelse 0;
-                    if (n > 0) {
-                        std.mem.swap(Value, &items[j - 1], &items[j]);
-                        j -= 1;
-                    } else break;
+                    return .{ .order = std.math.order(ord_val.asI64() orelse 0, 0) };
                 }
-            }
+            };
+            const by = By{ .host = host, .comparator = comparator, .out = out };
+            if (try runtime.stableSort(Value, RuntimeError, a, items, by, By.cmp)) |e| return .{ .err = e };
             return .{ .items = items };
         },
     }
 }
 
 fn sortValuesNaturalDescErr(a: Allocator, items: []Value, descending: bool) Error!?RuntimeError {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareValues(a, items[j - 1], items[j])) {
-                .order => |o| o,
-                .err => |e| return e.err,
-            };
-            const flipped = if (descending) reverseOrder(o) else o;
-            if (flipped == .gt) {
-                std.mem.swap(Value, &items[j - 1], &items[j]);
-                j -= 1;
-            } else break;
-        }
-    }
-    return null;
+    return if (try common_mod.sortValuesNaturalDesc(a, items, descending)) |e| e.err else null;
 }
 
 pub fn compare_values(a: Allocator, x: Value, y: Value) Error!OrderResult {

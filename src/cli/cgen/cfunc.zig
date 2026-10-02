@@ -414,6 +414,9 @@ fn writeInst(fx: *Fn, inst: *const ir.Inst) Error!void {
         .UnboxValue => |x| try fx.assign(x.dst, try fx.fmt("klio_r_unbox_value({s}, {d}u, {d}u)", .{ try fx.boxed(x.src), x.class.int(), x.slot }), .object),
         .ArrayGet => |x| try fx.assign(x.dst, try fx.fmt("klio_r_array_get({s}, {s})", .{ try fx.boxed(x.array), try fx.as(x.index, .i32) }), .object),
         .ArraySet => |x| try w.print("  klio_r_array_set({s}, {s}, {s});\n", .{ try fx.boxed(x.array), try fx.as(x.index, .i32), try fx.boxed(x.value) }),
+        .IterOpen => |x| try fx.assign(x.dst, try fx.fmt("klio_r_iter_open({s})", .{try fx.boxed(x.src)}), .object),
+        .IterHas => |x| try fx.assign(x.dst, try fx.fmt("klio_r_iter_has({s}, {s}, {s})", .{ try fx.boxed(x.src), try fx.as(x.idx, .i32), try fx.boxed(x.stamp) }), .boolean),
+        .IterGet => |x| try fx.assign(x.dst, try fx.fmt("klio_r_iter_get({s}, {s}, {s})", .{ try fx.boxed(x.src), try fx.as(x.idx, .i32), try fx.boxed(x.stamp) }), .object),
         .NewArray => |x| {
             const arr = try fx.argArray(x.args, x.n_args, 0);
             try fx.assign(x.dst, try fx.fmt("klio_r_new_array({d}u, {s}, {d})", .{ x.class.int(), arr, x.n_args }), .object);

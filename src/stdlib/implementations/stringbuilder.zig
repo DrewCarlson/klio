@@ -110,6 +110,19 @@ fn sbMut(sb: anytype) @TypeOf(sb.borrowMut()) {
     return sb.borrowMut();
 }
 
+/// Whether every byte of the builder is ASCII, so a UTF-16 index is a byte index: known from
+/// its header with no scan where the last change kept it so, else scanned.
+fn asciiBytes(sb: anytype, items: []const u8) bool {
+    if (runtime.sbAsciiLen(@intFromPtr(sb.cell), items.len) != null) return true;
+    for (items) |b| if (b >= 0x80) return false;
+    return true;
+}
+
+fn allAscii(bytes: []const u8) bool {
+    for (bytes) |b| if (b >= 0x80) return false;
+    return true;
+}
+
 fn sbMemoFor(sb: anytype, items: []const u8) *SbMemo {
     return runtime.sbMemoFor(@intFromPtr(sb.cell), items);
 }
@@ -315,7 +328,7 @@ fn userSeqRange(ctx: *CallCtx, v: *const Value, start_arg: ?Value, end_arg: ?Val
     const start = if (start_arg) |sa| (sa.asI64() orelse 0) else 0;
     const end = if (end_arg) |ea| (ea.asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start, end, vlen });
         defer if (runtime.freeScratch()) a.free(msg);
         return .{ .err = try rangeOob(a, msg) };
     }
@@ -340,6 +353,11 @@ fn userSeqRange(ctx: *CallCtx, v: *const Value, start_arg: ?Value, end_arg: ?Val
 
 fn rangeOob(allocator: Allocator, msg: []const u8) Allocator.Error!RuntimeError {
     return .{ .Thrown = try makeException(allocator, "kotlin.IndexOutOfBoundsException", msg) };
+}
+
+/// A range of the builder or string itself, which Java checks with its string bounds check.
+fn stringRangeOob(allocator: Allocator, msg: []const u8) Allocator.Error!RuntimeError {
+    return .{ .Thrown = try makeException(allocator, "klio.StringIndexOutOfBoundsException", msg) };
 }
 
 
@@ -374,9 +392,9 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
                 const cnt = ctx.args[2].asI64() orelse 0;
                 const size: i64 = @intCast(elems.len);
                 if (off < 0 or cnt < 0 or off > size - cnt) {
-                    const msg = try std.fmt.allocPrint(a, "offset {d}, count {d}, size {d}", .{ off, cnt, size });
+                    const msg = try std.fmt.allocPrint(a, "Range [{d}, {d} + {d}) out of bounds for length {d}", .{ off, off, cnt, size });
                     defer if (runtime.freeScratch()) a.free(msg);
-                    return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+                    return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
                 }
                 start = @intCast(off);
                 count = @intCast(cnt);
@@ -527,9 +545,9 @@ pub fn string_builder_set_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     // Throws only for start < 0, start > length or start > endIndex; an endIndex
     // past the length is clamped.
     if (start < 0 or start > len or start > end) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start, end, len });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start, @min(end, len), len });
         defer if (runtime.freeScratch()) a.free(msg);
-        return errResult(try rangeOob(a, msg));
+        return errResult(try stringRangeOob(a, msg));
     }
     const clamped_end = @min(end, len);
     const new_units = try spliceUnits(a, units, @intCast(start), @intCast(clamped_end), value.?);
@@ -563,7 +581,7 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
         const start = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
         const end = if (ctx.args.len > 3) (ctx.args[3].asI64() orelse vlen) else vlen;
         if (start < 0 or start > end or end > vlen) {
-            const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+            const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start, end, vlen });
             defer if (runtime.freeScratch()) a.free(msg);
             return errResult(try rangeOob(a, msg));
         }
@@ -589,7 +607,7 @@ pub fn string_builder_append_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const start = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     const end = if (ctx.args.len > 3) (ctx.args[3].asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start, end, vlen });
         defer if (runtime.freeScratch()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
@@ -630,7 +648,7 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const start = if (user_units != null) 0 else if (ctx.args.len > 3) (ctx.args[3].asI64() orelse 0) else 0;
     const end = if (user_units != null) vlen else if (ctx.args.len > 4) (ctx.args[4].asI64() orelse vlen) else vlen;
     if (start < 0 or start > end or end > vlen) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, vlen });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start, end, vlen });
         defer if (runtime.freeScratch()) a.free(msg);
         return errResult(try rangeOob(a, msg));
     }
@@ -642,9 +660,9 @@ pub fn string_builder_insert_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     const len: i64 = @intCast(units.len);
     if (index < 0 or index > len) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ index, len });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ index, len, len });
         defer if (runtime.freeScratch()) a.free(msg);
-        return errResult(try rangeOob(a, msg));
+        return errResult(try stringRangeOob(a, msg));
     }
     const slice = value.?[@intCast(start)..@intCast(end)];
     const new_units = try spliceUnits(a, units, @intCast(index), @intCast(index), slice);
@@ -661,10 +679,22 @@ pub fn string_builder_append(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 4 and isCharSeqOrArray(ctx.args[1]) and
         ctx.args[2].asI64() != null and ctx.args[3].asI64() != null)
     {
-        // `append(str: CharArray, offset, len)` is a deprecated stub that always
-        // throws (KT-15220); the real CharArray subrange is `appendRange`.
+        // `append(str: CharArray, offset, len)` is the JVM's member, `len` characters
+        // from `offset`; the common library deprecates its extension of the shape and
+        // leaves it unimplemented.
         if (ctx.args[1] == .Array) {
-            return thrown(ctx.allocator, "kotlin.NotImplementedError", "An operation is not implemented.");
+            const offset = ctx.args[2].asI64().?;
+            const end = offset + ctx.args[3].asI64().?;
+            const n: i64 = @intCast(ctx.args[1].Array.len());
+            if (offset < 0 or offset > end or end > n) {
+                const msg = try std.fmt.allocPrint(ctx.allocator, "Range [{d}, {d}) out of bounds for length {d}", .{ offset, end, n });
+                defer if (runtime.freeScratch()) ctx.allocator.free(msg);
+                return thrown(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
+            }
+            const range = [_]Value{ ctx.args[0], ctx.args[1], Value.newInt(@intCast(offset)), Value.newInt(@intCast(end)) };
+            var sub = ctx.*;
+            sub.args = &range;
+            return string_builder_append_range(&sub);
         }
         return string_builder_append_range(ctx);
     }
@@ -727,15 +757,30 @@ pub fn string_builder_set(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const unit = ctx.args[2].Char;
 
+    if (unit < 0x80) {
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (asciiBytes(sb, buf.items)) {
+            if (index.? < 0 or @as(usize, @intCast(index.?)) >= buf.items.len) {
+                const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ index.?, buf.items.len });
+                defer if (runtime.freeScratch()) a.free(msg);
+                return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+            }
+            buf.items[@intCast(index.?)] = @intCast(unit);
+            runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+            return ok(.Unit);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
     var units = try encodeUtf16(a, buf.items);
     defer a.free(units);
     if (index.? < 0 or @as(usize, @intCast(index.?)) >= units.len) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ index.?, units.len });
+        const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ index.?, units.len });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     units[@intCast(index.?)] = unit;
     const s = try fromUtf16Lossy(a, units);
@@ -826,16 +871,16 @@ pub fn string_builder_get(ctx: *CallCtx) Allocator.Error!EvalResult {
     const m = sbMemoFor(sb, buf);
     const n: i64 = @intCast(m.u16_len);
     if (idx.? < 0 or idx.? >= n) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     const ui: usize = @intCast(idx.?);
     if (m.ascii) return ok(.{ .Char = buf[ui] });
     if (sbUnitAt(m, buf, ui)) |u| return ok(.{ .Char = u });
-    const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+    const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, n });
     defer if (runtime.freeScratch()) a.free(msg);
-    return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+    return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
 }
 
 pub fn string_builder_is_empty(ctx: *CallCtx) Allocator.Error!EvalResult {
@@ -876,6 +921,21 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer piece.deinit(a);
     try piece.appendSlice(a, piece_bytes);
 
+    if (allAscii(piece_bytes)) {
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (asciiBytes(sb, buf.items)) {
+            if (idx.? < 0 or idx.? > buf.items.len) {
+                const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ idx.?, buf.items.len, buf.items.len });
+                defer if (runtime.freeScratch()) a.free(msg);
+                return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+            }
+            try buf.insertSlice(a, @intCast(idx.?), piece_bytes);
+            runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+            return okSb(sb);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
@@ -885,9 +945,9 @@ pub fn string_builder_insert(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? > n) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ idx.?, n, n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     const piece_units = try bufUnits(a, piece.items);
     defer a.free(piece_units);
@@ -907,6 +967,21 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     const idx = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
     if (idx == null) return errResult(.{ .Type = "deleteAt index must be Int" });
 
+    {
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (asciiBytes(sb, buf.items)) {
+            if (idx.? < 0 or idx.? >= buf.items.len) {
+                const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, buf.items.len });
+                defer if (runtime.freeScratch()) a.free(msg);
+                return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+            }
+            _ = buf.orderedRemove(@intCast(idx.?));
+            runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+            return okSb(sb);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
@@ -914,9 +989,9 @@ pub fn string_builder_delete_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? >= n) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     const at: usize = @intCast(idx.?);
     var out: std.ArrayList(u16) = .empty;
@@ -935,6 +1010,26 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     const end = if (ctx.args.len > 2) ctx.args[2].asI64() else null;
     if (end == null) return errResult(.{ .Type = "deleteRange end must be Int" });
 
+    {
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (asciiBytes(sb, buf.items)) {
+            const n: i64 = @intCast(buf.items.len);
+            // Kotlin throws only for startIndex < 0, > length or > endIndex; an endIndex
+            // past the length deletes through the end.
+            if (start.? < 0 or start.? > n or start.? > end.?) {
+                const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start.?, @min(end.?, n), n });
+                defer if (runtime.freeScratch()) a.free(msg);
+                return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+            }
+            const s: usize = @intCast(start.?);
+            const e: usize = @intCast(@min(end.?, n));
+            buf.replaceRangeAssumeCapacity(s, e - s, &.{});
+            runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+            return okSb(sb);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
@@ -944,9 +1039,9 @@ pub fn string_builder_delete_range(ctx: *CallCtx) Allocator.Error!EvalResult {
     // Kotlin throws only for startIndex < 0, > length or > endIndex; an endIndex
     // past the length deletes through the end.
     if (start.? < 0 or start.? > n or start.? > end.?) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end.?, n });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start.?, @min(end.?, n), n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     const s: usize = @intCast(start.?);
     const e: usize = @intCast(@min(end.?, n));
@@ -964,9 +1059,9 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     const new_len = if (ctx.args.len > 1) ctx.args[1].asI64() else null;
     if (new_len == null) return errResult(.{ .Type = "setLength requires Int" });
     if (new_len.? < 0) {
-        const msg = try std.fmt.allocPrint(a, "newLength: {d}", .{new_len.?});
+        const msg = try std.fmt.allocPrint(a, "String index out of range: {d}", .{new_len.?});
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
 
     const target: usize = @intCast(new_len.?);
@@ -1004,17 +1099,24 @@ pub fn string_builder_set_length(ctx: *CallCtx) Allocator.Error!EvalResult {
 pub fn string_builder_reverse(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const sb = sbArg(ctx.args) orelse return errResult(sbTypeError("StringBuilder.reverse"));
-    const g = sbMut(sb);
+    const g = sb.borrowMut();
     defer g.deinit();
     const buf = g.get();
-    var rev: std.ArrayList(u8) = .empty;
-    defer rev.deinit(a);
+    // Each character's bytes, in order, at the mirrored place: a surrogate pair stays one.
+    const rev = try a.alloc(u8, buf.items.len);
+    defer a.free(rev);
     var view = std.unicode.Utf8View.initUnchecked(buf.items);
     var it = view.iterator();
+    var end = rev.len;
     while (it.nextCodepointSlice()) |slice| {
-        try rev.insertSlice(a, 0, slice);
+        end -= slice.len;
+        @memcpy(rev[end..][0..slice.len], slice);
     }
-    try setBuf(buf, a, rev.items);
+    @memcpy(buf.items, rev);
+    // The length and the ASCII-ness are the same, the cursor no longer is.
+    if (runtime.sbAsciiLen(@intFromPtr(sb.cell), buf.items.len) != null) {
+        runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+    } else runtime.sbMemoInvalidate(@intFromPtr(sb.cell));
     return okSb(sb);
 }
 
@@ -1033,6 +1135,25 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     const g = sb.borrow();
     defer g.deinit();
     const buf = g.get().items;
+    if (asciiBytes(sb, buf)) {
+        const n: i64 = @intCast(buf.len);
+        var end: i64 = n;
+        if (is_range) {
+            end = ctx.args[1].Range.end + 1;
+        } else if (ctx.args.len > 2) {
+            if (ctx.args[2].isIntegral()) {
+                end = ctx.args[2].asI64().?;
+            } else {
+                return errResult(.{ .Type = "substring end must be Int" });
+            }
+        }
+        if (start.? < 0 or end > n or start.? > end) {
+            const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start.?, end, n });
+            defer if (runtime.freeScratch()) a.free(msg);
+            return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+        }
+        return ok(.{ .String = try runtime.strInit(a, buf[@intCast(start.?)..@intCast(end)]) });
+    }
     const units = try bufUnits(a, buf);
     defer a.free(units);
     const n: i64 = @intCast(units.len);
@@ -1047,9 +1168,9 @@ pub fn string_builder_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
     }
     if (start.? < 0 or end > n or start.? > end) {
-        const msg = try std.fmt.allocPrint(a, "startIndex: {d}, endIndex: {d}, length: {d}", .{ start.?, end, n });
+        const msg = try std.fmt.allocPrint(a, "Range [{d}, {d}) out of bounds for length {d}", .{ start.?, end, n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     const dup = try runtime.charUnitsToString(a, units[@intCast(start.?)..@intCast(end)]);
     return ok(.{ .String = try runtime.strInitOwned(a, dup) });
@@ -1065,6 +1186,21 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const ch = ctx.args[2].Char;
 
+    if (ch < 0x80) {
+        const g = sb.borrowMut();
+        defer g.deinit();
+        const buf = g.get();
+        if (asciiBytes(sb, buf.items)) {
+            if (idx.? < 0 or idx.? >= buf.items.len) {
+                const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, buf.items.len });
+                defer if (runtime.freeScratch()) a.free(msg);
+                return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
+            }
+            buf.items[@intCast(idx.?)] = @intCast(ch);
+            runtime.sbMemoAscii(@intFromPtr(sb.cell), buf.items.len);
+            return ok(.Unit);
+        }
+    }
     const g = sbMut(sb);
     defer g.deinit();
     const buf = g.get();
@@ -1072,9 +1208,9 @@ pub fn string_builder_set_char_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer a.free(units);
     const n: i64 = @intCast(units.len);
     if (idx.? < 0 or idx.? >= n) {
-        const msg = try std.fmt.allocPrint(a, "index: {d}, length: {d}", .{ idx.?, n });
+        const msg = try std.fmt.allocPrint(a, "Index {d} out of bounds for length {d}", .{ idx.?, n });
         defer if (runtime.freeScratch()) a.free(msg);
-        return thrown(a, "kotlin.IndexOutOfBoundsException", msg);
+        return thrown(a, "klio.StringIndexOutOfBoundsException", msg);
     }
     units[@intCast(idx.?)] = ch;
     try setBufUnits(buf, a, units);
@@ -1346,7 +1482,7 @@ test "get returns char and bounds-checks" {
         const r = try string_builder_get(&c);
         try testing.expect(r == .err);
         defer freeSb(r.err.Thrown, a);
-        try testing.expectEqualStrings("kotlin.IndexOutOfBoundsException", r.err.Thrown.exceptionFqn().?);
+        try testing.expectEqualStrings("klio.StringIndexOutOfBoundsException", r.err.Thrown.exceptionFqn().?);
     }
 }
 
@@ -1739,4 +1875,42 @@ test "the length read after each append follows the appends and any other change
     try testing.expectEqual(@as(i32, 2), try Len.of(&tc, a, sb));
     try Len.append(&tc, a, sb, .{ .Char = 'z' });
     try testing.expectEqual(@as(i32, 3), try Len.of(&tc, a, sb));
+}
+
+fn sbBytes(v: Value) []const u8 {
+    return v.StringBuilder.asPtrConst().items;
+}
+
+test "an ASCII builder is edited in place and keeps its length known with no scan" {
+    const a = testing.allocator;
+    var tc = TestCtx.init(a);
+    defer tc.deinit();
+    const sb = try newSb(a, "hello");
+    defer freeSb(sb, a);
+    const cell = @intFromPtr(sb.StringBuilder.cell);
+    const Op = struct { f: *const fn (*CallCtx) Allocator.Error!EvalResult, args: []const Value, want: []const u8 };
+    const ops = [_]Op{
+        .{ .f = string_builder_insert, .args = &.{ sb, .{ .Int = 0 }, .{ .Char = '[' } }, .want = "[hello" },
+        .{ .f = string_builder_delete_at, .args = &.{ sb, .{ .Int = 5 } }, .want = "[hell" },
+        .{ .f = string_builder_set_char_at, .args = &.{ sb, .{ .Int = 1 }, .{ .Char = 'H' } }, .want = "[Hell" },
+        .{ .f = string_builder_delete_range, .args = &.{ sb, .{ .Int = 2 }, .{ .Int = 4 } }, .want = "[Hl" },
+        .{ .f = string_builder_reverse, .args = &.{sb}, .want = "lH[" },
+    };
+    for (ops) |op| {
+        var args: [3]Value = undefined;
+        @memcpy(args[0..op.args.len], op.args);
+        var c = tc.ctx(a, args[0..op.args.len]);
+        const r = try op.f(&c);
+        try testing.expect(r == .ok);
+        defer freeSb(r.ok, a);
+        try testing.expectEqualStrings(op.want, sbBytes(sb));
+        try testing.expectEqual(@as(?usize, op.want.len), runtime.sbAsciiLen(cell, op.want.len));
+    }
+    // A non-ASCII character takes the builder off the known-ASCII path, and the edit still lands.
+    var args = [_]Value{ sb, .{ .Int = 1 }, .{ .Char = 0xE9 } };
+    var c = tc.ctx(a, &args);
+    const r = try string_builder_set_char_at(&c);
+    defer freeSb(r.ok, a);
+    try testing.expectEqualStrings("l\u{e9}[", sbBytes(sb));
+    try testing.expectEqual(@as(?usize, null), runtime.sbAsciiLen(cell, sbBytes(sb).len));
 }

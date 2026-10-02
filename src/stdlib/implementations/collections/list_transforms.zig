@@ -3,6 +3,7 @@
 //! and zip.
 
 const std = @import("std");
+const hashing = @import("hashing.zig");
 const runtime = @import("runtime");
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -23,6 +24,9 @@ const builders_mod = @import("builders.zig");
 const materialiseIterableInstance = builders_mod.materialiseIterableInstance;
 
 const common_mod = @import("common.zig");
+const mapEntriesLen = common_mod.mapEntriesLen;
+const mapStructuralBump = common_mod.mapStructuralBump;
+const map_mod = @import("map.zig");
 const CompareOutcome = common_mod.CompareOutcome;
 const RangeIter = common_mod.RangeIter;
 const appendArrItems = common_mod.appendArrItems;
@@ -97,69 +101,17 @@ pub fn sortListHostAwareDesc(ctx: *CallCtx, items: []Value, descending: bool) Er
         }
     }
     if (!needs_host) return sortValuesNaturalDesc(a, items, descending);
-    const n = items.len;
-    if (n < 2) return null;
-    const buf = try a.alloc(Value, n);
-    defer if (runtime.freeScratch()) a.free(buf);
-    var width: usize = 1;
-    while (width < n) : (width *= 2) {
-        var lo: usize = 0;
-        while (lo < n) : (lo += 2 * width) {
-            const mid = @min(lo + width, n);
-            const hi = @min(lo + 2 * width, n);
-            var i = lo;
-            var j = mid;
-            var k = lo;
-            while (i < mid and j < hi) {
-                const raw = switch (try compareHostAware(ctx, items[i], items[j])) {
-                    .order => |o| o,
-                    .err => |e| return e,
-                };
-                const o = if (descending) reverseOrder(raw) else raw;
-                // Take the left run on a tie so the sort stays stable.
-                if (o != .gt) {
-                    buf[k] = items[i];
-                    i += 1;
-                } else {
-                    buf[k] = items[j];
-                    j += 1;
-                }
-                k += 1;
-            }
-            while (i < mid) : ({
-                i += 1;
-                k += 1;
-            }) buf[k] = items[i];
-            while (j < hi) : ({
-                j += 1;
-                k += 1;
-            }) buf[k] = items[j];
+    const By = struct {
+        ctx: *CallCtx,
+        descending: bool,
+        fn cmp(self: @This(), x: *const Value, y: *const Value) Error!runtime.SortOrder(EvalResult) {
+            return switch (try compareHostAware(self.ctx, x.*, y.*)) {
+                .order => |o| .{ .order = if (self.descending) reverseOrder(o) else o },
+                .err => |e| .{ .err = e },
+            };
         }
-        @memcpy(items[0..n], buf[0..n]);
-    }
-    return null;
-}
-
-pub fn coll_list_sorted(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const it = switch (try recvListItems(a, ctx.args, "List.sorted")) {
-        .items => |x| x,
-        .err => |e| return e,
     };
-    const copy = try snapshotItems(a, it);
-    defer if (runtime.freeScratch()) a.free(copy);
-    if (try sortListHostAware(ctx, copy)) |e| return e;
-    return ok(try makeList(a, copy, false));
-}
-
-pub fn coll_list_sorted_descending(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const v = try coll_list_sorted(ctx);
-    if (v == .err) return v;
-    const items = try snapshotItems(a, v.ok.List.items);
-    defer if (runtime.freeScratch()) a.free(items);
-    std.mem.reverse(Value, items);
-    return ok(try makeList(a, items, false));
+    return runtime.stableSort(Value, EvalResult, a, items, By{ .ctx = ctx, .descending = descending }, By.cmp);
 }
 
 pub fn coll_list_reversed(ctx: *CallCtx) Error!EvalResult {
@@ -332,80 +284,19 @@ fn collListMinMaxCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []cons
 
 pub fn pairsFromValues(a: Allocator, items: []const Value, who: []const u8) Error!union(enum) { entries: std.ArrayList(MapPair), err: EvalResult } {
     var entries: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     for (items) |v| {
         if (v != .Pair) return .{ .err = typeErr(try fmt(a, "{s} requires a collection of Pair<K, V>", .{who})) };
         const key = v.Pair.first.asPtrConst().*;
         const val = v.Pair.second.asPtrConst().*;
-        if (findKeyIndexBoxed(entries.items, &key)) |i| {
+        if (try hashing.findQuiet(&keys, null, undefined, a, entries.items, &key)) |i| {
             entries.items[i].value = val;
         } else {
             try entries.append(a, .{ .key = key, .value = val });
         }
     }
     return .{ .entries = entries };
-}
-
-/// Read a user `Map` implementation into `MapPair`s through its `entries` view;
-/// an entry may be a `Map.Entry` instance, a builtin `MapEntry` or a `Pair`.
-pub fn userMapPairs(ctx: *CallCtx, inst: Value, who: []const u8) Error!union(enum) { entries: []MapPair, err: EvalResult } {
-    const a = ctx.allocator;
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePush(inst);
-    const entries_r = (try ctx.host.callWellKnown(&inst, .entries, &.{}, ctx.out)) orelse
-        return .{ .err = typeErr(try fmt(a, "{s} requires a Map or a collection of Pairs", .{who})) };
-    const entries_val = switch (entries_r) {
-        .ok => |v| v,
-        .err => |e| return .{ .err = .{ .err = e } },
-    };
-    runtime.keepalivePush(entries_val);
-    const items = switch (try materialiseIterableInstance(ctx, entries_val)) {
-        .items => |x| x,
-        .err => |e| return .{ .err = e },
-    };
-    runtime.keepalivePushSlice(items);
-    const loop_keepalive = runtime.keepaliveMark();
-    var out: std.ArrayList(MapPair) = .empty;
-    for (items) |entry| {
-        runtime.keepaliveRestore(loop_keepalive);
-        runtime.keepalivePushPairs(out.items);
-        runtime.keepalivePush(entry);
-        var key: Value = undefined;
-        var val: Value = undefined;
-        switch (entry) {
-            .MapEntry => |me| {
-                key = me.key.asPtrConst().*;
-                val = me.value.asPtrConst().*;
-            },
-            .Pair => |p| {
-                key = p.first.asPtrConst().*;
-                val = p.second.asPtrConst().*;
-            },
-            else => {
-                const kr = (try ctx.host.callWellKnown(&entry, .entry_key, &.{}, ctx.out)) orelse
-                    return .{ .err = typeErr(try fmt(a, "{s} entry is missing key", .{who})) };
-                key = switch (kr) {
-                    .ok => |v| v,
-                    .err => |e| return .{ .err = .{ .err = e } },
-                };
-                runtime.keepalivePush(key);
-                const vr = (try ctx.host.callWellKnown(&entry, .entry_value, &.{}, ctx.out)) orelse
-                    return .{ .err = typeErr(try fmt(a, "{s} entry is missing value", .{who})) };
-                val = switch (vr) {
-                    .ok => |v| v,
-                    .err => |e| return .{ .err = .{ .err = e } },
-                };
-            },
-        }
-        runtime.keepalivePush(key);
-        runtime.keepalivePush(val);
-        if (try findKeyIndexBoxedH(ctx.host, ctx.out, out.items, &key)) |i| {
-            out.items[i].value = val;
-        } else {
-            try out.append(a, .{ .key = key, .value = val });
-        }
-    }
-    return .{ .entries = try out.toOwnedSlice(a) };
 }
 
 pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
@@ -419,37 +310,28 @@ pub fn coll_list_to_map(ctx: *CallCtx) Error!EvalResult {
         },
     };
     defer if (runtime.freeScratch()) a.free(items);
+    if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
+        // As `destination.apply { putAll(this) }`: each pair put in turn, through its key's
+        // `hashCode()` and `equals`.
+        const dest = ctx.args[1].Map.entries;
+        const _mb = mapEntriesLen(dest);
+        defer mapStructuralBump(dest, _mb);
+        const mark = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(mark);
+        runtime.keepalivePushSlice(items);
+        for (items) |v| {
+            if (v != .Pair) return typeErr("toMap requires a collection of Pair<K, V>");
+            switch (try map_mod.putEntry(ctx, dest, v.Pair.first.asPtrConst().*, v.Pair.second.asPtrConst().*)) {
+                .prev => |p| if (p) |old| if (runtime.reclaimEnabled()) old.release(a),
+                .thrown => |e| return e,
+            }
+        }
+        return ok(ctx.args[1]);
+    }
     const entries = switch (try pairsFromValues(a, items, "toMap")) {
         .entries => |x| x,
         .err => |e| return e,
     };
-    if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
-        const dest = ctx.args[1];
-        const g = dest.Map.entries.borrowMut();
-        defer g.deinit();
-        for (entries.items) |kv| {
-            var found = false;
-            for (g.get().pairs.items) |*slot| {
-                if (eqBoxed(&slot.key, &kv.key)) {
-                    if (runtime.reclaimEnabled()) {
-                        kv.value.retain();
-                        slot.value.release(a);
-                    }
-                    slot.value = kv.value;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                if (runtime.reclaimEnabled()) {
-                    kv.key.retain();
-                    kv.value.retain();
-                }
-                try g.get().append(a, kv);
-            }
-        }
-        return ok(dest);
-    }
     return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, false));
 }
 
@@ -461,10 +343,14 @@ pub fn coll_list_distinct(ctx: *CallCtx) Error!EvalResult {
     };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
-    var out: std.ArrayList(Value) = .empty;
-    for (items) |v| {
-        if (!try containsBoxedH(ctx.host, ctx.out, out.items, &v)) try out.append(a, v);
-    }
+    var seen = hashing.Seen.init();
+    defer seen.deinit(a);
+    for (items) |v| switch (try seen.add(ctx.host, ctx.out, a, v)) {
+        .added, .present => {},
+        .thrown => |e| return e,
+    };
+    const out = seen.items;
+    seen.items = .empty;
     return ok(try makeListBorrowed(a, out, false));
 }
 
@@ -649,7 +535,7 @@ pub fn coll_list_plus(ctx: *CallCtx) Error!EvalResult {
     const arg = ctx.args[1];
     switch (arg) {
         .List => |l| try appendVL(&out, a, l.items),
-        .Set => |s| try appendVL(&out, a, s.items),
+        .Set => |s| try appendVL(&out, a, s.dense()),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItemsCtx(ctx, arg, "plus")) {
                 .items => |x| x,
@@ -723,7 +609,7 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     var is_collection = true;
     switch (arg) {
         .List => |l| try appendVL(&removals, a, l.items),
-        .Set => |s| try appendVL(&removals, a, s.items),
+        .Set => |s| try appendVL(&removals, a, s.dense()),
         .Range, .Sequence, .Array => {
             const xs = switch (try iterableItemsCtx(ctx, arg, "minus")) {
                 .items => |x| x,
@@ -740,9 +626,19 @@ pub fn coll_list_minus(ctx: *CallCtx) Error!EvalResult {
     var out: std.ArrayList(Value) = .empty;
     const src = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(src);
+    var gone = hashing.Seen.init();
+    defer gone.deinit(a);
+    if (is_collection) for (removals.items) |r| switch (try gone.add(ctx.host, ctx.out, a, r)) {
+        .added, .present => {},
+        .thrown => |e| return e,
+    };
     for (src) |v| {
         if (is_collection) {
-            if (!try containsBoxedH(ctx.host, ctx.out, removals.items, &v)) try out.append(a, v);
+            switch (try gone.find(ctx.host, ctx.out, a, v)) {
+                .thrown => |e| return e,
+                .at => {},
+                .none => try out.append(a, v),
+            }
         } else if (try indexOfBoxedH(ctx.host, ctx.out, removals.items, &v)) |pos| {
             _ = removals.orderedRemove(pos);
         } else {
@@ -862,7 +758,7 @@ pub fn coll_list_zip(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) rhs.deinit(a);
     switch (rhs_val) {
         .List => |l| try appendVL(&rhs, a, l.items),
-        .Set => |s| try appendVL(&rhs, a, s.items),
+        .Set => |s| try appendVL(&rhs, a, s.dense()),
         .Array => |arr| try appendArrItems(&rhs, a, arr),
         .Range => |r| {
             var rit = RangeIter.init(r.start, r.end, r.step, r.kind);

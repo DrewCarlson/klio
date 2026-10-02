@@ -1,0 +1,25 @@
+sum 112683
+long 1099511627776
+true false 
+uint 4000000000
+double 1.5
+xy
+1 2 3 
+[10, 20, 30]
+2 3 5 4 3 2 1 7 8 
+a=1 b=2 a b 1 2 a1 b2 
+3 2 1 9 8 
+0p 1q 1one 2two 
+add: ConcurrentModificationException
+remove second to last: [2, 3]
+remove at last: ConcurrentModificationException
+set: [1, 2, 30]
+array write: [1, 2, 30]
+set add: ConcurrentModificationException
+set remove later: ConcurrentModificationException
+set remove earlier at last: [2, 3]
+set remove current mid: ConcurrentModificationException
+map put: ConcurrentModificationException
+clear: ConcurrentModificationException
+break continue: [10, 20, 30, 60]
+total 2009999880

@@ -1,8 +1,7 @@
-// `for (x in …)` compiled to C. The loop is the iteration protocol: the
-// container answers an iterator, and the loop steps it with `hasNext`/`next`.
-// An iterator over a builtin container is a runtime value the interpreter
-// already knows how to step, so a compiled program hands those three calls
-// back to the same code rather than growing its own iterators.
+// `for (x in …)` compiled to C. A loop over a builtin list, set, array or
+// string reads it by position through the runtime the interpreter uses, so a
+// compiled program grows no iteration code of its own; any other iterable is
+// stepped through its iterator's `hasNext`/`next`.
 fun main() {
     val words = listOf("alpha", "beta", "gamma")
     for (w in words) println(w)

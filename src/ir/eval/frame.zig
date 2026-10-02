@@ -335,6 +335,7 @@ pub const Frame = struct {
             }
             self.pfRelease(self.allocator);
         }
+        self.owns_params_caps = false;
         self.freePending();
         self.freeHeap(ev);
         if (self.vs_mark) |m| ev.vstack.restore(m);

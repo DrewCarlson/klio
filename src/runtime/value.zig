@@ -236,6 +236,14 @@ inline fn sbSetAscii(cell: usize, len: usize) void {
     @atomicStore(u32, &h.gc_aux, if (len < sb_unknown) @intCast(len) else sb_unknown, .monotonic);
 }
 
+/// After a change that left builder `cell` ASCII throughout and `len` bytes long: its length
+/// known with no scan, and a memo of what it held before dropped.
+pub fn sbMemoAscii(cell: usize, len: usize) void {
+    sbSetAscii(cell, len);
+    const sb_memo = sb_memo_tls.get();
+    if (sb_memo.cell == cell) sb_memo.cell = 0;
+}
+
 pub fn sbMemoInvalidate(cell: usize) void {
     sbSetAscii(cell, sb_unknown);
     const sb_memo = sb_memo_tls.get();
@@ -561,20 +569,46 @@ pub const MapPair = struct {
 };
 /// Backing store for `Map`/`MutableMap`: the insertion-ordered entry list
 /// Kotlin's `LinkedHashMap` semantics require, plus a hash index over entry
-/// positions. `hashes[i]` is the hash of `pairs[i].key` for each entry below
+/// slots. `hashes[i]` is the hash of `slots[i].key` for each slot below
 /// `hashes.len`: `keyHash` for a simple key, else the hash the host gave for
 /// it (an instance's `hashCode()`), taken once as a `HashMap` node keeps it.
 /// Entries past it are hashed on the next lookup that needs them. `buckets`,
 /// a power of two long, maps a hash's low bits to one past the newest indexed
-/// entry whose hash has them, and `chain[i]` links entry `i` to one past the
+/// slot whose hash has them, and `chain[i]` links slot `i` to one past the
 /// next older one in its bucket, 0 ending it; a lookup compares the stored
 /// hash before the key. They cover the first `chain.len` hashes. Maps below
 /// `index_threshold` are scanned instead.
+///
+/// Removing an indexed entry leaves a hole in its slot, as a `LinkedHashMap`
+/// unlinks a node without touching the others: the slot leaves its bucket, its
+/// `chain` link becomes `hole` and its key and value `Unit`. The entries in
+/// order are the slots that are not holes (`live`, `len`); `compact` closes the
+/// holes up, and a reader that wants the entries as one slice (`dense`) reads
+/// them after it.
 pub const MapStore = struct {
-    pairs: std.ArrayList(MapPair) = .empty,
+    slots: std.ArrayList(MapPair) = .empty,
     hashes: std.ArrayList(u64) = .empty,
     buckets: []u32 = &.{},
     chain: std.ArrayList(u32) = .empty,
+    /// How many of `slots` are holes, all below `chain.len`.
+    holes: usize = 0,
+    /// How many of the first slots are holes: a walk in order starts past them.
+    head: usize = 0,
+    /// Counts the times the entries moved to other slots (`compact`, `clear`, a removal
+    /// past the index), so a walk over the slots finds its place again by how many
+    /// entries it has passed.
+    epoch: u32 = 0,
+    /// Per slot, once an entry object was made of one (`tracking`), the entry object of
+    /// the node standing there, null until one is made (`nodeEntry`). A node is a key's
+    /// place from its insertion until its removal, which a later insertion of the key
+    /// does not take over, as a JVM `HashMap`'s node, which is its own `Map.Entry`: every
+    /// walk over the entries hands out the same object, and when the node leaves the map
+    /// the object takes its last value and the store lets it go.
+    nodes: std.ArrayList(?*MapEntryRef.Cell) = .empty,
+    tracking: bool = false,
+    /// The map a `buildMap` builds, while it builds: its entries fail fast after a
+    /// structural change, as `MapBuilder`'s do.
+    builder: bool = false,
     /// A key neither `keyHash` nor the host can hash (a lambda): lookups scan
     /// until the map is cleared.
     unhashable: bool = false,
@@ -585,12 +619,17 @@ pub const MapStore = struct {
     /// Below this count a linear scan beats a hash table, so no index is built.
     pub const index_threshold: usize = 16;
 
+    /// A hole's `chain` link, which no slot of a map that fits in memory reaches.
+    pub const hole: u32 = std.math.maxInt(u32);
+
     /// Writers turn the cell's sequence, so a lookup takes no lock
     /// (`lookupNoLock`).
     pub const objref_sequenced = true;
 
     pub fn deinit(self: *MapStore, a: std.mem.Allocator) void {
-        self.pairs.deinit(a);
+        for (self.nodes.items) |n| if (n) |c| (MapEntryRef{ .cell = c }).deinit();
+        self.nodes.deinit(a);
+        self.slots.deinit(a);
         self.hashes.deinit(a);
         a.free(self.buckets);
         self.chain.deinit(a);
@@ -602,10 +641,13 @@ pub const MapStore = struct {
     }
 
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
-        for (self.pairs.items) |*kv| kv.gcTrace(m);
+        // A hole holds `Unit`, which marks nothing.
+        for (self.slots.items) |*kv| kv.gcTrace(m);
+        for (self.nodes.items) |n| if (n) |c| m.shade(&c.hdr);
         if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
         // The lines of the arrays the region holds (`gc.buffer_allocator`).
-        m.markBuffer(@intFromPtr(self.pairs.items.ptr), self.pairs.capacity * @sizeOf(MapPair));
+        m.markBuffer(@intFromPtr(self.slots.items.ptr), self.slots.capacity * @sizeOf(MapPair));
+        m.markBuffer(@intFromPtr(self.nodes.items.ptr), self.nodes.capacity * @sizeOf(?*MapEntryRef.Cell));
         m.markBuffer(@intFromPtr(self.hashes.items.ptr), self.hashes.capacity * @sizeOf(u64));
         m.markBuffer(@intFromPtr(self.chain.items.ptr), self.chain.capacity * @sizeOf(u32));
         m.markBuffer(@intFromPtr(self.buckets.ptr), self.buckets.len * @sizeOf(u32));
@@ -634,6 +676,13 @@ pub const MapStore = struct {
                 defer sg.deinit();
                 break :blk std.hash.Wyhash.hash(14, sg.get().bytes);
             },
+            // A pair or triple of simple values compares component by component
+            // (`structuralEqBoxed`): its components' hashes, mixed in order.
+            .Pair => |p| mixKey(15, (keyHash(p.first.asPtrConst()) orelse return null) ^
+                std.math.rotl(u64, keyHash(p.second.asPtrConst()) orelse return null, 23)),
+            .Triple => |t| mixKey(16, (keyHash(t.first.asPtrConst()) orelse return null) ^
+                std.math.rotl(u64, keyHash(t.second.asPtrConst()) orelse return null, 23) ^
+                std.math.rotl(u64, keyHash(t.third.asPtrConst()) orelse return null, 46)),
             else => null,
         };
     }
@@ -652,9 +701,100 @@ pub const MapStore = struct {
         return z ^ (z >> 31);
     }
 
+    /// How many entries the map holds: its slots that are not holes.
+    pub inline fn len(self: *const MapStore) usize {
+        return self.slots.items.len - self.holes;
+    }
+
+    /// Whether slot `i` is a hole a removal left.
+    pub inline fn isHole(self: *const MapStore, i: usize) bool {
+        return self.holes != 0 and i < self.chain.items.len and self.chain.items[i] == hole;
+    }
+
+    /// The entries in order as one slice, for a store that holds no holes: after
+    /// `compact` under the write lock, or under a borrow `borrowDense` took.
+    pub fn dense(self: *const MapStore) []MapPair {
+        std.debug.assert(self.holes == 0);
+        return self.slots.items;
+    }
+
+    /// The entries in order, skipping holes.
+    pub fn live(self: *const MapStore) Live {
+        return .{ .store = self };
+    }
+
+    pub const Live = struct {
+        store: *const MapStore,
+        i: usize = 0,
+
+        /// The next entry's slot.
+        pub fn nextSlot(self: *Live) ?usize {
+            const st = self.store;
+            while (self.i < st.slots.items.len) {
+                const i = self.i;
+                self.i += 1;
+                if (!st.isHole(i)) return i;
+            }
+            return null;
+        }
+
+        pub fn next(self: *Live) ?*MapPair {
+            const i = self.nextSlot() orelse return null;
+            return &self.store.slots.items[i];
+        }
+    };
+
+    /// The entries in order, copied into a slice of their own from `a`.
+    pub fn liveCopy(self: *const MapStore, a: std.mem.Allocator) std.mem.Allocator.Error![]MapPair {
+        if (self.holes == 0) return a.dupe(MapPair, self.slots.items);
+        const out = try a.alloc(MapPair, self.len());
+        var it = self.live();
+        var k: usize = 0;
+        while (it.next()) |kv| : (k += 1) out[k] = kv.*;
+        return out;
+    }
+
+    /// A new store holding this one's entries in order, with the hashes this one keeps for
+    /// them, for a map made as a copy of this one (`HashMap(map)`, `toMutableMap`); a
+    /// lookup builds its index when it first needs one. The caller retains the entries
+    /// where values are counted.
+    pub fn copyLive(self: *const MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!MapStore {
+        var out: MapStore = .{ .unhashable = self.unhashable };
+        errdefer out.deinit(a);
+        try out.slots.ensureTotalCapacityPrecise(a, self.len());
+        // The hashes cover a run of the first slots, the holes among them.
+        try out.hashes.ensureTotalCapacityPrecise(a, @min(self.hashes.items.len, self.len()));
+        var it = self.live();
+        while (it.nextSlot()) |i| {
+            out.slots.appendAssumeCapacity(self.slots.items[i]);
+            if (i < self.hashes.items.len) out.hashes.appendAssumeCapacity(self.hashes.items[i]);
+        }
+        return out;
+    }
+
+    /// The first slot from `i` on that is not a hole, or the slots' length.
+    pub fn pastHoles(self: *const MapStore, i: usize) usize {
+        var p = i;
+        if (self.holes != 0) {
+            while (p < self.slots.items.len and self.isHole(p)) p += 1;
+        }
+        return p;
+    }
+
+    /// The slot of the entry `n` places from the first, null past the last.
+    pub fn slotAt(self: *const MapStore, n: usize) ?usize {
+        if (self.holes == 0) return if (n < self.slots.items.len) n else null;
+        var it = self.live();
+        var k: usize = 0;
+        while (it.nextSlot()) |i| : (k += 1) {
+            if (k == n) return i;
+        }
+        return null;
+    }
+
     fn linearFind(self: *const MapStore, key: *const Value) ?usize {
-        for (self.pairs.items, 0..) |*kv, i| {
-            if (Value.structuralEqBoxed(&kv.key, key)) return i;
+        for (self.slots.items, 0..) |*kv, i| {
+            if (!self.isHole(i) and Value.structuralEqBoxed(&kv.key, key)) return i;
         }
         return null;
     }
@@ -667,55 +807,179 @@ pub const MapStore = struct {
     /// Adds `kv` after the last entry, `h` being its key's hash when the
     /// caller took it. A map below `index_threshold` keeps no hashes.
     pub fn appendHashed(self: *MapStore, a: std.mem.Allocator, kv: MapPair, h: ?u64) std.mem.Allocator.Error!void {
-        try self.pairs.append(a, kv);
+        if (self.tracking) try self.nodes.ensureUnusedCapacity(a, 1);
+        try self.slots.append(a, kv);
+        if (self.tracking) self.nodes.appendAssumeCapacity(null);
         const hsh = h orelse return;
-        if (self.pairs.items.len < index_threshold or self.hashes.items.len + 1 != self.pairs.items.len) return;
+        if (self.slots.items.len < index_threshold or self.hashes.items.len + 1 != self.slots.items.len) return;
         try self.hashes.append(a, hsh);
         if (self.chain.items.len + 1 == self.hashes.items.len) try self.bucket(a, self.chain.items.len);
     }
 
-    /// Removes the entry at `i`, keeping the hashes of the others and
-    /// renumbering their buckets.
+    /// Removes the entry in slot `i`. An indexed entry leaves a hole and every
+    /// other keeps its slot, the last slot's going with the holes before it; one
+    /// past the index (in a map too small for one) is taken out, the slots after
+    /// it moving down one.
     pub fn removeAt(self: *MapStore, i: usize) MapPair {
-        const kv = self.pairs.orderedRemove(i);
-        if (i >= self.hashes.items.len) return kv;
-        const h = self.hashes.orderedRemove(i);
-        if (i >= self.chain.items.len) return kv;
-        const pos: u32 = @intCast(i + 1);
-        const next = self.chain.items[i];
-        // A bucket runs from its newest entry to its oldest, so what links
-        // to `i` is newer than it.
-        const first = &self.buckets[h & (self.buckets.len - 1)];
-        if (first.* == pos) {
-            first.* = next;
-        } else {
-            var slot = first.*;
-            while (slot != 0) : (slot = self.chain.items[slot - 1]) {
-                if (self.chain.items[slot - 1] == pos) {
-                    self.chain.items[slot - 1] = next;
-                    break;
-                }
+        const kv = self.slots.items[i];
+        if (self.tracking) self.letGo(i);
+        if (i >= self.chain.items.len) {
+            _ = self.slots.orderedRemove(i);
+            if (self.tracking) _ = self.nodes.orderedRemove(i);
+            if (i < self.hashes.items.len) _ = self.hashes.orderedRemove(i);
+            // The entries after it moved down a slot.
+            self.epoch +%= 1;
+            return kv;
+        }
+        self.unlink(i);
+        // An indexed last slot ends all three arrays.
+        if (i + 1 == self.slots.items.len) {
+            self.dropLast();
+            while (self.holes != 0 and self.chain.items[self.chain.items.len - 1] == hole) {
+                self.dropLast();
+                self.holes -= 1;
             }
+            if (self.head > self.slots.items.len) self.head = self.slots.items.len;
+            return kv;
         }
-        _ = self.chain.orderedRemove(i);
-        for (self.chain.items) |*c| {
-            if (c.* > pos) c.* -= 1;
-        }
-        for (self.buckets) |*b| {
-            if (b.* > pos) b.* -= 1;
+        self.chain.items[i] = hole;
+        self.slots.items[i] = .{ .key = .Unit, .value = .Unit };
+        self.holes += 1;
+        // The last slot is never a hole, so the run of leading holes ends before it.
+        if (i == self.head) {
+            var h = i + 1;
+            while (self.isHole(h)) h += 1;
+            self.head = h;
         }
         return kv;
     }
 
+    fn dropLast(self: *MapStore) void {
+        self.slots.items.len -= 1;
+        if (self.tracking) self.nodes.items.len -= 1;
+        self.hashes.items.len -= 1;
+        self.chain.items.len -= 1;
+    }
+
+    /// Takes indexed slot `i` out of its bucket.
+    fn unlink(self: *MapStore, i: usize) void {
+        const pos: u32 = @intCast(i + 1);
+        const next = self.chain.items[i];
+        // A bucket runs from its newest slot to its oldest, so what links to
+        // `i` is newer than it.
+        const first = &self.buckets[self.hashes.items[i] & (self.buckets.len - 1)];
+        if (first.* == pos) {
+            first.* = next;
+            return;
+        }
+        var slot = first.*;
+        while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+            if (self.chain.items[slot - 1] == pos) {
+                self.chain.items[slot - 1] = next;
+                return;
+            }
+        }
+    }
+
+    /// Closes the holes up: each entry moves down past the holes before it, in
+    /// order, and the buckets are built again over the slots as they now stand.
+    /// The entries' positions change, so a caller walking slots stops first.
+    pub fn compact(self: *MapStore) void {
+        if (self.holes == 0) return;
+        const hashed = self.hashes.items.len - self.holes;
+        const indexed = self.chain.items.len - self.holes;
+        var w: usize = 0;
+        for (0..self.slots.items.len) |r| {
+            if (r < self.chain.items.len and self.chain.items[r] == hole) continue;
+            self.slots.items[w] = self.slots.items[r];
+            if (self.tracking) self.nodes.items[w] = self.nodes.items[r];
+            // The holes are all indexed, so the hashed slots stay first.
+            if (r < self.hashes.items.len) self.hashes.items[w] = self.hashes.items[r];
+            w += 1;
+        }
+        self.slots.items.len = w;
+        if (self.tracking) self.nodes.items.len = w;
+        self.hashes.items.len = hashed;
+        self.chain.items.len = indexed;
+        self.holes = 0;
+        self.head = 0;
+        self.epoch +%= 1;
+        @memset(self.buckets, 0);
+        for (self.hashes.items[0..indexed], 0..) |h, j| {
+            const b = &self.buckets[h & (self.buckets.len - 1)];
+            self.chain.items[j] = b.*;
+            b.* = @intCast(j + 1);
+        }
+    }
+
+    /// `compact` once the holes are as many as the entries, so a removal's share
+    /// of the copying stays constant.
+    pub fn compactIfSparse(self: *MapStore) void {
+        if (self.holes != 0 and self.holes * 2 >= self.slots.items.len) self.compact();
+    }
+
     /// Removes every entry.
     pub fn clear(self: *MapStore) void {
-        self.pairs.clearRetainingCapacity();
+        if (self.tracking) for (0..self.nodes.items.len) |i| self.letGo(i);
+        self.slots.clearRetainingCapacity();
+        self.nodes.clearRetainingCapacity();
+        self.holes = 0;
+        self.head = 0;
+        self.epoch +%= 1;
         self.forgetHashes();
     }
 
-    /// Drops every hash, for entries rearranged in place: the next lookup
-    /// through the index hashes them again.
+    /// The entry object of the node in slot `slot`, which every walk over the entries hands
+    /// out (a new reference to it), its value the node's now and `exp_mod` taken as
+    /// `stamp`; made through `a` for `entries`, this store, the first time. The store
+    /// tracks every slot's node from the first one on, in an array `buf_a` grows, as its
+    /// others.
+    pub fn nodeEntry(self: *MapStore, buf_a: std.mem.Allocator, a: std.mem.Allocator, entries: MapEntries, slot: usize, stamp: u64) std.mem.Allocator.Error!Value {
+        if (!self.tracking) {
+            try self.nodes.appendNTimes(buf_a, null, self.slots.items.len);
+            self.tracking = true;
+        }
+        const n = &self.nodes.items[slot];
+        const kv = self.slots.items[slot];
+        if (n.*) |c| {
+            const entry: MapEntryRef = .{ .cell = c };
+            const me = &c.data;
+            me.exp_mod = stamp;
+            me.at = @intCast(slot);
+            // The value the entry read last: the node's now.
+            me.putValue(kv.value);
+            return .{ .MapEntry = &entry.clone().cell.data };
+        }
+        if (objcell.reclaimEnabled()) {
+            kv.key.retain();
+            kv.value.retain();
+        }
+        const entry = try MapEntryRef.init(a, .{
+            .key = kv.key,
+            .value = kv.value,
+            .backing = .from(entries),
+            .exp_mod = stamp,
+            .at = @intCast(slot),
+        });
+        // The caller's write borrow of the store took the barrier this store needs.
+        n.* = entry.cell;
+        return .{ .MapEntry = &entry.clone().cell.data };
+    }
+
+    /// The node in slot `i` leaves the map: its entry object, if one was made, takes the
+    /// value the node has, and the store's reference to it goes.
+    pub fn letGo(self: *MapStore, i: usize) void {
+        const c = self.nodes.items[i] orelse return;
+        self.nodes.items[i] = null;
+        const entry: MapEntryRef = .{ .cell = c };
+        c.data.putValue(self.slots.items[i].value);
+        entry.deinit();
+    }
+
+    /// Drops every hash, for entries rearranged in place (the store holding no
+    /// holes): the next lookup through the index hashes them again.
     pub fn forgetHashes(self: *MapStore) void {
+        std.debug.assert(self.holes == 0);
         self.hashes.clearRetainingCapacity();
         @memset(self.buckets, 0);
         self.chain.clearRetainingCapacity();
@@ -730,7 +994,7 @@ pub const MapStore = struct {
     /// Takes `hs` as the hashes of the entries from `from` on; false when
     /// the entries changed since `from` was read.
     pub fn addHashes(self: *MapStore, a: std.mem.Allocator, from: usize, hs: []const u64) std.mem.Allocator.Error!bool {
-        if (self.hashes.items.len != from or from + hs.len > self.pairs.items.len) return false;
+        if (self.hashes.items.len != from or from + hs.len > self.slots.items.len) return false;
         try self.hashes.appendSlice(a, hs);
         return true;
     }
@@ -753,9 +1017,9 @@ pub const MapStore = struct {
         return self.buckets[h & (self.buckets.len - 1)];
     }
 
-    /// Entry `i`, the next to index, into its bucket: the buckets double first
-    /// when they would hold more than three entries for every four of them,
-    /// and every indexed entry is put in its new bucket again.
+    /// Slot `i`, the next to index, into its bucket: the buckets double first
+    /// when they would hold more than three slots for every four of them, and
+    /// every indexed slot but a hole is put in its new bucket again.
     fn bucket(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
         try self.chain.ensureUnusedCapacity(a, 1);
         if ((i + 1) * 4 > self.buckets.len * 3) {
@@ -765,6 +1029,7 @@ pub const MapStore = struct {
             self.buckets = grown;
             @memset(self.buckets, 0);
             for (self.hashes.items[0..i], 0..) |h, j| {
+                if (self.chain.items[j] == hole) continue;
                 const b = &self.buckets[h & (n - 1)];
                 self.chain.items[j] = b.*;
                 b.* = @intCast(j + 1);
@@ -785,37 +1050,46 @@ pub const MapStore = struct {
     /// null when the buckets do not index every entry or the key has no hash,
     /// and `find` must run.
     pub fn findIndexed(self: *const MapStore, key: *const Value) ?(?usize) {
-        const n = self.pairs.items.len;
+        const n = self.slots.items.len;
         if (self.unhashable or n < index_threshold or self.hashes.items.len != n or self.chain.items.len != n) return null;
         const hsh = keyHash(key) orelse return null;
         var slot = self.bucketHead(hsh);
         while (slot != 0) {
             const i = slot - 1;
-            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
+            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.slots.items[i].key, key)) return i;
             slot = self.chain.items[i];
         }
         return @as(?usize, null);
+    }
+
+    /// Hashes the entries past the hashes while their keys are simple and puts every hashed
+    /// one in its bucket, as a lookup does first: a removal from slot `i` then leaves a
+    /// hole where an index covers it. Nothing for a map below `index_threshold`.
+    pub fn indexSimple(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (self.unhashable or self.slots.items.len < index_threshold) return;
+        while (self.hashes.items.len < self.slots.items.len) {
+            const kh = keyHash(&self.slots.items[self.hashes.items.len].key) orelse break;
+            try self.hashes.append(a, kh);
+        }
+        try self.indexHashed(a);
     }
 
     /// The entry whose key equals `key` structurally: through the buckets
     /// for the hashed entries, by a scan of those after them. The entries
     /// with simple keys are hashed first.
     pub fn find(self: *MapStore, a: std.mem.Allocator, key: *const Value) std.mem.Allocator.Error!?usize {
-        if (self.unhashable or self.pairs.items.len < index_threshold) return self.linearFind(key);
+        if (self.unhashable or self.slots.items.len < index_threshold) return self.linearFind(key);
         const hsh = keyHash(key) orelse return self.linearFind(key);
-        while (self.hashes.items.len < self.pairs.items.len) {
-            const kh = keyHash(&self.pairs.items[self.hashes.items.len].key) orelse break;
-            try self.hashes.append(a, kh);
-        }
-        try self.indexHashed(a);
+        try self.indexSimple(a);
         var slot = self.bucketHead(hsh);
         while (slot != 0) {
             const i = slot - 1;
-            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.pairs.items[i].key, key)) return i;
+            if (self.hashes.items[i] == hsh and Value.structuralEqBoxed(&self.slots.items[i].key, key)) return i;
             slot = self.chain.items[i];
         }
+        // No hole is past the hashes.
         const from = self.hashes.items.len;
-        for (self.pairs.items[from..], from..) |*kv, i| {
+        for (self.slots.items[from..], from..) |*kv, i| {
             if (Value.structuralEqBoxed(&kv.key, key)) return i;
         }
         return null;
@@ -833,6 +1107,71 @@ pub const RangeIterState = struct {
 
 pub const MapEntries = ObjRef(MapStore);
 
+/// A walk over a map's entries where they stand, as the JVM's iterator over a map's
+/// `entrySet()` walks it: each step takes the store's lock only to read the next entry, so
+/// the caller may run Kotlin code between steps (an element's `toString`, a put into
+/// another map) with no lock held, and no copy of the entries is made. A step after a
+/// structural change since the walk began ends it (`changed`), where the JVM's iterator
+/// throws `ConcurrentModificationException`, unless the entry before was the map's last
+/// then (`IterCursor.ended`); a compaction, which moves the entries without changing the
+/// map, it follows by how many entries it has passed. The caller roots an entry it holds
+/// across Kotlin code (`keepalivePushPairs`).
+pub const MapWalk = struct {
+    entries: MapEntries,
+    pos: usize,
+    passed: usize = 0,
+    epoch: u32,
+    stamp: u64,
+    ended: bool,
+
+    pub const Step = union(enum) { pair: MapPair, end, changed };
+
+    pub fn init(entries: MapEntries) MapWalk {
+        const g = entries.borrow();
+        defer g.deinit();
+        const st = g.get();
+        return .{ .entries = entries, .pos = st.head, .epoch = st.epoch, .stamp = structuralCount(st), .ended = st.len() == 0 };
+    }
+
+    pub fn next(self: *MapWalk) Step {
+        if (self.ended) return .end;
+        const g = self.entries.borrow();
+        defer g.deinit();
+        const st = g.get();
+        if (structuralCount(st) != self.stamp) return .changed;
+        if (st.epoch != self.epoch) {
+            self.pos = st.slotAt(self.passed) orelse st.slots.items.len;
+            self.epoch = st.epoch;
+        }
+        self.pos = st.pastHoles(self.pos);
+        if (self.pos >= st.slots.items.len) return .end;
+        const kv = st.slots.items[self.pos];
+        self.pos += 1;
+        self.passed += 1;
+        self.ended = st.pastHoles(self.pos) >= st.slots.items.len;
+        return .{ .pair = kv };
+    }
+
+    fn structuralCount(st: *const MapStore) u64 {
+        const mc = st.mod_count.get() orelse return 0;
+        return mc.cell.data.load() & ~FROZEN_MOD_BIT;
+    }
+};
+
+/// A read borrow of `entries` under which the store holds no holes, so its entries read
+/// as one slice (`MapStore.dense`): a store holding some is compacted under the write
+/// lock first.
+pub fn mapBorrowDense(entries: MapEntries) objcell.ObjGuard(MapStore) {
+    while (true) {
+        const g = entries.borrow();
+        if (g.get().holes == 0) return g;
+        g.deinit();
+        const w = entries.borrowMut();
+        w.get().compact();
+        w.deinit();
+    }
+}
+
 /// The value of the entry whose stored hash is `hsh` and whose key `eq(ctx, key)` says
 /// is the one looked up, read with no lock where `objcell.lockfree_reads` holds, in a
 /// map whose every entry is in its index. The store's arrays are read between two
@@ -849,7 +1188,7 @@ pub fn lookupNoLock(entries: MapEntries, hsh: u64, ctx: anytype, comptime eq: fn
     const before = seq.load(.acquire);
     if (before & 1 != 0) return null;
     const st = &cell.data;
-    const pairs = sliceWords(&st.pairs.items);
+    const pairs = sliceWords(&st.slots.items);
     const hashes = sliceWords(&st.hashes.items);
     const buckets = sliceWords(&st.buckets);
     const chain = sliceWords(&st.chain.items);
@@ -892,6 +1231,19 @@ pub fn lookupNoLock(entries: MapEntries, hsh: u64, ctx: anytype, comptime eq: fn
     objcell.loadFence();
     if (seq.load(.monotonic) != before) return null;
     return .Null;
+}
+
+/// How many entries `entries` holds, read with no lock between two equal even readings
+/// of its write sequence; null when a writer overlapped the read.
+pub fn mapLenNoLock(entries: MapEntries) ?usize {
+    const seq = &entries.cell.lock.seq;
+    const before = seq.load(.acquire);
+    if (before & 1 != 0) return null;
+    const st = &entries.cell.data;
+    const n = @atomicLoad(usize, &st.slots.items.len, .monotonic) -% @atomicLoad(usize, &st.holes, .monotonic);
+    objcell.loadFence();
+    if (seq.load(.monotonic) != before) return null;
+    return n;
 }
 
 /// `lookupNoLock` of Int key `x`: its hash and its compare in line, the rest of a
@@ -938,12 +1290,21 @@ pub const MapData = struct {
     /// Declared key and value type heads; see `ListData.declared_elem`.
     declared_key: ?[]const u8 = null,
     declared_value: ?[]const u8 = null,
+    /// The map's `keys`, `values` and `entries` views (`MapViews.kt`), by `MapViewKind`,
+    /// made on first use and kept, as the JVM's maps keep theirs.
+    views: [3]?Value = @splat(null),
 
     /// Releases the entries' keys and values when this was their last owner.
     pub fn deinit(self: *MapData, allocator: std.mem.Allocator) void {
+        // A view holds the entries: the views go first.
+        for (&self.views) |*v| if (v.*) |x| {
+            x.release(allocator);
+            v.* = null;
+        };
         if (self.entries.strongCount() == 1) {
             const g = self.entries.borrow();
-            for (g.get().pairs.items) |pair| {
+            // A hole holds `Unit`, which releases nothing.
+            for (g.get().slots.items) |pair| {
                 pair.key.release(allocator);
                 pair.value.release(allocator);
             }
@@ -954,6 +1315,15 @@ pub const MapData = struct {
 
     pub fn gcTrace(self: *const MapData, m: *objcell.gc.Marker) void {
         m.shade(&self.entries.cell.hdr);
+        for (self.views) |v| if (v) |x| x.gcMark(m);
+    }
+
+    /// Keeps `v` as the map's view of `kind`, as the collector must see a reference stored
+    /// in a cell.
+    pub fn setView(self: *MapData, kind: MapViewKind, v: Value) void {
+        self.views[@intFromEnum(kind)] = v;
+        const cell: *MapRef.Cell = @alignCast(@fieldParentPtr("data", self));
+        objcell.gc.writeBarrier(&cell.hdr);
     }
 };
 
@@ -993,26 +1363,103 @@ pub const BoundMethodData = struct {
 };
 
 pub const MapEntryData = struct {
-    key: ValueBox,
-    value: ValueBox,
+    key: Value,
+    /// The value it keeps once its node left the map, or with no map behind it; read and
+    /// written under the entry's own lock (`putValue`). `getValue` is the entry's value.
+    value: Value,
     /// When set, the live map's entries: `setValue` writes through.
     backing: objcell.OptRef(MapStore) = .{},
     /// The backing counter when this entry was handed out; a later structural
     /// change makes every member access throw ConcurrentModificationException.
     exp_mod: u64 = 0,
+    /// The slot the key was last in in the backing store: checked before a scan.
+    at: u32 = 0,
+
+    /// The slot of this live entry's key in its backing store: where it last was
+    /// when that slot still holds the key, else found by a scan, which moves `at`.
+    pub fn slotIn(self: *MapEntryData, store: *const MapStore) ?usize {
+        const key = &self.key;
+        const slots = store.slots.items;
+        if (self.at < slots.len and !store.isHole(self.at) and Value.structuralEq(&slots[self.at].key, key)) return self.at;
+        var it = store.live();
+        while (it.nextSlot()) |i| {
+            if (Value.structuralEq(&slots[i].key, key)) {
+                self.at = @intCast(i);
+                return i;
+            }
+        }
+        return null;
+    }
+
+    pub const Read = union(enum) {
+        /// The node's value as the map holds it.
+        live: Value,
+        /// A builder's map changed structurally since the entry was handed out.
+        stale,
+        /// The node left the map: the entry's own value stands.
+        detached,
+    };
+
+    /// What a read of this entry finds in `store`, read under its lock: a `buildMap`
+    /// builder's entry fails fast once the map changed structurally, as `MapBuilder`'s
+    /// do; any other is its node, as a JVM `HashMap`'s entry is.
+    pub fn read(self: *MapEntryData, store: *const MapStore) Read {
+        if (store.builder) if (store.mod_count.get()) |mc| if (mc.cell.data.load() != self.exp_mod) return .stale;
+        const i = self.nodeSlot(store) orelse return .detached;
+        return .{ .live = store.slots.items[i].value };
+    }
+
+    /// The slot this entry's node stands in, the one whose entry object it is (`MapStore.nodeEntry`),
+    /// null once the node left the map (a removal, a `clear`), as a JVM `HashMap`'s entry
+    /// outlives its node's place. An entry with no node of its own finds its key.
+    pub fn nodeSlot(self: *MapEntryData, store: *const MapStore) ?usize {
+        if (!store.tracking) return self.slotIn(store);
+        const nodes = store.nodes.items;
+        const mine = mapEntryRefOf(self).cell;
+        if (self.at < nodes.len and nodes[self.at] == mine) return self.at;
+        for (nodes, 0..) |n, i| {
+            if (n != mine) continue;
+            self.at = @intCast(i);
+            return i;
+        }
+        return null;
+    }
+
+    /// Its value: its node's while the node is in the map, its own once it left, as a JVM
+    /// `HashMap`'s entry is its node. Takes the store's lock: not for a caller holding it.
+    pub fn getValue(self: *MapEntryData) Value {
+        if (self.backing.get()) |entries| {
+            const sg = entries.borrow();
+            defer sg.deinit();
+            if (self.nodeSlot(sg.get())) |i| return sg.get().slots.items[i].value;
+        }
+        const g = mapEntryRefOf(self).borrow();
+        defer g.deinit();
+        return g.get().value;
+    }
+
+    /// Makes `v` the value it holds, under its lock; the same value stays.
+    pub fn putValue(self: *MapEntryData, v: Value) void {
+        const g = mapEntryRefOf(self).borrowMut();
+        defer g.deinit();
+        const cur = &g.get().value;
+        if (Value.structuralEq(cur, &v)) return;
+        if (objcell.reclaimEnabled()) {
+            v.retain();
+            cur.release(std.heap.page_allocator);
+        }
+        cur.* = v;
+    }
 
     pub fn deinit(self: *MapEntryData, allocator: std.mem.Allocator) void {
-        _ = allocator;
-        self.key.deinit();
-        self.value.deinit();
+        self.key.release(allocator);
+        self.value.release(allocator);
         // `backing` is a non-owning write-through reference.
     }
 
     pub fn gcTrace(self: *const MapEntryData, m: *objcell.gc.Marker) void {
-        // Shade the box cells, whose own tracers reach the inner values:
-        // marking through the interior would leave the boxes unmarked.
-        m.shade(&self.key.cell.hdr);
-        m.shade(&self.value.cell.hdr);
+        self.key.gcMark(m);
+        self.value.gcMark(m);
         if (self.backing.get()) |b| m.shade(&b.cell.hdr);
     }
 };
@@ -1248,24 +1695,295 @@ pub inline fn listRefOf(l: *ListData) ListRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", l)) };
 }
 
+/// A hash index over the elements of a list by position, for a set's membership
+/// (`stdlib`'s `collections/hashing.zig`): each element's hash, taken once as the element
+/// joins, as a `HashSet`'s node keeps it, and buckets of positions over them. An element
+/// with no hash a lookup can use (`no_hash`) is compared by every lookup. It is read and
+/// written under the lock of the list it indexes, and `seq` is the list's write sequence
+/// it covers, so a change made to the list another way is seen and the index built again.
+/// A removed element's position can stay behind as a hole (`removeHole`), which no
+/// lookup offers, until `compact` closes it up as the list's elements move down.
+pub const ValueIndex = struct {
+    hashes: std.ArrayList(u64) = .empty,
+    /// One past the newest position in each bucket, 0 for none: a power of two long, at
+    /// least twice the positions.
+    buckets: []u32 = &.{},
+    /// Per position: one past the next older position in its bucket, 0 ending it, or
+    /// `hole`.
+    chain: std.ArrayList(u32) = .empty,
+    /// The positions whose element has no hash.
+    loose: std.ArrayList(u32) = .empty,
+    seq: u32 = 0,
+
+    pub const no_hash: u64 = std.math.maxInt(u64);
+
+    /// A removed element's `chain` link: its position is in no bucket and not loose.
+    pub const hole: u32 = std.math.maxInt(u32);
+
+    /// The allocator an index's arrays live in, apart from the collector's heap: the index
+    /// frees them as its cell goes.
+    pub const allocator = std.heap.c_allocator;
+
+    pub fn deinit(self: *ValueIndex, a: std.mem.Allocator) void {
+        _ = a;
+        self.hashes.deinit(allocator);
+        allocator.free(self.buckets);
+        self.buckets = &.{};
+        self.chain.deinit(allocator);
+        self.loose.deinit(allocator);
+    }
+
+    pub fn gcFinalize(self: *ValueIndex, a: std.mem.Allocator) void {
+        self.deinit(a);
+    }
+
+    pub fn len(self: *const ValueIndex) usize {
+        return self.hashes.items.len;
+    }
+
+    pub fn clear(self: *ValueIndex) void {
+        self.hashes.clearRetainingCapacity();
+        self.chain.clearRetainingCapacity();
+        self.loose.clearRetainingCapacity();
+        @memset(self.buckets, 0);
+    }
+
+    /// Indexes one more element, of hash `h`, at the next position.
+    pub fn push(self: *ValueIndex, h: u64) std.mem.Allocator.Error!void {
+        const a = allocator;
+        const pos: u32 = @intCast(self.hashes.items.len);
+        try self.hashes.append(a, h);
+        try self.chain.append(a, 0);
+        if (h == no_hash) return self.loose.append(a, pos);
+        if (self.hashes.items.len * 2 > self.buckets.len) return self.rebucket();
+        self.link(pos, h);
+    }
+
+    inline fn link(self: *ValueIndex, pos: u32, h: u64) void {
+        const b = &self.buckets[@intCast(h & (self.buckets.len - 1))];
+        self.chain.items[pos] = b.*;
+        b.* = pos + 1;
+    }
+
+    /// The buckets again, for every position, at least twice as many as positions.
+    fn rebucket(self: *ValueIndex) std.mem.Allocator.Error!void {
+        const a = allocator;
+        const want = @max(16, std.math.ceilPowerOfTwoAssert(usize, self.hashes.items.len * 2));
+        if (want != self.buckets.len) {
+            a.free(self.buckets);
+            self.buckets = &.{};
+            self.buckets = try a.alloc(u32, want);
+        }
+        @memset(self.buckets, 0);
+        self.loose.clearRetainingCapacity();
+        for (self.hashes.items, 0..) |h, i| {
+            const pos: u32 = @intCast(i);
+            if (self.chain.items[i] == hole) continue;
+            if (h == no_hash) {
+                self.chain.items[i] = 0;
+                try self.loose.append(a, pos);
+            } else self.link(pos, h);
+        }
+    }
+
+    /// Takes position `i` out of every lookup and leaves a hole there, the other
+    /// positions keeping theirs.
+    pub fn removeHole(self: *ValueIndex, i: usize) void {
+        const pos: u32 = @intCast(i);
+        const h = self.hashes.items[i];
+        if (h == no_hash) {
+            if (std.mem.indexOfScalar(u32, self.loose.items, pos)) |at| _ = self.loose.orderedRemove(at);
+        } else {
+            // A bucket runs from its newest position to its oldest, so what links to
+            // `i` is newer than it.
+            const first = &self.buckets[@intCast(h & (self.buckets.len - 1))];
+            if (first.* == pos + 1) {
+                first.* = self.chain.items[i];
+            } else {
+                var slot = first.*;
+                while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+                    if (self.chain.items[slot - 1] == pos + 1) {
+                        self.chain.items[slot - 1] = self.chain.items[i];
+                        break;
+                    }
+                }
+            }
+        }
+        self.chain.items[i] = hole;
+    }
+
+    /// Whether position `i` is a hole.
+    pub inline fn isHole(self: *const ValueIndex, i: usize) bool {
+        return self.chain.items[i] == hole;
+    }
+
+    /// Drops the positions from `n` on, every one a hole.
+    pub fn truncate(self: *ValueIndex, n: usize) void {
+        self.hashes.items.len = n;
+        self.chain.items.len = n;
+    }
+
+    /// Closes the holes up: each position moves down past the holes before it, as the
+    /// list's elements do, and the buckets are linked again over them.
+    pub fn compact(self: *ValueIndex) void {
+        var w: usize = 0;
+        for (self.chain.items, 0..) |c, r| {
+            if (c == hole) continue;
+            self.hashes.items[w] = self.hashes.items[r];
+            w += 1;
+        }
+        self.truncate(w);
+        // As many buckets as before, and the loose positions no more than before.
+        @memset(self.buckets, 0);
+        self.loose.clearRetainingCapacity();
+        for (self.hashes.items, 0..) |h, i| {
+            const pos: u32 = @intCast(i);
+            if (h == no_hash) {
+                self.chain.items[i] = 0;
+                self.loose.appendAssumeCapacity(pos);
+            } else self.link(pos, h);
+        }
+    }
+
+    /// The positions an element of hash `h` may be at: those of its bucket holding that
+    /// hash, then every loose one. `h` `no_hash` answers every position.
+    pub fn candidates(self: *const ValueIndex, h: u64, out: *std.ArrayList(u32), a: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (h == no_hash) {
+            for (0..self.hashes.items.len) |i| if (!self.isHole(i)) try out.append(a, @intCast(i));
+            return;
+        }
+        if (self.buckets.len != 0) {
+            var slot = self.buckets[@intCast(h & (self.buckets.len - 1))];
+            while (slot != 0) : (slot = self.chain.items[slot - 1]) {
+                if (self.hashes.items[slot - 1] == h) try out.append(a, slot - 1);
+            }
+        }
+        try out.appendSlice(a, self.loose.items);
+    }
+};
+
+pub const ValueIndexRef = ObjRef(ValueIndex);
+
 pub const SetData = struct {
-    items: ValueList,
+    /// The elements in order. Removing one from a set with an index leaves a hole in its
+    /// place (`Unit`, its index position a `ValueIndex.hole`), as a `LinkedHashSet` unlinks
+    /// a node without moving the others; `dense` closes the holes up for a reader that
+    /// takes the list as the set's elements.
+    elems: ValueList,
     mutable: bool,
     backing: ?*CollBackingCell,
     /// See `ListData.declared_elem`.
     declared_elem: ?[]const u8 = null,
     mod_count: objcell.OptRef(ModCount) = .{},
+    /// The hash index over `elems` a set of a few elements or more keeps
+    /// (`stdlib`'s `collections/hashing.zig`), read and written under `elems`'s lock.
+    index: ?ValueIndexRef = null,
+    /// How many of `elems` are holes, changed under its lock; never more than none for a
+    /// set with no index that covers its list.
+    holes: u32 = 0,
+    /// How many of `elems`' first positions are holes, so an iterator starts past them.
+    head: u32 = 0,
+    /// Counts the times `compact` moved the elements, so an iterator over the list finds
+    /// its place again by how many elements it has passed.
+    epoch: u32 = 0,
 
     pub fn deinit(self: *SetData, allocator: std.mem.Allocator) void {
-        Value.releaseValueList(self.items, allocator);
+        Value.releaseValueList(self.elems, allocator);
         if (self.backing) |b| (CollBackingRef{ .cell = b }).deinit();
         if (self.mod_count.get()) |mc| mc.deinit();
+        if (self.index) |ix| ix.deinit();
     }
 
     pub fn gcTrace(self: *const SetData, m: *objcell.gc.Marker) void {
-        m.shade(&self.items.cell.hdr);
+        m.shade(&self.elems.cell.hdr);
         if (self.backing) |b| m.shade(&b.hdr);
         if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+        if (self.index) |ix| m.shade(&ix.cell.hdr);
+    }
+
+    /// Gives the set index `ix`, as the collector must see a reference stored in a cell.
+    pub fn setIndex(self: *SetData, ix: ValueIndexRef) void {
+        self.index = ix;
+        const cell: *SetRef.Cell = @alignCast(@fieldParentPtr("data", self));
+        objcell.gc.writeBarrier(&cell.hdr);
+    }
+
+    /// The set's list with no holes in it: its elements in order, for a reader that takes
+    /// them by position or a writer that changes the list another way than the set's
+    /// own lookups (`collections/hashing.zig`).
+    pub fn dense(self: *SetData) ValueList {
+        if (@atomicLoad(u32, &self.holes, .monotonic) != 0) self.compact();
+        return self.elems;
+    }
+
+    /// How many elements the set holds.
+    pub fn len(self: *const SetData) usize {
+        const g = self.elems.borrow();
+        defer g.deinit();
+        return g.get().items.len - self.holes;
+    }
+
+    /// Closes the holes in the list up, the index's positions moving with the elements,
+    /// so the index still covers the list.
+    pub fn compact(self: *SetData) void {
+        const g = self.elems.borrowMut();
+        defer g.deinit();
+        self.compactLocked(g.get());
+    }
+
+    /// Takes the element at position `pos` out of the list, whose write lock the caller
+    /// holds, and answers it. With an index covering the list it leaves a hole and every
+    /// other element keeps its position, the last position going with the holes before
+    /// it; with none the elements after it move down one (`shifted`).
+    pub fn removeAtLocked(self: *SetData, list: *std.ArrayList(Value), pos: usize) struct { gone: Value, shifted: bool } {
+        const gone = list.items[pos];
+        // The writer's lock made the sequence odd: one more than the index's.
+        const s = self.elems.cell.lock.seq.load(.monotonic);
+        if (self.index) |ixr| if (ixr.cell.data.seq == s -% 1 and self.backing == null) {
+            const ix = &ixr.cell.data;
+            ix.removeHole(pos);
+            if (pos + 1 == list.items.len) {
+                var n = pos;
+                while (n > 0 and ix.isHole(n - 1)) n -= 1;
+                @atomicStore(u32, &self.holes, self.holes - @as(u32, @intCast(pos - n)), .monotonic);
+                list.items.len = n;
+                ix.truncate(n);
+                if (self.head > n) self.head = @intCast(n);
+            } else {
+                list.items[pos] = .Unit;
+                @atomicStore(u32, &self.holes, self.holes + 1, .monotonic);
+                // The last position is never a hole, so the run of holes ends before it.
+                if (pos == self.head) {
+                    var h = pos + 1;
+                    while (ix.isHole(h)) h += 1;
+                    self.head = @intCast(h);
+                }
+            }
+            ix.seq = s +% 1;
+            return .{ .gone = gone, .shifted = false };
+        };
+        std.debug.assert(self.holes == 0);
+        _ = list.orderedRemove(pos);
+        return .{ .gone = gone, .shifted = true };
+    }
+
+    /// `compact` under the list's write lock, which the caller holds.
+    pub fn compactLocked(self: *SetData, list: *std.ArrayList(Value)) void {
+        if (self.holes == 0) return;
+        const ix = &self.index.?.cell.data;
+        var w: usize = 0;
+        for (list.items, 0..) |v, r| {
+            if (ix.isHole(r)) continue;
+            list.items[w] = v;
+            w += 1;
+        }
+        list.items.len = w;
+        ix.compact();
+        // The writer's lock made the sequence odd; giving it back makes it one more.
+        ix.seq = self.elems.cell.lock.seq.load(.monotonic) +% 1;
+        @atomicStore(u32, &self.holes, 0, .monotonic);
+        self.head = 0;
+        @atomicStore(u32, &self.epoch, self.epoch +% 1, .monotonic);
     }
 };
 
@@ -1281,12 +1999,11 @@ pub const ValueBox = ObjRef(Value);
 pub const MapViewKind = enum { Keys, Values, Entries };
 
 /// Back-reference carried by a live collection view so reads and mutations
-/// resolve through the source: a `MutableMap` view edits the map, a `subList`
-/// splices through the parent's items, and a primitive-array `.asList()`
+/// resolve through the source: a `subList` splices through the parent's items,
+/// and a primitive-array `.asList()`
 /// reflects later element writes. A reference `Array<T>.asList()` shares the
 /// boxed buffer outright and carries no backing.
 pub const CollBacking = union(enum) {
-    map: struct { entries: MapEntries, kind: MapViewKind },
     sublist: struct {
         /// The parent view's cache in a `subList` chain, or the root list.
         parent: ValueList,
@@ -1305,7 +2022,6 @@ pub const CollBacking = union(enum) {
     /// handle is non-owning, so refcount teardown never releases the source.
     pub fn gcTrace(self: *const CollBacking, m: *objcell.gc.Marker) void {
         switch (self.*) {
-            .map => |x| m.shade(&x.entries.cell.hdr),
             .sublist => |x| {
                 m.shade(&x.parent.cell.hdr);
                 if (x.parent_backing) |pb| m.shade(&pb.hdr);
@@ -1619,6 +2335,20 @@ pub const ArrayStore = union(enum) {
     scalars: ObjRef(PrimBuf),
 };
 
+/// `from`'s values into `to`, the two overlapping or not; where values are counted, each
+/// taken before the ones it replaces are let go.
+fn moveValues(a: std.mem.Allocator, to: []Value, from: []const Value) void {
+    if (objcell.reclaimEnabled()) {
+        for (from) |v| v.retain();
+        for (to) |v| v.release(a);
+    }
+    if (@intFromPtr(to.ptr) <= @intFromPtr(from.ptr)) std.mem.copyForwards(Value, to, from) else std.mem.copyBackwards(Value, to, from);
+}
+
+fn moveBytes(to: []u8, from: []const u8) void {
+    if (@intFromPtr(to.ptr) <= @intFromPtr(from.ptr)) std.mem.copyForwards(u8, to, from) else std.mem.copyBackwards(u8, to, from);
+}
+
 pub const ArrayData = struct {
     /// The storage cell with its element kind tagged into the low four bits.
     /// Every control block is 16-byte aligned, so the pair fits in one pointer
@@ -1704,6 +2434,63 @@ pub const ArrayData = struct {
                 const g = pb.borrowMut();
                 defer g.deinit();
                 g.get().setAs(i, v, self.primKind() orelse g.get().kind);
+            },
+        }
+    }
+
+    /// Copies the `count` elements of `src` from `start` into this array from `at`, as
+    /// `System.arraycopy` copies them whether or not the ranges overlap: under one lock on
+    /// each array, taken in address order so two copies the other way round never wait on
+    /// each other, and for a reference array with the write barrier of the range it writes.
+    /// False, copying nothing, for arrays of two kinds of storage; the caller checked both
+    /// ranges.
+    pub fn copyRangeFrom(self: ArrayData, allocator: std.mem.Allocator, at: usize, src: ArrayData, start: usize, count: usize) bool {
+        switch (self.storage()) {
+            .boxed => |to| {
+                const from = switch (src.storage()) {
+                    .boxed => |vl| vl,
+                    .scalars => return false,
+                };
+                if (count == 0) return true;
+                if (to.cell == from.cell) {
+                    const g = to.borrowMutRange(at, at + count - 1);
+                    defer g.deinit();
+                    moveValues(allocator, g.get().items[at..][0..count], g.get().items[start..][0..count]);
+                    return true;
+                }
+                const to_first = @intFromPtr(to.cell) < @intFromPtr(from.cell);
+                const gt = if (to_first) to.borrowMutRange(at, at + count - 1) else null;
+                const gf = from.borrow();
+                defer gf.deinit();
+                const gt2 = gt orelse to.borrowMutRange(at, at + count - 1);
+                defer gt2.deinit();
+                moveValues(allocator, gt2.get().items[at..][0..count], gf.get().items[start..][0..count]);
+                return true;
+            },
+            .scalars => |to| {
+                const from = switch (src.storage()) {
+                    .scalars => |pb| pb,
+                    .boxed => return false,
+                };
+                if (count == 0) return true;
+                if (to.cell == from.cell) {
+                    const g = to.borrowMut();
+                    defer g.deinit();
+                    const size = g.get().kind.elemSize();
+                    const bytes = g.get().bytes.items;
+                    moveBytes(bytes[at * size ..][0 .. count * size], bytes[start * size ..][0 .. count * size]);
+                    return true;
+                }
+                const to_first = @intFromPtr(to.cell) < @intFromPtr(from.cell);
+                const gt = if (to_first) to.borrowMut() else null;
+                const gf = from.borrow();
+                defer gf.deinit();
+                const gt2 = gt orelse to.borrowMut();
+                defer gt2.deinit();
+                const size = gt2.get().kind.elemSize();
+                if (gf.get().kind.elemSize() != size) return false;
+                @memcpy(gt2.get().bytes.items[at * size ..][0 .. count * size], gf.get().bytes.items[start * size ..][0 .. count * size]);
+                return true;
             },
         }
     }
@@ -1938,6 +2725,12 @@ pub const SeqIterStateRef = ObjRef(SeqIterState);
 
 /// Behind one shared handle, so it survives the by-value copies a `Value`
 /// undergoes.
+/// What made a host iterator, which says its class as the JVM's: a collection's own
+/// iterator is a `MutableIterator`, as every one of a JVM collection is, whether the
+/// collection may change or not; a list's `listIterator()` a `MutableListIterator`; any
+/// other (an array's, a string's) a plain `Iterator`, as Kotlin's own are.
+pub const IterSource = enum(u8) { other, collection, list };
+
 pub const IterCursor = struct {
     pos: usize = 0,
     /// The `ListIterator` set and remove target. -1 before the first move and
@@ -1957,6 +2750,28 @@ pub const IterCursor = struct {
     /// `MutableIterator.remove` and the `MutableListIterator` writes reach the
     /// source. Kotlin throws `UnsupportedOperationException` otherwise.
     mutable: bool = false,
+    /// For an iterator over a map or a view of it, the store whose slots it walks, from
+    /// `pos` over the holes, yielding `map_kind` of each entry: its key, its value, or its
+    /// node's entry object. `items` is empty. `map_epoch` is the store's `epoch` where it
+    /// last stood, and `seen` how many entries it has passed, where it stands again once
+    /// the entries moved.
+    map_store: objcell.OptRef(MapStore) = .{},
+    map_kind: ?MapViewKind = null,
+    map_epoch: u32 = 0,
+    /// For an iterator over a mutable set's own list, which can hold holes: `next` passes
+    /// over them and `remove` leaves one. `seen` counts the elements before `pos`, which
+    /// is where the iterator stands again once the set's `epoch` moves past `set_epoch`.
+    set: objcell.OptRef(SetData) = .{},
+    set_epoch: u32 = 0,
+    seen: usize = 0,
+    /// What made the iterator, which says the class it is an instance of (`IterSource`).
+    source: IterSource = .other,
+    /// For an iterator over a map or a set's own list: set when `next` gave the last element
+    /// the collection held then, or the collection was empty when the iterator was made.
+    /// `hasNext` answers from it alone, as a JVM `LinkedHashMap` iterator answers from the
+    /// node it took to come next, so an element added after the last one ends the walk and
+    /// any other change throws from `next`.
+    ended: bool = false,
 
     pub fn deinit(self: *IterCursor, allocator: std.mem.Allocator) void {
         // The last handle releases the contained elements before the list.
@@ -1967,11 +2782,15 @@ pub const IterCursor = struct {
         }
         self.items.deinit();
         if (self.mod_count.get()) |mc| mc.deinit();
+        if (self.map_store.get()) |ms| ms.deinit();
+        if (self.set.get()) |st| st.deinit();
     }
 
     pub fn gcTrace(self: *const IterCursor, m: *objcell.gc.Marker) void {
         m.shade(&self.items.cell.hdr);
         if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
+        if (self.map_store.get()) |ms| m.shade(&ms.cell.hdr);
+        if (self.set.get()) |st| m.shade(&st.cell.hdr);
     }
 };
 
@@ -3157,13 +3976,19 @@ pub const Value = union(enum) {
             .Sequence => matchesAny(name, &.{ "Sequence", "Any" }),
             .SeqIter => matchesAny(name, &.{ "Iterator", "Any" }),
             .Iterator => |it| blk: {
-                if (matchesAny(name, &.{ "Iterator", "ListIterator", "Any" })) break :blk true;
+                if (matchesAny(name, &.{ "Iterator", "Any" })) break :blk true;
                 const snap = sblk: {
                     const g = it.borrow();
                     defer g.deinit();
-                    break :sblk .{ .mutable = g.get().mutable, .prim = g.get().prim };
+                    break :sblk .{ .source = g.get().source, .prim = g.get().prim };
                 };
-                if (snap.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
+                // As `IterSource` gives the class: the list iterators' names for a list's
+                // `listIterator()`, `MutableIterator` for any collection's.
+                switch (snap.source) {
+                    .list => if (matchesAny(name, &.{ "MutableIterator", "ListIterator", "MutableListIterator" })) break :blk true,
+                    .collection => if (std.mem.eql(u8, name, "MutableIterator")) break :blk true,
+                    .other => {},
+                }
                 if (snap.prim) |p| {
                     break :blk simpleNameMatchesIterator(name, p.simpleName());
                 }
@@ -3275,7 +4100,7 @@ pub const Value = union(enum) {
     /// stay owned by the source value; the caller keeps that alive.
     fn mapEntryParts(v: *const Value) ?struct { key: Value, value: Value } {
         switch (v.*) {
-            .MapEntry => |e| return .{ .key = e.key.asPtrConst().*, .value = e.value.asPtrConst().* },
+            .MapEntry => |e| return .{ .key = e.key, .value = e.getValue() },
             .Instance => |inst| {
                 if (!instanceImplementsMapEntry(inst)) return null;
                 const g = inst.borrow();
@@ -3298,6 +4123,38 @@ pub const Value = union(enum) {
     }
 
     /// A boxed type matches only its own type, elements included.
+    /// `hashCode()` of a number, a `Char`, a `Boolean`, a string or null, as the JVM
+    /// answers it; null for any other value, whose hash depends on what it holds or on a
+    /// class's override.
+    pub fn javaHashCode(v: *const Value) ?i32 {
+        return switch (v.*) {
+            .Null => 0,
+            .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
+            .Char => |c| @as(i32, c),
+            .Byte => |x| @as(i32, x),
+            .Short => |x| @as(i32, x),
+            .Int => |x| x,
+            // An unsigned value class hashes its signed storage: 65535u hashes as -1.
+            .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
+            .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
+            .UInt => |x| @bitCast(x),
+            .Long => |l| @truncate(l ^ @as(i64, @bitCast(@as(u64, @bitCast(l)) >> 32))),
+            .ULong => |u| @truncate(@as(i64, @bitCast(u ^ (u >> 32)))),
+            // `floatToIntBits` and `doubleToLongBits` make every NaN the canonical one.
+            .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @bitCast(f),
+            .Double => |d| blk: {
+                const b: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
+                break :blk @truncate(b ^ @as(i64, @bitCast(@as(u64, @bitCast(b)) >> 32)));
+            },
+            .String => |s| blk: {
+                const g = s.borrow();
+                defer g.deinit();
+                break :blk javaStringHash(g.get().bytes);
+            },
+            else => null,
+        };
+    }
+
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
         // A builtin `MapEntry` and a user `Map.Entry` instance compare by key
         // and value, so `map.entries.contains(e)` works across concrete types.
@@ -3324,7 +4181,7 @@ pub const Value = union(enum) {
                 b.refreshSublistView();
                 return listEqBoxed(x.items, b.List.items);
             },
-            .Set => |x| if (b.* == .Set) return setEqBoxed(x.items, b.Set.items),
+            .Set => |x| if (b.* == .Set) return setEqBoxed(x.dense(), b.Set.dense()),
             .Map => |x| if (b.* == .Map) return mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| if (b.* == .Pair)
                 return structuralEqBoxed(x.first.asPtrConst(), b.Pair.first.asPtrConst()) and structuralEqBoxed(x.second.asPtrConst(), b.Pair.second.asPtrConst()),
@@ -3332,8 +4189,11 @@ pub const Value = union(enum) {
                 return structuralEqBoxed(x.first.asPtrConst(), b.Triple.first.asPtrConst()) and
                     structuralEqBoxed(x.second.asPtrConst(), b.Triple.second.asPtrConst()) and
                     structuralEqBoxed(x.third.asPtrConst(), b.Triple.third.asPtrConst()),
-            .MapEntry => |x| if (b.* == .MapEntry)
-                return structuralEqBoxed(x.key.asPtrConst(), b.MapEntry.key.asPtrConst()) and structuralEqBoxed(x.value.asPtrConst(), b.MapEntry.value.asPtrConst()),
+            .MapEntry => |x| if (b.* == .MapEntry) {
+                const xv = x.getValue();
+                const yv = b.MapEntry.getValue();
+                return structuralEqBoxed(&x.key, &b.MapEntry.key) and structuralEqBoxed(&xv, &yv);
+            },
             // Kotlin does not override `Throwable.equals`.
             .Exception => if (b.* == .Exception) return referenceEq(a, b),
             else => {},
@@ -3393,7 +4253,7 @@ pub const Value = union(enum) {
                 b.refreshSublistView();
                 break :blk listEqBoxed(x.items, b.List.items);
             },
-            .Set => |x| b.* == .Set and setEqBoxed(x.items, b.Set.items),
+            .Set => |x| b.* == .Set and setEqBoxed(x.dense(), b.Set.dense()),
             .Map => |x| b.* == .Map and mapEqBoxed(x.entries, b.Map.entries),
             .Pair => |x| b.* == .Pair and
                 structuralEqBoxed(x.first.asPtrConst(), b.Pair.first.asPtrConst()) and structuralEqBoxed(x.second.asPtrConst(), b.Pair.second.asPtrConst()),
@@ -3401,8 +4261,11 @@ pub const Value = union(enum) {
                 structuralEqBoxed(x.first.asPtrConst(), b.Triple.first.asPtrConst()) and
                 structuralEqBoxed(x.second.asPtrConst(), b.Triple.second.asPtrConst()) and
                 structuralEqBoxed(x.third.asPtrConst(), b.Triple.third.asPtrConst()),
-            .MapEntry => |x| b.* == .MapEntry and
-                structuralEqBoxed(x.key.asPtrConst(), b.MapEntry.key.asPtrConst()) and structuralEqBoxed(x.value.asPtrConst(), b.MapEntry.value.asPtrConst()),
+            .MapEntry => |x| b.* == .MapEntry and structuralEqBoxed(&x.key, &b.MapEntry.key) and blk: {
+                const xv = x.getValue();
+                const yv = b.MapEntry.getValue();
+                break :blk structuralEqBoxed(&xv, &yv);
+            },
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtrConst(), b.Result.payload.asPtrConst()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and blk: {
@@ -3444,7 +4307,7 @@ pub const Value = union(enum) {
             },
             .Cell => |x| if (b.* == .Cell) return ObjRef(Value).ptrEq(x, b.Cell),
             .List => |x| if (b.* == .List) return ValueList.ptrEq(x.items, b.List.items),
-            .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.items, b.Set.items),
+            .Set => |x| if (b.* == .Set) return ValueList.ptrEq(x.elems, b.Set.elems),
             .Map => |x| if (b.* == .Map) return MapEntries.ptrEq(x.entries, b.Map.entries),
             .Array => |x| if (b.* == .Array) return x.identity() == b.Array.identity(),
             .StringBuilder => |x| if (b.* == .StringBuilder) return x.identity() == b.StringBuilder.identity(),
@@ -3487,7 +4350,7 @@ pub const Value = union(enum) {
             .Instance => |i| i.identity(),
             .List => |l| l.items.identity(),
             .Array => |a| a.identity(),
-            .Set => |s| s.items.identity(),
+            .Set => |s| s.elems.identity(),
             .Map => |m| m.entries.identity(),
             .Cell => |c| c.identity(),
             .StringBuilder => |s| s.identity(),
@@ -3562,7 +4425,9 @@ pub const Value = union(enum) {
                 self.refreshSublistView();
                 try writeElements(writer, coll.items, &self);
             },
-            .Set => |coll| try writeElements(writer, coll.items, &self),
+            .Set => |coll| {
+                try writeElements(writer, coll.dense(), &self);
+            },
             .Array => |a| {
                 const tag = if (a.primKind()) |k| k.typeFqn() else "kotlin.Array";
                 try writer.print("{s}@<…>", .{tag});
@@ -3571,7 +4436,9 @@ pub const Value = union(enum) {
                 const g = m.entries.borrow();
                 defer g.deinit();
                 try writer.writeByte('{');
-                for (g.get().pairs.items, 0..) |e, i| {
+                var it = g.get().live();
+                var i: usize = 0;
+                while (it.next()) |e| : (i += 1) {
                     if (i > 0) try writer.writeAll(", ");
                     if (Value.referenceEq(&e.key, &self)) {
                         try writer.writeAll("(this Map)");
@@ -3604,9 +4471,9 @@ pub const Value = union(enum) {
                 try writer.writeByte(')');
             },
             .MapEntry => |e| {
-                try e.key.asPtrConst().writeTo(writer);
+                try e.key.writeTo(writer);
                 try writer.writeByte('=');
-                try e.value.asPtrConst().writeTo(writer);
+                try e.getValue().writeTo(writer);
             },
             .Result => |r| {
                 try writer.writeAll(if (r.ok) "Success(" else "Failure(");
@@ -4029,12 +4896,12 @@ fn mapEqBoxed(a: MapEntries, b: MapEntries) bool {
     defer ga.deinit();
     const gb = b.borrow();
     defer gb.deinit();
-    const xs = ga.get().pairs.items;
-    const ys = gb.get().pairs.items;
-    if (xs.len != ys.len) return false;
-    for (xs) |*kv| {
+    if (ga.get().len() != gb.get().len()) return false;
+    var xs = ga.get().live();
+    while (xs.next()) |kv| {
         var found = false;
-        for (ys) |*kv2| {
+        var ys = gb.get().live();
+        while (ys.next()) |kv2| {
             if (Value.structuralEqBoxed(&kv.key, &kv2.key) and Value.structuralEqBoxed(&kv.value, &kv2.value)) {
                 found = true;
                 break;
@@ -4043,6 +4910,27 @@ fn mapEqBoxed(a: MapEntries, b: MapEntries) bool {
         if (!found) return false;
     }
     return true;
+}
+
+/// `String.hashCode()` over the UTF-16 units of `bytes`, UTF-8; a byte sequence that is
+/// not UTF-8 hashes byte by byte.
+pub fn javaStringHash(bytes: []const u8) i32 {
+    var h: i32 = 0;
+    const view = std.unicode.Utf8View.init(bytes) catch {
+        for (bytes) |ch| h = h *% 31 +% @as(i32, ch);
+        return h;
+    };
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp <= 0xFFFF) {
+            h = h *% 31 +% @as(i32, @intCast(cp));
+        } else {
+            const c = cp - 0x10000;
+            h = h *% 31 +% @as(i32, @intCast(0xD800 + (c >> 10)));
+            h = h *% 31 +% @as(i32, @intCast(0xDC00 + (c & 0x3FF)));
+        }
+    }
+    return h;
 }
 
 fn instanceEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) bool {
@@ -4193,7 +5081,7 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
             },
             .Set => |s| {
                 if (s.declared_elem == null) s.declared_elem = elem_arg;
-                coerceListElems(s.items, elem_arg);
+                coerceListElems(s.dense(), elem_arg);
             },
             else => {},
         }
@@ -4257,19 +5145,201 @@ test "a map finds its keys through the index across appends and removals" {
         if (i % 3 == 0) _ = m.removeAt(i);
         if (i == 0) break;
     }
-    try std.testing.expectEqual(@as(usize, 66), m.pairs.items.len);
+    try std.testing.expectEqual(@as(usize, 66), m.len());
     for (0..100) |k| {
         const at = try m.find(a, &Value.newInt(@intCast(k)));
         if (k % 3 == 0) {
             try std.testing.expectEqual(@as(?usize, null), at);
         } else {
-            try std.testing.expectEqual(@as(i32, @intCast(k * 10)), m.pairs.items[at.?].value.Int);
+            try std.testing.expectEqual(@as(i32, @intCast(k * 10)), m.slots.items[at.?].value.Int);
         }
     }
     try m.append(a, .{ .key = Value.newInt(0), .value = Value.newInt(-1) });
+    try std.testing.expectEqual(@as(?usize, 99), try m.find(a, &Value.newInt(0)));
+    m.compact();
+    try std.testing.expectEqual(@as(usize, 67), m.slots.items.len);
     try std.testing.expectEqual(@as(?usize, 66), try m.find(a, &Value.newInt(0)));
+    try std.testing.expectEqual(@as(i32, 10), m.slots.items[0].value.Int);
     m.clear();
     try std.testing.expectEqual(@as(?usize, null), try m.find(a, &Value.newInt(1)));
+}
+
+test "a map's removal leaves a hole that lookups, the walk in order and compaction pass over" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..40) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = Value.newInt(@intCast(i * 10)) });
+    _ = try m.find(a, &Value.newInt(0));
+    // A `Unit` key, which a hole holds too, after them, past the hashes.
+    try m.append(a, .{ .key = .Unit, .value = Value.newInt(-1) });
+    _ = m.removeAt(5);
+    _ = m.removeAt(6);
+    try std.testing.expectEqual(@as(usize, 2), m.holes);
+    try std.testing.expectEqual(@as(usize, 39), m.len());
+    try std.testing.expectEqual(@as(?usize, null), try m.find(a, &Value.newInt(5)));
+    try std.testing.expectEqual(@as(?usize, 7), try m.find(a, &Value.newInt(7)));
+    try std.testing.expectEqual(@as(?usize, 40), try m.find(a, &@as(Value, .Unit)));
+    var it = m.live();
+    var n: usize = 0;
+    var sum: i64 = 0;
+    while (it.next()) |kv| : (n += 1) {
+        if (kv.key == .Int) sum += kv.key.Int;
+    }
+    try std.testing.expectEqual(@as(usize, 39), n);
+    try std.testing.expectEqual(@as(i64, 780 - 11), sum);
+    try std.testing.expectEqual(@as(?usize, 7), m.slotAt(5));
+    try std.testing.expectEqual(@as(?usize, 40), m.slotAt(38));
+    try std.testing.expectEqual(@as(?usize, null), m.slotAt(39));
+    m.compact();
+    try std.testing.expectEqual(@as(usize, 0), m.holes);
+    try std.testing.expectEqual(@as(usize, 39), m.slots.items.len);
+    try std.testing.expectEqual(@as(?usize, 5), try m.find(a, &Value.newInt(7)));
+    try std.testing.expectEqual(@as(?usize, 38), try m.find(a, &@as(Value, .Unit)));
+    for (0..40) |k| {
+        if (k == 5 or k == 6) continue;
+        const at = (try m.find(a, &Value.newInt(@intCast(k)))).?;
+        try std.testing.expectEqual(@as(i32, @intCast(k * 10)), m.slots.items[at].value.Int);
+    }
+}
+
+test "a map's last slot out takes the holes before it, and a sparse map compacts" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..20) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = Value.newInt(@intCast(i)) });
+    _ = try m.find(a, &Value.newInt(0));
+    _ = m.removeAt(17);
+    _ = m.removeAt(18);
+    _ = m.removeAt(19);
+    try std.testing.expectEqual(@as(usize, 0), m.holes);
+    try std.testing.expectEqual(@as(usize, 17), m.slots.items.len);
+    try std.testing.expectEqual(@as(?usize, 16), try m.find(a, &Value.newInt(16)));
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        _ = m.removeAt(i);
+        m.compactIfSparse();
+    }
+    // Eight holes of seventeen slots, then the ninth makes them as many as the entries.
+    try std.testing.expectEqual(@as(usize, 8), m.holes);
+    _ = m.removeAt(8);
+    m.compactIfSparse();
+    try std.testing.expectEqual(@as(usize, 0), m.holes);
+    try std.testing.expectEqual(@as(usize, 8), m.slots.items.len);
+    try std.testing.expectEqual(@as(?usize, 0), try m.find(a, &Value.newInt(9)));
+    try std.testing.expectEqual(@as(?usize, 7), try m.find(a, &Value.newInt(16)));
+}
+
+test "a map entry is its node: one object for every walk, found through holes and compaction, keeping its last value once it leaves" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try MapEntries.init(a, .{});
+    const m = &entries.cell.data;
+    for (0..20) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = Value.newInt(@intCast(i * 10)) });
+    _ = try m.find(a, &Value.newInt(0));
+    const e5 = (try m.nodeEntry(a, a, entries, 5, 0)).MapEntry;
+    const e9 = (try m.nodeEntry(a, a, entries, 9, 0)).MapEntry;
+    // Another walk hands out the same object, its value the node's now.
+    m.slots.items[9].value = Value.newInt(91);
+    const again = (try m.nodeEntry(a, a, entries, 9, 0)).MapEntry;
+    try std.testing.expect(again == e9);
+    try std.testing.expectEqual(@as(i32, 91), e9.getValue().Int);
+    // A put over node 5, then its removal: the entry takes the value it had.
+    m.slots.items[5].value = Value.newInt(55);
+    _ = m.removeAt(5);
+    try std.testing.expectEqual(@as(?usize, null), e5.nodeSlot(m));
+    try std.testing.expectEqual(@as(i32, 55), e5.getValue().Int);
+    // The key back is a new node, which the old entry is not.
+    try m.append(a, .{ .key = Value.newInt(5), .value = Value.newInt(-5) });
+    try std.testing.expectEqual(@as(?usize, null), e5.nodeSlot(m));
+    // Node 9 found where compaction moved it; the leading holes counted until then.
+    for ([_]usize{ 0, 1, 2, 3, 4, 6, 7 }) |i| _ = m.removeAt(i);
+    try std.testing.expectEqual(@as(usize, 8), m.head);
+    const epoch = m.epoch;
+    for ([_]usize{ 8, 10, 11 }) |i| _ = m.removeAt(i);
+    m.compactIfSparse();
+    try std.testing.expectEqual(@as(usize, 0), m.holes);
+    try std.testing.expectEqual(@as(usize, 0), m.head);
+    try std.testing.expect(m.epoch != epoch);
+    const at9 = e9.nodeSlot(m).?;
+    try std.testing.expectEqual(@as(i32, 9), m.slots.items[at9].key.Int);
+    try std.testing.expectEqual(@as(usize, 0), at9);
+    // A clear lets every node go, each entry with its value.
+    m.slots.items[at9].value = Value.newInt(99);
+    m.clear();
+    try std.testing.expectEqual(@as(?usize, null), e9.nodeSlot(m));
+    try std.testing.expectEqual(@as(i32, 99), e9.getValue().Int);
+}
+
+test "a removal past a map's index moves the entries after it, which the epoch counts" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..3) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = .Null });
+    const epoch = m.epoch;
+    _ = m.removeAt(0);
+    try std.testing.expect(m.epoch != epoch);
+    // The first entry a walk passes is where the second stood.
+    try std.testing.expectEqual(@as(?usize, 0), m.slotAt(0));
+    try std.testing.expectEqual(@as(i32, 1), m.slots.items[0].key.Int);
+}
+
+test "a walk over a map passes over holes, follows a compaction, and ends at a change unless it gave the last entry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try MapEntries.init(a, .{ .mod_count = .from(try ModCount.new(a)) });
+    const m = &entries.cell.data;
+    for (0..20) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = Value.newInt(@intCast(i * 10)) });
+    _ = try m.find(a, &Value.newInt(0));
+    _ = m.removeAt(0);
+    _ = m.removeAt(5);
+    var walk = MapWalk.init(entries);
+    var keys: std.ArrayList(i32) = .empty;
+    while (true) {
+        switch (walk.next()) {
+            .pair => |kv| try keys.append(a, kv.key.Int),
+            .end => break,
+            .changed => return error.TestUnexpectedResult,
+        }
+        // The entries close up under the walk: it goes on from the one it would have read.
+        if (keys.items.len == 3) m.compact();
+    }
+    try std.testing.expectEqual(@as(usize, 18), keys.items.len);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 6, 7 }, keys.items[0..6]);
+    // A change before the last entry: the next step ends the walk as changed.
+    var mid = MapWalk.init(entries);
+    _ = mid.next();
+    m.mod_count.get().?.cell.data.bump();
+    try std.testing.expect(mid.next() == .changed);
+    // A change after the last entry was given: the walk is over.
+    var tail = MapWalk.init(entries);
+    var n: usize = 0;
+    while (tail.next() == .pair) : (n += 1) {
+        if (n == 17) m.mod_count.get().?.cell.data.bump();
+    }
+    try std.testing.expectEqual(@as(usize, 18), n);
+}
+
+test "a copy of a map's store holds its entries in order with the hashes kept for them" {
+    const a = std.testing.allocator;
+    var m: MapStore = .{};
+    defer m.deinit(a);
+    for (0..20) |i| try m.append(a, .{ .key = Value.newInt(@intCast(i)), .value = .Null });
+    _ = try m.find(a, &Value.newInt(0));
+    for ([_]usize{ 0, 7 }) |i| _ = m.removeAt(i);
+    try m.append(a, .{ .key = Value.newInt(20), .value = .Null });
+    var c = try m.copyLive(a);
+    defer c.deinit(a);
+    try std.testing.expectEqual(@as(usize, 19), c.slots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), c.holes);
+    try std.testing.expectEqual(@as(i32, 1), c.slots.items[0].key.Int);
+    try std.testing.expectEqual(@as(i32, 8), c.slots.items[6].key.Int);
+    // Each entry carries the hash its slot kept, the holes' left behind.
+    try std.testing.expectEqual(@as(usize, 19), c.hashes.items.len);
+    try std.testing.expectEqual(MapStore.keyHash(&Value.newInt(8)).?, c.hashes.items[6]);
+    try std.testing.expectEqual(MapStore.keyHash(&Value.newInt(20)).?, c.hashes.items[18]);
+    try std.testing.expectEqual(@as(?usize, 18), try c.find(a, &Value.newInt(20)));
 }
 
 test "a map hashes a host-hashed key only when given its hash" {
@@ -4406,6 +5476,46 @@ test "a string made in one allocation keeps its bytes in its cell and frees them
     try std.testing.expect(!apart.asPtr().inCell());
     try std.testing.expectEqual(@as(usize, 3), apart.asPtr().gcExternalBytes());
     apart.deinit();
+}
+
+fn boxedInts(a: std.mem.Allocator, xs: []const i32) !ArrayData {
+    var list: std.ArrayList(Value) = .empty;
+    for (xs) |x| try list.append(a, .{ .Int = x });
+    return ArrayData.boxed(try ValueList.init(a, list));
+}
+
+fn arrayInts(a: std.mem.Allocator, arr: ArrayData) ![]i32 {
+    const vs = try arr.snapshot(a);
+    const out = try a.alloc(i32, vs.len);
+    for (vs, out) |v, *o| o.* = v.Int;
+    return out;
+}
+
+test "an array's block copy moves a range within it either way, or from another array, as arraycopy does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const xs = try boxedInts(a, &.{ 0, 1, 2, 3, 4, 5, 6, 7 });
+    // Up within one array: the elements read are the ones before the copy.
+    try std.testing.expect(xs.copyRangeFrom(a, 2, xs, 0, 5));
+    try std.testing.expectEqualSlices(i32, &.{ 0, 1, 0, 1, 2, 3, 4, 7 }, try arrayInts(a, xs));
+    // Down within one array.
+    try std.testing.expect(xs.copyRangeFrom(a, 0, xs, 3, 5));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 7, 3, 4, 7 }, try arrayInts(a, xs));
+    // From another array, and nothing for no elements.
+    const ys = try boxedInts(a, &.{ 9, 8, 7 });
+    try std.testing.expect(xs.copyRangeFrom(a, 5, ys, 0, 3));
+    try std.testing.expect(ys.copyRangeFrom(a, 0, xs, 0, 0));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 4, 7, 9, 8, 7 }, try arrayInts(a, xs));
+    // A primitive array's bytes, within one and from another; storage of another kind is refused.
+    const ps = (try ArrayData.initPacked(a, .Int, &.{ .{ .Int = 1 }, .{ .Int = 2 }, .{ .Int = 3 }, .{ .Int = 4 } })).Array;
+    try std.testing.expect(ps.copyRangeFrom(a, 1, ps, 0, 3));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 2, 3 }, try arrayInts(a, ps));
+    const qs = (try ArrayData.initPacked(a, .Int, &.{ .{ .Int = 7 }, .{ .Int = 8 } })).Array;
+    try std.testing.expect(ps.copyRangeFrom(a, 2, qs, 0, 2));
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 7, 8 }, try arrayInts(a, ps));
+    try std.testing.expect(!ps.copyRangeFrom(a, 0, ys, 0, 1));
+    try std.testing.expect(!ys.copyRangeFrom(a, 0, ps, 0, 1));
 }
 
 test "a primitive array made in one allocation keeps its elements in its cell and needs no finalizer" {
@@ -4613,7 +5723,16 @@ fn raceMapLookups(derefs: bool) !void {
                 const g = which.borrowMut();
                 defer g.deinit();
                 const st = g.get();
-                const len = st.pairs.items.len;
+                const len = st.slots.items.len;
+                // Now and then an entry out, leaving a hole the lookups must not land on.
+                if (len >= MapStore.index_threshold and n % 5 == 0) {
+                    const i = (n / 5) % len;
+                    if (!st.isHole(i)) {
+                        _ = st.removeAt(i);
+                        st.compactIfSparse();
+                    }
+                    continue;
+                }
                 if (len >= 20 + (n / 2) % 40) {
                     st.deinit(self.a);
                     st.* = .{};
@@ -4707,4 +5826,96 @@ test "reads with no lock racing writers that rewrite a whole Array see only whol
     race.stop.store(true, .monotonic);
     for (threads) |t| t.join();
     try testing.expectEqual(@as(usize, 0), race.torn.load(.monotonic));
+}
+
+test "javaHashCode answers as the JVM's hashCode for numbers, chars, booleans, strings and null" {
+    const a = std.testing.allocator;
+    const s = struct {
+        fn str(al: std.mem.Allocator, text: []const u8) !Value {
+            return .{ .String = try strInit(al, text) };
+        }
+    };
+    const cases = [_]struct { []const u8, i32 }{ .{ "a", 97 }, .{ "hello", 99162322 }, .{ "\u{1F600}x", 54959989 }, .{ "\u{e4}", 228 } };
+    for (cases) |c| {
+        const v = try s.str(a, c[0]);
+        defer v.release(a);
+        try std.testing.expectEqual(@as(?i32, c[1]), v.javaHashCode());
+    }
+    try std.testing.expectEqual(@as(?i32, -1097262584), (Value{ .Long = 123456789012 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 0), (Value{ .Long = -1 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 1073217536), (Value{ .Double = 1.5 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 2146959360), (Value{ .Double = std.math.nan(f64) }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, -2147483648), (Value{ .Double = -0.0 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 1075838976), (Value{ .Float = 2.5 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 1231), (Value{ .Bool = true }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 1237), (Value{ .Bool = false }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 90), (Value{ .Char = 'Z' }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, -1), (Value{ .UShort = 65535 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, -294967296), (Value{ .UInt = 4000000000 }).javaHashCode());
+    try std.testing.expectEqual(@as(?i32, 0), (@as(Value, .Null)).javaHashCode());
+}
+
+test "a value index finds positions by hash, keeps the loose ones for every lookup, and closes removals' holes up" {
+    var ix: ValueIndex = .{};
+    defer ix.deinit(std.testing.allocator);
+    // Forty positions: hashes 0..39 with 7 twice, and position 5 without one.
+    for (0..40) |i| try ix.push(if (i == 5) ValueIndex.no_hash else if (i == 30) 7 else @as(u64, i));
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try ix.candidates(7, &out, std.testing.allocator);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7, 30 }, out.items);
+    // Positions 3 and 30 go as holes: no lookup offers them, the others stay where they are.
+    ix.removeHole(3);
+    ix.removeHole(30);
+    out.clearRetainingCapacity();
+    try ix.candidates(7, &out, std.testing.allocator);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 5, 7 }, out.items);
+    out.clearRetainingCapacity();
+    try ix.candidates(ValueIndex.no_hash, &out, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 38), out.items.len);
+    // Closed up: 7 moves to 6, the loose one to 4, 31 to 29.
+    ix.compact();
+    try std.testing.expectEqual(@as(usize, 38), ix.len());
+    out.clearRetainingCapacity();
+    try ix.candidates(7, &out, std.testing.allocator);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 6 }, out.items);
+    out.clearRetainingCapacity();
+    try ix.candidates(31, &out, std.testing.allocator);
+    std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+    try std.testing.expectEqualSlices(u32, &.{ 4, 29 }, out.items);
+    // A needle with no hash may equal any element.
+    out.clearRetainingCapacity();
+    try ix.candidates(ValueIndex.no_hash, &out, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 38), out.items.len);
+    ix.clear();
+    out.clearRetainingCapacity();
+    try ix.candidates(7, &out, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "a map finds a pair key by its components' hashes" {
+    var mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer mem.deinit();
+    const a = mem.allocator();
+    const prev = objcell.reclaimEnabled();
+    objcell.setReclaim(false);
+    defer objcell.setReclaim(prev);
+    const p1 = try Value.newPair(a, .{ .first = try Value.boxRef(a, Value.newInt(3)), .second = try Value.boxRef(a, .{ .String = try strInit(a, "x") }) });
+    const p2 = try Value.newPair(a, .{ .first = try Value.boxRef(a, Value.newInt(3)), .second = try Value.boxRef(a, .{ .String = try strInit(a, "x") }) });
+    const p3 = try Value.newPair(a, .{ .first = try Value.boxRef(a, Value.newInt(4)), .second = try Value.boxRef(a, .{ .String = try strInit(a, "x") }) });
+    try std.testing.expect(MapStore.keyHash(&p1) != null);
+    try std.testing.expectEqual(MapStore.keyHash(&p1), MapStore.keyHash(&p2));
+    try std.testing.expect(MapStore.keyHash(&p1).? != MapStore.keyHash(&p3).?);
+    // Past the scan threshold the store looks keys up by hash.
+    var store: MapStore = .{};
+    for (0..40) |i| {
+        const k = try Value.newPair(a, .{ .first = try Value.boxRef(a, Value.newInt(@intCast(i))), .second = try Value.boxRef(a, .{ .String = try strInit(a, "x") }) });
+        try store.append(a, .{ .key = k, .value = Value.newInt(@intCast(i)) });
+    }
+    try std.testing.expectEqual(@as(?usize, 3), try store.find(a, &p1));
+    try std.testing.expectEqual(@as(?usize, 4), try store.find(a, &p3));
+    try std.testing.expectEqual(@as(usize, 40), store.hashes.items.len);
 }

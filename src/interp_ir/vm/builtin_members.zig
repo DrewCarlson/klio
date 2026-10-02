@@ -62,7 +62,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 };
                 runtime.keepalivePush(drained);
                 defer if (runtime.reclaimEnabled()) drained.release(allocator);
-                const xa = try rootedItems(allocator, a.Set.items);
+                const xa = try rootedItems(allocator, a.Set.dense());
                 defer if (runtime.freeScratch()) allocator.free(xa);
                 const xb = try rootedItems(allocator, drained.List.items);
                 defer if (runtime.freeScratch()) allocator.free(xb);
@@ -102,57 +102,41 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
                 return true;
             },
             .Map => if (host_resolved.instanceImplements(self, b, hostClasses(self).map)) {
-                // `entries` is a property: read as one, a class lowered from
-                // sema answers it through its slot.
+                // As `AbstractMap.equals`: the sizes, then each of this map's entries, where
+                // it stands, looked up in the other.
                 const mark = runtime.keepaliveMark();
                 defer runtime.keepaliveRestore(mark);
-                const er = try host_resolved.wellKnownMember(self, allocator, b, .entries, &.{});
-                const entries_val = switch (er) {
+                const n = switch (try host_resolved.wellKnownMember(self, allocator, b, .map_size, &.{})) {
                     .ok => |v| v,
                     .err => return false,
                 };
-                runtime.keepalivePush(entries_val);
-                defer if (runtime.reclaimEnabled()) entries_val.release(allocator);
-                const dr = try drainIterableToList(self, allocator, &entries_val);
-                const drained = switch (dr) {
-                    .ok => |v| v,
-                    .err => return false,
-                };
-                runtime.keepalivePush(drained);
-                defer if (runtime.reclaimEnabled()) drained.release(allocator);
-                const pa = try rootedPairs(allocator, a.Map.entries);
-                defer if (runtime.freeScratch()) allocator.free(pa);
-                const xb = try rootedItems(allocator, drained.List.items);
-                defer if (runtime.freeScratch()) allocator.free(xb);
-                if (pa.len != xb.len) return false;
-                for (pa) |*ka| {
-                    var found = false;
-                    for (xb) |*eb| {
-                        const entry_mark = runtime.keepaliveMark();
-                        defer runtime.keepaliveRestore(entry_mark);
-                        const kr = try host_resolved.wellKnownMember(self, allocator, eb, .entry_key, &.{});
-                        const key = switch (kr) {
+                if (n != .Int or n.Int != storeLen(a.Map.entries)) return false;
+                var walk = runtime.MapWalk.init(a.Map.entries);
+                while (true) {
+                    var one = [1]runtime.MapPair{switch (walk.next()) {
+                        .pair => |p| p,
+                        .end => return true,
+                        // Changed while its keys' `equals` ran: not the map it was.
+                        .changed => return false,
+                    }};
+                    runtime.keepaliveRestore(mark);
+                    runtime.keepalivePushPairs(&one);
+                    const kv = one[0];
+                    const got = switch (try host_resolved.wellKnownMember(self, allocator, b, .map_get, &.{kv.key})) {
+                        .ok => |v| v,
+                        .err => return false,
+                    };
+                    runtime.keepalivePush(got);
+                    defer if (runtime.reclaimEnabled()) got.release(allocator);
+                    if (kv.value == .Null) {
+                        if (got != .Null) return false;
+                        const has = switch (try host_resolved.wellKnownMember(self, allocator, b, .contains_key, &.{kv.key})) {
                             .ok => |v| v,
-                            .err => continue,
+                            .err => return false,
                         };
-                        runtime.keepalivePush(key);
-                        defer if (runtime.reclaimEnabled()) key.release(allocator);
-                        if (!try deepValueEquals(self, allocator, &ka.key, &key)) continue;
-                        const vr = try host_resolved.wellKnownMember(self, allocator, eb, .entry_value, &.{});
-                        const val = switch (vr) {
-                            .ok => |v| v,
-                            .err => continue,
-                        };
-                        runtime.keepalivePush(val);
-                        defer if (runtime.reclaimEnabled()) val.release(allocator);
-                        if (try deepValueEquals(self, allocator, &ka.value, &val)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) return false;
+                        if (has != .Bool or !has.Bool) return false;
+                    } else if (!try deepValueEquals(self, allocator, &kv.value, &got)) return false;
                 }
-                return true;
             },
             else => {},
         }
@@ -191,9 +175,9 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
             if (b.* != .Set) return Value.structuralEqBoxed(a, b);
             const mark = runtime.keepaliveMark();
             defer runtime.keepaliveRestore(mark);
-            const xa = try rootedItems(allocator, a.Set.items);
+            const xa = try rootedItems(allocator, a.Set.dense());
             defer if (runtime.freeScratch()) allocator.free(xa);
-            const xb = try rootedItems(allocator, b.Set.items);
+            const xb = try rootedItems(allocator, b.Set.dense());
             defer if (runtime.freeScratch()) allocator.free(xb);
             if (xa.len != xb.len) return false;
             for (xa) |*ea| {
@@ -210,26 +194,7 @@ pub fn deepValueEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: 
         },
         .Map => {
             if (b.* != .Map) return Value.structuralEqBoxed(a, b);
-            const mark = runtime.keepaliveMark();
-            defer runtime.keepaliveRestore(mark);
-            const pa = try rootedPairs(allocator, a.Map.entries);
-            defer if (runtime.freeScratch()) allocator.free(pa);
-            const pb = try rootedPairs(allocator, b.Map.entries);
-            defer if (runtime.freeScratch()) allocator.free(pb);
-            if (pa.len != pb.len) return false;
-            for (pa) |*ka| {
-                var found = false;
-                for (pb) |*kb| {
-                    if (try deepValueEquals(self, allocator, &ka.key, &kb.key) and
-                        try deepValueEquals(self, allocator, &ka.value, &kb.value))
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
-            }
-            return true;
+            return mapEquals(self, allocator, a.Map.entries, b.Map.entries);
         },
         .Pair => |x| {
             if (b.* != .Pair) return Value.structuralEqBoxed(a, b);
@@ -258,13 +223,48 @@ fn rootedItems(allocator: Allocator, items: runtime.ValueList) Allocator.Error![
     return xs;
 }
 
-/// `rootedItems` for a map's entries.
-fn rootedPairs(allocator: Allocator, entries: runtime.MapEntries) Allocator.Error![]runtime.MapPair {
+fn storeLen(entries: runtime.MapEntries) usize {
     const g = entries.borrow();
     defer g.deinit();
-    const ps = try allocator.dupe(runtime.MapPair, g.get().pairs.items);
-    runtime.keepalivePushPairs(ps);
-    return ps;
+    return g.get().len();
+}
+
+/// Two host maps' equality, as `AbstractMap.equals`: the sizes, then each of `a`'s entries,
+/// where it stands, found in `b` by its key's `hashCode()` and `equals` and its value
+/// compared with `equals`.
+fn mapEquals(self: *VmHost, allocator: Allocator, a: runtime.MapEntries, b: runtime.MapEntries) Allocator.Error!bool {
+    if (a.cell == b.cell) return true;
+    if (storeLen(a) != storeLen(b)) return false;
+    var sink = self.out_sink;
+    var intrinsic = VmIntrinsicHost.owning(self);
+    defer intrinsic.release();
+    var ctx: runtime.CallCtx = .{ .args = &.{}, .out = sink.output(), .host = intrinsic.intrinsicHost(), .allocator = allocator };
+    const mark = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(mark);
+    var walk = runtime.MapWalk.init(a);
+    while (true) {
+        var one = [1]runtime.MapPair{switch (walk.next()) {
+            .pair => |p| p,
+            .end => return true,
+            // Changed while a key's `equals` ran: not the map it was.
+            .changed => return false,
+        }};
+        runtime.keepaliveRestore(mark);
+        runtime.keepalivePushPairs(&one);
+        const at = switch (try stdlib.implementations.collections.mapKeyIndex(&ctx, b, one[0].key)) {
+            .at => |i| i,
+            .none, .thrown => return false,
+        };
+        const other = blk: {
+            const g = b.borrow();
+            defer g.deinit();
+            const st = g.get();
+            if (at >= st.slots.items.len or st.isHole(at)) return false;
+            break :blk st.slots.items[at].value;
+        };
+        runtime.keepalivePush(other);
+        if (!try deepValueEquals(self, allocator, &one[0].value, &other)) return false;
+    }
 }
 
 /// `kotlinHashCode` plus member dispatch: a container folds its elements' USER
@@ -309,71 +309,41 @@ pub fn hashWithDispatch(self: *VmHost, allocator: Allocator, v: *const Value) Al
         .Set => |st| {
             const mark = runtime.keepaliveMark();
             defer runtime.keepaliveRestore(mark);
-            const xs = try rootedItems(allocator, st.items);
+            const xs = try rootedItems(allocator, st.dense());
             defer if (runtime.freeScratch()) allocator.free(xs);
             var h: i32 = 0;
             for (xs) |*e| h = h +% try hashWithDispatch(self, allocator, e);
             return h;
         },
         .Map => |m| {
+            // As `AbstractMap.hashCode`: each entry's, where it stands.
             const mark = runtime.keepaliveMark();
             defer runtime.keepaliveRestore(mark);
-            const ps = try rootedPairs(allocator, m.entries);
-            defer if (runtime.freeScratch()) allocator.free(ps);
+            var walk = runtime.MapWalk.init(m.entries);
             var h: i32 = 0;
-            for (ps) |*kv| h = h +% ((try hashWithDispatch(self, allocator, &kv.key)) ^ (try hashWithDispatch(self, allocator, &kv.value)));
-            return h;
+            while (true) {
+                var one = [1]runtime.MapPair{switch (walk.next()) {
+                    .pair => |p| p,
+                    .end, .changed => return h,
+                }};
+                runtime.keepaliveRestore(mark);
+                runtime.keepalivePushPairs(&one);
+                h = h +% ((try hashWithDispatch(self, allocator, &one[0].key)) ^ (try hashWithDispatch(self, allocator, &one[0].value)));
+            }
         },
         .Pair => |pr| return (try hashWithDispatch(self, allocator, pr.first.asPtrConst())) *% 31 +% try hashWithDispatch(self, allocator, pr.second.asPtrConst()),
         .Triple => |t| return ((try hashWithDispatch(self, allocator, t.first.asPtrConst())) *% 31 +% try hashWithDispatch(self, allocator, t.second.asPtrConst())) *% 31 +% try hashWithDispatch(self, allocator, t.third.asPtrConst()),
-        .MapEntry => |e| return (try hashWithDispatch(self, allocator, e.key.asPtrConst())) ^ (try hashWithDispatch(self, allocator, e.value.asPtrConst())),
+        .MapEntry => |e| {
+            const value = e.getValue();
+            return (try hashWithDispatch(self, allocator, &e.key)) ^ (try hashWithDispatch(self, allocator, &value));
+        },
         else => return kotlinHashCode(v),
     }
 }
 
 pub fn kotlinHashCode(v: *const Value) i32 {
+    if (v.javaHashCode()) |c| return c;
     return switch (v.*) {
-        .Null => 0,
-        .Bool => |b| if (b) @as(i32, 1231) else @as(i32, 1237),
-        .Char => |c| @as(i32, c),
-        .Byte => |x| @as(i32, x),
-        .Short => |x| @as(i32, x),
-        .Int => |x| x,
-        // An unsigned value class hashes its SIGNED storage: 65535u hashes as -1.
-        .UByte => |x| @as(i32, @as(i8, @bitCast(x))),
-        .UShort => |x| @as(i32, @as(i16, @bitCast(x))),
-        .UInt => |x| @bitCast(x),
-        .Long => |l| @truncate(l ^ @as(i64, @bitCast(@as(u64, @bitCast(l)) >> 32))),
-        .ULong => |u| @truncate(@as(i64, @bitCast(u ^ (u >> 32)))),
-        // Java's to*Bits canonicalizes every NaN payload before hashing.
-        .Float => |f| if (std.math.isNan(f)) @as(i32, @bitCast(@as(u32, 0x7fc0_0000))) else @bitCast(f),
-        .Double => |d| blk: {
-            const b: i64 = if (std.math.isNan(d)) @bitCast(@as(u64, 0x7ff8_0000_0000_0000)) else @bitCast(d);
-            break :blk @truncate(b ^ @as(i64, @bitCast(@as(u64, @bitCast(b)) >> 32)));
-        },
-        .String => |s| blk: {
-            const g = s.borrow();
-            defer g.deinit();
-            const bytes = g.get().bytes;
-            var h: i32 = 0;
-            const view = std.unicode.Utf8View.init(bytes) catch {
-                for (bytes) |ch| h = h *% 31 +% @as(i32, ch);
-                break :blk h;
-            };
-            var it = view.iterator();
-            while (it.nextCodepoint()) |cp| {
-                if (cp <= 0xFFFF) {
-                    h = h *% 31 +% @as(i32, @intCast(cp));
-                } else {
-                    const v2 = cp - 0x10000;
-                    const hi: i32 = @intCast(0xD800 + (v2 >> 10));
-                    const lo: i32 = @intCast(0xDC00 + (v2 & 0x3FF));
-                    h = h *% 31 +% hi;
-                    h = h *% 31 +% lo;
-                }
-            }
-            break :blk h;
-        },
         .List => |l| blk: {
             const g = l.items.borrow();
             defer g.deinit();
@@ -385,7 +355,7 @@ pub fn kotlinHashCode(v: *const Value) i32 {
         .Pair => |p| kotlinHashCode(p.first.asPtrConst()) *% 31 +% kotlinHashCode(p.second.asPtrConst()),
         .Triple => |t| (kotlinHashCode(t.first.asPtrConst()) *% 31 +% kotlinHashCode(t.second.asPtrConst())) *% 31 +% kotlinHashCode(t.third.asPtrConst()),
         .Set => |s| blk: {
-            const g = s.items.borrow();
+            const g = s.dense().borrow();
             defer g.deinit();
             var h: i32 = 0;
             for (g.get().items) |e| h = h +% kotlinHashCode(&e);
@@ -395,7 +365,8 @@ pub fn kotlinHashCode(v: *const Value) i32 {
             const g = m.entries.borrow();
             defer g.deinit();
             var h: i32 = 0;
-            for (g.get().pairs.items) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
+            var it = g.get().live();
+            while (it.next()) |kv| h = h +% (kotlinHashCode(&kv.key) ^ kotlinHashCode(&kv.value));
             break :blk h;
         },
         .Array => |arr| blk: {
@@ -427,7 +398,10 @@ pub fn kotlinHashCode(v: *const Value) i32 {
             break :blk (@as(i32, 31) *% (@as(i32, 31) *% f +% l)) +% s;
         },
         // `Map.Entry.hashCode()` is `key xor value`; a Set of entries folds to the map's.
-        .MapEntry => |e| kotlinHashCode(e.key.asPtrConst()) ^ kotlinHashCode(e.value.asPtrConst()),
+        .MapEntry => |e| blk: {
+            const value = e.getValue();
+            break :blk kotlinHashCode(&e.key) ^ kotlinHashCode(&value);
+        },
         else => valueStructuralHash(v),
     };
 }
@@ -516,9 +490,13 @@ fn rangeElem(cur: i64, kind: RangeKind) Value {
 
 /// Read a boxed component slot: the box keeps its `Value`, the caller gets a ref.
 fn extractOwned(box: runtime.ObjRef(Value)) EvalResult {
-    const out = box.asPtrConst().*;
-    out.retain();
-    return .{ .ok = out };
+    return ownedResult(box.asPtrConst().*);
+}
+
+/// `v` as a result the caller owns.
+fn ownedResult(v: Value) EvalResult {
+    v.retain();
+    return .{ .ok = v };
 }
 
 pub fn drainIterableToList(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!EvalResult {
@@ -607,41 +585,34 @@ pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.E
             // A mutable list shares its backing, so `remove()` mutates the source.
             if (l.mutable and !stdlib.implementations.collections.modCountFrozen(l.mod_count)) {
                 const cap = try captureModCount(allocator, l.mod_count.get());
-                return .{ .ok = try Value.newIterator(allocator, .{ .items = l.items.clone(), .prim = null, .mod_count = .from(cap.mod_count), .mutable = true, .pos = 0, .exp_mod = cap.exp_mod }) };
+                return .{ .ok = try Value.newIterator(allocator, .{ .items = l.items.clone(), .prim = null, .source = .collection, .mod_count = .from(cap.mod_count), .mutable = true, .pos = 0, .exp_mod = cap.exp_mod }) };
             }
             // A snapshot iterator still captures `mod_count` to fail fast.
             const items = try cloneItemsList(allocator, l.items);
             const cap = try captureModCount(allocator, l.mod_count.get());
-            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .mod_count = .from(cap.mod_count), .pos = 0, .exp_mod = cap.exp_mod }) };
+            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .source = .collection, .mod_count = .from(cap.mod_count), .pos = 0, .exp_mod = cap.exp_mod }) };
         },
         .Set => |s| {
-            // A mutable set, including a live map view, shares its backing.
+            // A mutable set shares its backing.
             if (s.mutable and !stdlib.implementations.collections.modCountFrozen(s.mod_count)) {
                 const cap = try captureModCount(allocator, s.mod_count.get());
-                return .{ .ok = try Value.newIterator(allocator, .{ .items = s.items.clone(), .prim = null, .mod_count = .from(cap.mod_count), .mutable = true, .pos = 0, .exp_mod = cap.exp_mod }) };
+                // A set's own list, holes and all: the walk passes over them, from past
+                // the leading ones.
+                if (s.backing == null) {
+                    const at = blk: {
+                        const g = s.elems.borrow();
+                        defer g.deinit();
+                        break :blk .{ s.head, s.epoch, g.get().items.len == s.holes };
+                    };
+                    return .{ .ok = try Value.newIterator(allocator, .{ .items = s.elems.clone(), .prim = null, .source = .collection, .mod_count = .from(cap.mod_count), .mutable = true, .pos = at[0], .exp_mod = cap.exp_mod, .set = .from(runtime.setRefOf(s).clone()), .set_epoch = at[1], .ended = at[2] }) };
+                }
+                return .{ .ok = try Value.newIterator(allocator, .{ .items = s.dense().clone(), .prim = null, .source = .collection, .mod_count = .from(cap.mod_count), .mutable = true, .pos = 0, .exp_mod = cap.exp_mod }) };
             }
-            const items = try cloneItemsList(allocator, s.items);
+            const items = try cloneItemsList(allocator, s.dense());
             const cap = try captureModCount(allocator, s.mod_count.get());
-            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .mod_count = .from(cap.mod_count), .pos = 0, .exp_mod = cap.exp_mod }) };
+            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .source = .collection, .mod_count = .from(cap.mod_count), .pos = 0, .exp_mod = cap.exp_mod }) };
         },
-        .Map => |m| {
-            const g = m.entries.borrow();
-            const src_mc = g.get().mod_count;
-            const live = m.mutable and !stdlib.implementations.collections.modCountFrozen(src_mc);
-            const stamp: u64 = if (src_mc.get()) |cell| cell.cell.data.load() else 0;
-            var items: std.ArrayList(Value) = .empty;
-            for (g.get().pairs.items) |kv| {
-                kv.key.retain();
-                kv.value.retain();
-                const k = try Value.boxRef(allocator, kv.key);
-                const v = try Value.boxRef(allocator, kv.value);
-                // Live entries: `setValue` writes through, `remove` deletes.
-                try items.append(allocator, try Value.newMapEntry(allocator, .{ .key = k, .value = v, .backing = if (live) .from(m.entries) else .{}, .exp_mod = stamp }));
-            }
-            g.deinit();
-            const cap = try captureModCount(allocator, src_mc.get());
-            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .mod_count = .from(cap.mod_count), .mutable = live, .pos = 0, .exp_mod = cap.exp_mod }) };
-        },
+        .Map => |m| return .{ .ok = try stdlib.implementations.collections.mapIterator(allocator, m.entries, .Entries, m.mutable) },
         .Range => |r| {
             return .{ .ok = .{ .RangeIter = try ObjRef(runtime.RangeIterState).init(allocator, .{ .cur = r.start, .end = r.end, .step = r.step, .kind = r.kind }) } };
         },
@@ -649,13 +620,14 @@ pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.E
             const items = try cloneArrayItems(allocator, arr);
             return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = arr.primKind(), .pos = 0, .exp_mod = 0 }) };
         },
+        // A `CharIterator`, as `CharSequence.iterator()` makes.
         .String => |s| {
             const g = s.borrow();
             defer g.deinit();
             var items: std.ArrayList(Value) = .empty;
             const view = std.unicode.Utf8View.init(g.get().bytes) catch {
                 for (g.get().bytes) |b| try items.append(allocator, .{ .Char = b });
-                return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .pos = 0, .exp_mod = 0 }) };
+                return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = .Char, .pos = 0, .exp_mod = 0 }) };
             };
             var it = view.iterator();
             while (it.nextCodepoint()) |cp| {
@@ -667,10 +639,104 @@ pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.E
                     try items.append(allocator, .{ .Char = @intCast(0xDC00 + (v2 & 0x3FF)) });
                 }
             }
-            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = null, .pos = 0, .exp_mod = 0 }) };
+            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = .Char, .pos = 0, .exp_mod = 0 }) };
         },
         else => return null,
     }
+}
+
+/// Where a map cursor stands in `st`, whose lock the caller holds: found again by how many
+/// entries it has passed once they moved, then past any holes. Its `last_ret` moves too.
+fn mapCursorAt(it: ObjRef(runtime.IterCursor), st: *const runtime.MapStore) usize {
+    var p = blk: {
+        const g = it.borrowMut();
+        defer g.deinit();
+        const c = g.get();
+        if (c.map_epoch != st.epoch) {
+            c.pos = st.slotAt(c.seen) orelse st.slots.items.len;
+            if (c.last_ret >= 0) c.last_ret = if (c.seen > 0) if (st.slotAt(c.seen - 1)) |i| @intCast(i) else -1 else -1;
+            c.map_epoch = st.epoch;
+        }
+        break :blk c.pos;
+    };
+    if (st.holes != 0) {
+        while (p < st.slots.items.len and st.isHole(p)) p += 1;
+    }
+    return p;
+}
+
+/// `hasNext`, `next` and `remove` of an iterator over a map or a view of it
+/// (`collections.mapIterator`).
+fn mapCursorMember(allocator: Allocator, it: ObjRef(runtime.IterCursor), kind: runtime.MapViewKind, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (args.len != 0) return null;
+    const store = iterMapStore(it).get().?;
+    if (std.mem.eql(u8, name, "hasNext")) return .{ .ok = boolVal(!iterEnded(it)) };
+    if (isIteratorNext(name)) {
+        if (try iteratorCheckMod(allocator, it)) |e| return e;
+        const v, const p, const ended = blk: {
+            // An entry object may be made: the store's write lock.
+            const g = store.borrowMut();
+            defer g.deinit();
+            const st = g.get();
+            const p = mapCursorAt(it, st);
+            if (p >= st.slots.items.len) return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", null) };
+            const kv = st.slots.items[p];
+            const v: Value = switch (kind) {
+                .Keys => kv.key,
+                .Values => kv.value,
+                // A read-only map's store keeps no structural count: `setValue` throws.
+                .Entries => try st.nodeEntry(runtime.gc.bufferAllocatorFor(&store.cell.hdr, allocator), allocator, store, p, iterExpMod(it)),
+            };
+            if (kind != .Entries and runtime.reclaimEnabled()) v.retain();
+            break :blk .{ v, p, st.pastHoles(p + 1) >= st.slots.items.len };
+        };
+        const g = it.borrowMut();
+        defer g.deinit();
+        const c = g.get();
+        c.pos = p + 1;
+        c.last_ret = @intCast(p);
+        c.seen += 1;
+        c.ended = ended;
+        return .{ .ok = v };
+    }
+    if (std.mem.eql(u8, name, "remove")) {
+        if (try iteratorCheckMod(allocator, it)) |e| return e;
+        if (!iterMutable(it)) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+        {
+            const g = store.borrowMut();
+            defer g.deinit();
+            const st = g.get();
+            _ = mapCursorAt(it, st);
+            const li = iteratorLastRet(it);
+            if (li < 0) return .{ .err = try throwExc(allocator, "kotlin.IllegalStateException", null) };
+            const lu: usize = @intCast(li);
+            if (lu < st.slots.items.len and !st.isHole(lu)) {
+                // A slot an index covers leaves a hole; any other moves the rest down.
+                if (lu >= st.chain.items.len) try st.indexSimple(runtime.gc.bufferAllocatorFor(&store.cell.hdr, allocator));
+                const kv = st.removeAt(lu);
+                if (runtime.reclaimEnabled()) {
+                    kv.key.release(allocator);
+                    kv.value.release(allocator);
+                }
+                st.compactIfSparse();
+            }
+        }
+        {
+            const g = it.borrowMut();
+            defer g.deinit();
+            g.get().seen -= 1;
+            g.get().last_ret = -1;
+        }
+        iteratorOwnStructuralMod(it);
+        return .{ .ok = .Unit };
+    }
+    return null;
+}
+
+inline fn iterExpMod(it: ObjRef(runtime.IterCursor)) u64 {
+    const g = it.borrow();
+    defer g.deinit();
+    return g.get().exp_mod;
 }
 
 /// `Sequence.iterator()`: a builder sequence gets a fresh coroutine cursor
@@ -917,7 +983,7 @@ pub fn arrayShapeOps(self: *VmHost, allocator: Allocator, receiver: *const Value
     }
     if (std.mem.eql(u8, name, "toSet") and args.len == 0) {
         const items = try cloneArrayItems(allocator, arr);
-        return .{ .ok = try Value.newSet(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .mutable = false, .backing = null }) };
+        return .{ .ok = try Value.newSet(allocator, .{ .elems = try ObjRef(std.ArrayList(Value)).init(allocator, items), .mutable = false, .backing = null }) };
     }
     if (std.mem.eql(u8, name, "concatToString") and (args.len == 0 or args.len == 2)) {
         const chars = try arr.snapshot(allocator);
@@ -969,69 +1035,53 @@ pub fn componentMembers(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
         },
         .MapEntry => |me| {
-            // A live entry views the backing set: a structural map change makes
-            // every access throw CME, and reads before that see the live pair.
+            // A live entry is its node: it reads the value the map holds while the node is
+            // in it, and its own once the node left (`MapEntryData.read`); a `buildMap`
+            // builder's entry throws CME once the map changed structurally.
             if (me.backing.get()) |entries| {
                 const g = entries.borrow();
-                var stale = false;
-                if (g.get().mod_count.get()) |cell| stale = cell.cell.data.load() != me.exp_mod;
-                if (stale) {
-                    g.deinit();
-                    return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) };
-                }
-                var live: ?Value = null;
-                for (g.get().pairs.items) |*slot| {
-                    if (Value.structuralEq(&slot.key, me.key.asPtrConst())) {
-                        live = slot.value;
-                        break;
-                    }
-                }
+                const r = me.read(g.get());
                 g.deinit();
-                // The box is a cell of its own: the refreshed value is stored under its lock.
-                if (live) |lv| {
-                    const vg = me.value.borrowMut();
-                    defer vg.deinit();
-                    if (!Value.structuralEq(vg.get(), &lv)) {
-                        if (runtime.reclaimEnabled()) {
-                            lv.retain();
-                            vg.get().release(allocator);
-                        }
-                        vg.get().* = lv;
-                    }
+                switch (r) {
+                    .stale => return .{ .err = try throwExc(allocator, "kotlin.ConcurrentModificationException", null) },
+                    .live => |lv| me.putValue(lv),
+                    .detached => {},
                 }
             }
-            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return extractOwned(me.key);
-            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return extractOwned(me.value);
+            if (std.mem.eql(u8, name, "component1") or std.mem.eql(u8, name, "key")) return ownedResult(me.key);
+            if (std.mem.eql(u8, name, "component2") or std.mem.eql(u8, name, "value")) return ownedResult(me.getValue());
             // `Map.Entry` equality is by key and value, builtin or user alike.
             if (std.mem.eql(u8, name, "equals") and args.len == 1) {
-                if (try host_resolved.entryEquals(self, allocator, me.key.asPtrConst(), me.value.asPtrConst(), &args[0])) |r| return r;
+                const value = me.getValue();
+                if (try host_resolved.entryEquals(self, allocator, &me.key, &value, &args[0])) |r| return r;
                 return .{ .ok = boolVal(Value.structuralEqBoxed(receiver, &args[0])) };
             }
             if (std.mem.eql(u8, name, "hashCode") and args.len == 0) return .{ .ok = .{ .Int = kotlinHashCode(receiver) } };
             if (std.mem.eql(u8, name, "setValue")) {
-                // No backing means a read-only map's entry: mutation throws.
-                if (!me.backing.isSome()) {
-                    return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
-                }
+                // A read-only map's entry: mutation throws.
+                const entries = me.backing.get() orelse return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
                 const new_v = if (args.len > 0) args[0] else Value.Unit;
-                const prev = me.value.asPtrConst().*;
-                // host-returns-owned: the old value escapes as the result.
-                if (runtime.reclaimEnabled()) prev.retain();
-                if (me.backing.get()) |entries| {
+                // The node's value before: the map's while the node is in it, which the
+                // result takes over, else the entry's own.
+                const in_map: ?Value = blk: {
                     const g = entries.borrowMut();
                     defer g.deinit();
-                    for (g.get().pairs.items) |*slot| {
-                        if (Value.structuralEq(&slot.key, me.key.asPtrConst())) {
-                            // The slot owns its value: release the old, retain the new.
-                            if (runtime.reclaimEnabled()) {
-                                new_v.retain();
-                                slot.value.release(allocator);
-                            }
-                            slot.value = new_v;
-                            break;
-                        }
-                    }
-                }
+                    const st = g.get();
+                    const writable = if (st.mod_count.get()) |mc| !mc.cell.data.frozen() else false;
+                    if (!writable) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+                    const i = me.nodeSlot(st) orelse break :blk null;
+                    const old = st.slots.items[i].value;
+                    if (runtime.reclaimEnabled()) new_v.retain();
+                    st.slots.items[i].value = new_v;
+                    break :blk old;
+                };
+                const prev = in_map orelse own: {
+                    const v = me.getValue();
+                    if (runtime.reclaimEnabled()) v.retain();
+                    break :own v;
+                };
+                // The entry holds the value too, which a node out of the map keeps.
+                me.putValue(new_v);
                 return .{ .ok = prev };
             }
         },
@@ -1124,6 +1174,63 @@ inline fn iterItems(it: ObjRef(runtime.IterCursor)) runtime.ValueList {
     return g.get().items;
 }
 
+inline fn iterMapStore(it: ObjRef(runtime.IterCursor)) @FieldType(runtime.IterCursor, "map_store") {
+    const g = it.borrow();
+    defer g.deinit();
+    return g.get().map_store;
+}
+
+inline fn iterMapKind(it: ObjRef(runtime.IterCursor)) ?runtime.MapViewKind {
+    const g = it.borrow();
+    defer g.deinit();
+    return g.get().map_kind;
+}
+
+inline fn iterSet(it: ObjRef(runtime.IterCursor)) ?*runtime.SetData {
+    const g = it.borrow();
+    defer g.deinit();
+    return if (g.get().set.get()) |r| &r.cell.data else null;
+}
+
+/// Where an iterator over set `sd`'s own list stands, which the caller reads under the
+/// list's lock: found again by how many elements it has passed once a compaction moved
+/// them, then past any holes.
+fn setCursor(it: ObjRef(runtime.IterCursor), sd: *const runtime.SetData, len: usize) usize {
+    var p = blk: {
+        const g = it.borrowMut();
+        defer g.deinit();
+        const c = g.get();
+        if (c.set_epoch != sd.epoch) {
+            c.pos = c.seen;
+            if (c.last_ret >= 0) c.last_ret = @as(i64, @intCast(c.seen)) - 1;
+            c.set_epoch = sd.epoch;
+        }
+        break :blk c.pos;
+    };
+    if (sd.holes != 0) {
+        const ix = &sd.index.?.cell.data;
+        while (p < len and ix.isHole(p)) p += 1;
+    }
+    return p;
+}
+
+/// Whether set `sd`'s list, of length `len`, holds no element after position `p`; the
+/// caller holds the list's lock.
+fn setEndsAt(sd: *const runtime.SetData, len: usize, p: usize) bool {
+    var q = p + 1;
+    if (sd.holes != 0) {
+        const ix = &sd.index.?.cell.data;
+        while (q < len and ix.isHole(q)) q += 1;
+    }
+    return q >= len;
+}
+
+inline fn iterEnded(it: ObjRef(runtime.IterCursor)) bool {
+    const g = it.borrow();
+    defer g.deinit();
+    return g.get().ended;
+}
+
 inline fn iterModCount(it: ObjRef(runtime.IterCursor)) @FieldType(runtime.IterCursor, "mod_count") {
     const g = it.borrow();
     defer g.deinit();
@@ -1138,21 +1245,25 @@ inline fn iterMutable(it: ObjRef(runtime.IterCursor)) bool {
 
 pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const it = receiver.Iterator;
+    if (iterMapKind(it)) |kind| return mapCursorMember(allocator, it, kind, name, args);
+    const over_set = iterSet(it);
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
-        const pg = it.borrow();
-        const p = pg.get().pos;
-        pg.deinit();
+        if (over_set != null) return .{ .ok = boolVal(!iterEnded(it)) };
         const ig = iterItems(it).borrow();
+        defer ig.deinit();
         const len = ig.get().items.len;
-        ig.deinit();
-        return .{ .ok = boolVal(p < len) };
+        const pg = it.borrow();
+        defer pg.deinit();
+        return .{ .ok = boolVal(pg.get().pos < len) };
     }
     if (isIteratorNext(name) and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
-        const pg = it.borrow();
-        const p = pg.get().pos;
-        pg.deinit();
         const ig = iterItems(it).borrow();
+        const p = if (over_set) |sd| setCursor(it, sd, ig.get().items.len) else blk: {
+            const pg = it.borrow();
+            defer pg.deinit();
+            break :blk pg.get().pos;
+        };
         if (p >= ig.get().items.len) {
             ig.deinit();
             return .{ .err = try throwExc(allocator, "kotlin.NoSuchElementException", "iterator exhausted") };
@@ -1166,9 +1277,14 @@ pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []cons
         }
         // Borrowed element: retain before the register takes ownership.
         if (runtime.reclaimEnabled()) v.retain();
+        const ended = if (over_set) |sd| setEndsAt(sd, ig.get().items.len, p) else false;
         ig.deinit();
         const pmg = it.borrowMut();
         pmg.get().pos = p + 1;
+        if (over_set != null) {
+            pmg.get().seen += 1;
+            pmg.get().ended = ended;
+        }
         pmg.deinit();
         iteratorSetLast(it, @intCast(p));
         if (runtime.envSetOnce("KLIO_ITER_TRACE")) {
@@ -1253,6 +1369,9 @@ pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []cons
     if (std.mem.eql(u8, name, "remove") and args.len == 0) {
         if (try iteratorCheckMod(allocator, it)) |e| return e;
         if (!iterMutable(it)) return .{ .err = try throwExc(allocator, "kotlin.UnsupportedOperationException", null) };
+        const g = iterItems(it).borrowMut();
+        defer g.deinit();
+        if (over_set) |sd| _ = setCursor(it, sd, g.get().items.len);
         const pg = it.borrow();
         const p = pg.get().pos;
         pg.deinit();
@@ -1261,35 +1380,17 @@ pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []cons
             return .{ .err = try throwExc(allocator, "kotlin.IllegalStateException", "remove() called before next()") };
         }
         const lu: usize = @intCast(li);
-        const g = iterItems(it).borrowMut();
-        defer g.deinit();
         if (lu < g.get().items.len) {
-            const removed = g.get().items[lu];
-            // A live entry: delete it from the backing map by key as well.
-            if (removed == .MapEntry) {
-                if (removed.MapEntry.backing.get()) |entries| {
-                    const eg = entries.borrowMut();
-                    defer eg.deinit();
-                    const key = removed.MapEntry.key.asPtrConst();
-                    for (eg.get().pairs.items, 0..) |*slot, i| {
-                        if (Value.structuralEq(&slot.key, key)) {
-                            if (runtime.reclaimEnabled()) {
-                                slot.key.release(allocator);
-                                slot.value.release(allocator);
-                            }
-                            _ = eg.get().removeAt(i);
-                            break;
-                        }
-                    }
-                }
-            }
-            _ = g.get().orderedRemove(lu);
+            // A set's own list may keep a hole where the element stood instead.
+            const shifted = if (over_set) |sd| sd.removeAtLocked(g.get(), lu).shifted else blk: {
+                _ = g.get().orderedRemove(lu);
+                break :blk true;
+            };
+            const pmg = it.borrowMut();
+            if (over_set != null) pmg.get().seen -= 1;
             // The cursor slides back only when the removed slot was BEFORE it.
-            if (lu < p) {
-                const pmg = it.borrowMut();
-                pmg.get().pos = p - 1;
-                pmg.deinit();
-            }
+            if (shifted and lu < p) pmg.get().pos = p - 1;
+            pmg.deinit();
             iteratorSetLast(it, -1);
             iteratorOwnStructuralMod(it);
         }
@@ -1916,18 +2017,7 @@ pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allo
 
 /// `String.hashCode()` over UTF-16 code units.
 pub fn javaStringHash(s: []const u8) i32 {
-    var h: i32 = 0;
-    var it = std.unicode.Utf8View.initUnchecked(s).iterator();
-    while (it.nextCodepoint()) |cp| {
-        if (cp >= 0x10000) {
-            const c = cp - 0x10000;
-            h = h *% 31 +% @as(i32, @intCast(0xD800 + (c >> 10)));
-            h = h *% 31 +% @as(i32, @intCast(0xDC00 + (c & 0x3FF)));
-        } else {
-            h = h *% 31 +% @as(i32, @intCast(cp));
-        }
-    }
-    return h;
+    return runtime.javaStringHash(s);
 }
 
 fn renderAnnotationInto(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), buf: *std.ArrayList(u8)) Allocator.Error!void {

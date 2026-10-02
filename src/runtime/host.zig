@@ -176,11 +176,18 @@ pub const WellKnownObject = enum(u8) {
 pub const WellKnownClass = enum(u8) {
     /// `IndexedValue(index, value)`, the elements `withIndex` yields.
     indexed_value,
+    /// A map's `keys`, `values` and `entries` over the map (`MapViews.kt`).
+    hash_map_keys,
+    hash_map_values,
+    hash_map_entry_set,
 
     /// The class's FQN, as sema spells a nested class's.
     pub fn fqn(c: WellKnownClass) []const u8 {
         return switch (c) {
             .indexed_value => "kotlin.collections.IndexedValue",
+            .hash_map_keys => "kotlin.collections.HashMapKeys",
+            .hash_map_values => "kotlin.collections.HashMapValues",
+            .hash_map_entry_set => "kotlin.collections.HashMapEntrySet",
         };
     }
 };

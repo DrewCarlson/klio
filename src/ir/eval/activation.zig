@@ -179,40 +179,33 @@ pub fn resumeContinuation(
                 snap.regs.ptrIdentity(),
             });
         }
+        // The frame is rebuilt as an activation, as a call the loop runs opens one: its next
+        // suspension parks it live, so a coroutine's frame is copied out once, not at every one.
         const ev = ev_state.evtlsPtr();
         const area = try ArgArea.push(ev, snap.params, snap.captures);
-        var frame: Frame = undefined;
-        frame.enter(ev, allocator, m, func, area.vals[0..snap.params.len], area.vals[snap.params.len..], area.mark) catch |e| {
+        const act = actAlloc(ev, allocator) catch |e| {
             ev.vstack.restore(area.mark);
             return e;
         };
-        frame.closure = snap.closure;
-        frame.cur_span = snap.span;
-        frame.pfSet(snap.pending_finally) catch |e| {
-            frame.deinitIn(ev);
+        act.frame.enter(ev, allocator, m, func, area.vals[0..snap.params.len], area.vals[snap.params.len..], area.mark) catch |e| {
+            ev.vstack.restore(area.mark);
+            actFree(ev, allocator, act);
             return e;
         };
-        defer frame.deinit();
-        gcPushFrame(&frame);
-        defer gcPopFrame(&frame);
-        frame.module_arc = snap_module;
+        act.frame.closure = snap.closure;
+        act.frame.cur_span = snap.span;
+        act.frame.module_arc = snap_module;
         // The frame adopts the references the snapshot retained on suspend; its teardown balances them.
-        frame.owns_params_caps = true;
-        switch (snap.regs) {
-            .sparse => |entries| {
-                // The sparse snapshot recorded only live registers over a Unit base, which a no-fill frame must materialize first.
-                frame.materializeRegs();
-                for (entries) |entry| {
-                    if (entry.id < frame.regs.len) frame.regs[entry.id] = entry.value;
-                }
-            },
-            .dense => |values| {
-                frame.materializeRegs();
-                if (values.len > frame.regs.len) try frame.write(Reg.from(@intCast(values.len - 1)), .Unit);
-                @memcpy(frame.regs[0..values.len], values);
-                @memset(frame.regs[values.len..], .Unit);
-            },
-        }
+        act.frame.owns_params_caps = true;
+        act.ret_idx = 0;
+        act.ret_streams = null;
+        act.ret_pc = 0;
+        act.ret_code = 0;
+        rebuildFrom(act, snap) catch |e| {
+            act.frame.deinitIn(ev);
+            actFree(ev, allocator, act);
+            return e;
+        };
         // Kotlin `Continuation.resumeWith(Result.failure(e))` means resume by throwing `e` at the
         // suspension point, so only the innermost frame sees it, as a throw and not as a value.
         var resume_throw: ?Value = null;
@@ -229,34 +222,57 @@ pub fn resumeContinuation(
             }
         }
         first = false;
-        if (resume_throw == null) {
-            if (snap.resume_reg) |r| {
-                try frame.write(r, carry);
-            }
-        }
-        var try_stack: std.ArrayList(TryFrame) = .empty;
-        defer try_stack.deinit(try_alloc);
-        try try_stack.appendSlice(try_alloc, snap.try_stack);
-        // Every value moved into a frame-owned buffer; free the snapshot's slice buffers, not its values.
+        // Every value moved into the frame; free the snapshot's slice buffers, not its values.
         freeSnapshotBuffers(snap, allocator);
-        const r = try runFrameInner(
-            H,
-            allocator,
-            m,
-            &frame,
-            &try_stack,
-            snap.block,
-            snap.inst_idx,
-            resume_throw,
-            resume_unwind,
-            host,
-        );
+        const r = try resumeLiveActivation(H, allocator, act, carry, snap.block, snap.inst_idx, snap.resume_reg, resume_throw, resume_unwind, host);
         switch (try routeResumedResult(allocator, r, &frames, head, &tails, &carry, &pending_throw_from_inner, &pending_unwind_from_inner)) {
             .next => {},
             .done => |out| return out,
         }
     }
     return ok(carry);
+}
+
+/// `resumeContinuation` for a `state` holding one live-parked activation and nothing
+/// inherited, as a generator's is after its first suspension, resumed with a value that is
+/// no `Result`: the activation runs on with no resume list to keep or route, its result is
+/// written to `out`, and `state` keeps its frame list's buffer, empty, for its caller to
+/// reuse. False, having done nothing, for any other state or value. The result goes through
+/// `out` rather than an optional, which a hot caller would copy in pieces.
+pub fn resumeSingleLive(comptime H: type, allocator: Allocator, state: *SuspendState, resume_value: Value, host: *H, out: *EvalResult) Allocator.Error!bool {
+    if (state.tails != null or state.frames.items.len != 1) return false;
+    if (resume_value == .Result or resume_value == .CoroutineSuspended) return false;
+    const snap = state.frames.items[0];
+    const act = snap.live orelse return false;
+    state.frames.clearRetainingCapacity();
+    state.gc_quiesced = false;
+    out.* = try resumeLiveActivation(H, allocator, act, resume_value, snap.block, snap.inst_idx, snap.resume_reg, null, null, host);
+    // A ran frame's escape is re-tagged as `routeResumedResult` re-tags it.
+    if (out.* == .err and out.err == .Unimplemented) out.* = errResult(.{ .CalleeFailed = out.err.Unimplemented });
+    return true;
+}
+
+/// A snapshot's paused finally flow, registers and try frames, restored into the rebuilt
+/// activation `act`.
+fn rebuildFrom(act: *Activation, snap: FrameSnapshot) Allocator.Error!void {
+    const frame = &act.frame;
+    try frame.pfSet(snap.pending_finally);
+    switch (snap.regs) {
+        .sparse => |entries| {
+            // The sparse snapshot recorded only live registers over a Unit base, which a no-fill frame must materialize first.
+            frame.materializeRegs();
+            for (entries) |entry| {
+                if (entry.id < frame.regs.len) frame.regs[entry.id] = entry.value;
+            }
+        },
+        .dense => |values| {
+            frame.materializeRegs();
+            if (values.len > frame.regs.len) try frame.write(Reg.from(@intCast(values.len - 1)), .Unit);
+            @memcpy(frame.regs[0..values.len], values);
+            @memset(frame.regs[values.len..], .Unit);
+        },
+    }
+    try act.try_stack.appendSlice(try_alloc, snap.try_stack);
 }
 
 const ResumeRoute = union(enum) { next, done: EvalResult };
@@ -336,11 +352,11 @@ pub fn runFrame(
         if (try ev_resolved.stackOverflowError(H, allocator, module, host)) |exc| return errResult(.{ .Throw = exc });
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
     }
-    if (ev_state.evtlsPtr().eval_depth == 0) _ = parent.threads_in_eval.fetchAdd(1, .monotonic);
-    ev_state.evtlsPtr().eval_depth += 1;
+    if (depth_ev.eval_depth == 0) _ = parent.threads_in_eval.fetchAdd(1, .monotonic);
+    depth_ev.eval_depth += 1;
     defer {
-        ev_state.evtlsPtr().eval_depth -= 1;
-        if (ev_state.evtlsPtr().eval_depth == 0) _ = parent.threads_in_eval.fetchSub(1, .monotonic);
+        depth_ev.eval_depth -= 1;
+        if (depth_ev.eval_depth == 0) _ = parent.threads_in_eval.fetchSub(1, .monotonic);
     }
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }

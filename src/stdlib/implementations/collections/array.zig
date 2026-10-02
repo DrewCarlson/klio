@@ -27,6 +27,7 @@ const makeArrayBorrowed = common_mod.makeArrayBorrowed;
 const makeStringOwned = common_mod.makeStringOwned;
 const ok = common_mod.ok;
 const okElem = common_mod.okElem;
+const sortValuesNaturalDesc = common_mod.sortValuesNaturalDesc;
 const thrown = common_mod.thrown;
 const typeErr = common_mod.typeErr;
 
@@ -35,7 +36,6 @@ const invokeComparatorCompare = iterable_mod.invokeComparatorCompare;
 
 const list_transforms_mod = @import("list_transforms.zig");
 const sortListHostAware = list_transforms_mod.sortListHostAware;
-const sortListHostAwareDesc = list_transforms_mod.sortListHostAwareDesc;
 const sumValues = list_transforms_mod.sumValues;
 
 fn arrayPrimDefault(prim: ?PrimitiveArrayKind) Value {
@@ -75,6 +75,22 @@ fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
     const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     if (runtime.freeScratch()) a.free(msg);
     return e;
+}
+
+/// An array's type as the JVM names it in an `arraycopy` message: an unsigned array is the
+/// signed one it wraps.
+fn arrayTypeName(arr: runtime.ArrayData) []const u8 {
+    const k = arr.primKind() orelse return "object array";
+    return switch (k) {
+        .Int, .UInt => "int",
+        .Long, .ULong => "long",
+        .Double => "double",
+        .Float => "float",
+        .Short, .UShort => "short",
+        .Byte, .UByte => "byte",
+        .Boolean => "boolean",
+        .Char => "char",
+    };
 }
 
 fn illegalArg(a: Allocator, msg: []const u8) Error!EvalResult {
@@ -443,17 +459,30 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
         .idx => |v| v,
         .err => |e| return e,
     };
-    if (start < 0 or end > src_len or start > end) {
-        return indexOob(a, try fmt(a, "copyInto: source range [{d}, {d}) out of bounds for length {d}", .{ start, end, src_len }));
-    }
     const count = end - start;
     const dest_len: i64 = @intCast(dest_arr.len());
-    if (dest_offset < 0 or dest_offset + count > dest_len) {
-        return indexOob(a, try fmt(a, "copyInto: destination range [{d}, {d}) out of bounds for length {d}", .{ dest_offset, dest_offset + count, dest_len }));
+    // As the JVM's `copyInto`, which is `System.arraycopy`, checks the ranges and says why.
+    const why: ?[]u8 = if (start < 0)
+        try fmt(a, "arraycopy: source index {d} out of bounds for {s}[{d}]", .{ start, arrayTypeName(src_arr), src_len })
+    else if (dest_offset < 0)
+        try fmt(a, "arraycopy: destination index {d} out of bounds for {s}[{d}]", .{ dest_offset, arrayTypeName(dest_arr), dest_len })
+    else if (count < 0)
+        try fmt(a, "arraycopy: length {d} is negative", .{count})
+    else if (end > src_len)
+        try fmt(a, "arraycopy: last source index {d} out of bounds for {s}[{d}]", .{ end, arrayTypeName(src_arr), src_len })
+    else if (dest_offset + count > dest_len)
+        try fmt(a, "arraycopy: last destination index {d} out of bounds for {s}[{d}]", .{ dest_offset + count, arrayTypeName(dest_arr), dest_len })
+    else
+        null;
+    if (why) |msg| {
+        const e = try thrown(a, "klio.ArrayIndexOutOfBoundsException", msg);
+        if (runtime.freeScratch()) a.free(msg);
+        return e;
     }
+    const base: usize = @intCast(dest_offset);
+    if (dest_arr.copyRangeFrom(a, base, src_arr, @intCast(start), @intCast(count))) return ok(dest_val);
     const sub = try src_arr.snapshotRange(a, @intCast(start), @intCast(end));
     defer if (runtime.freeScratch()) a.free(sub);
-    const base: usize = @intCast(dest_offset);
     for (sub, 0..) |v, i| dest_arr.set(a, base + i, v);
     return ok(dest_val);
 }
@@ -614,58 +643,44 @@ pub fn array_sort(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
-pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
+/// `__klio_sortNatively(array, fromIndex, toIndex, comparator)`, the host half of the Kotlin
+/// sorts (`kotlin-collections/Sorting.kt`): sorts the range in place and answers true when
+/// the comparator is the natural order (null, a host comparator with no steps, the stdlib's
+/// natural-order object) or its reverse and every element there is a number, a character, a
+/// string or a Boolean of one kind, whose comparisons nothing observes; false, the array as
+/// it was, for anything else, which the Kotlin sort takes with its comparator's own calls.
+pub fn array_sort_natively(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sortWith requires an array receiver");
+    if (ctx.args.len != 4 or ctx.args[0] != .Array or ctx.args[1] != .Int or ctx.args[2] != .Int) {
+        return typeErr("__klio_sortNatively expects (array, fromIndex, toIndex, comparator)");
+    }
+    const descending = switch (ctx.args[3]) {
+        .Null => false,
+        .Comparator => |c| blk: {
+            const g = c.steps.borrow();
+            defer g.deinit();
+            if (g.get().len != 0) return ok(.{ .Bool = false });
+            break :blk c.descending;
+        },
+        .Instance => |inst| blk: {
+            const fqn = inst.asPtrConst().class.cell.data.fqn;
+            if (std.mem.eql(u8, fqn, "kotlin.comparisons.NaturalOrderComparator")) break :blk false;
+            if (std.mem.eql(u8, fqn, "kotlin.comparisons.ReverseOrderComparator")) break :blk true;
+            return ok(.{ .Bool = false });
+        },
+        else => return ok(.{ .Bool = false }),
+    };
     const arr = ctx.args[0].Array;
-    if (ctx.args.len < 2) return arityErr("sortWith expects (comparator, ...)");
-    const comparator = ctx.args[1];
-    const len: i64 = @intCast(arr.len());
-    const from = switch (try arrayOptIndex(a, ctx, 2, 0, "sortWith")) {
-        .idx => |v| v,
-        .err => |e| return e,
-    };
-    const to = switch (try arrayOptIndex(a, ctx, 3, len, "sortWith")) {
-        .idx => |v| v,
-        .err => |e| return e,
-    };
-    if (from < 0 or to > len) {
-        return indexOob(a, try fmt(a, "sortWith: range [{d}, {d}) out of bounds for length {d}", .{ from, to, len }));
-    }
-    if (from > to) {
-        return illegalArg(a, try fmt(a, "sortWith: fromIndex {d} > toIndex {d}", .{ from, to }));
-    }
     const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
-    const sub = buf[@intCast(from)..@intCast(to)];
-    if (comparator == .Comparator) {
-        const empty = blk: {
-            const steps_g = comparator.Comparator.steps.borrow();
-            defer steps_g.deinit();
-            break :blk steps_g.get().len == 0;
-        };
-        if (empty) {
-            if (try sortListHostAwareDesc(ctx, sub, comparator.Comparator.descending)) |e| return e;
-            try arr.writeBack(a, buf);
-            return ok(Value.Unit);
-        }
-    }
-    var i: usize = 1;
-    while (i < sub.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const n = switch (try invokeComparatorCompare(ctx, comparator, sub[j - 1], sub[j])) {
-                .n => |v| v,
-                .err => |e| return e,
-            };
-            if (n > 0) {
-                std.mem.swap(Value, &sub[j - 1], &sub[j]);
-                j -= 1;
-            } else break;
-        }
-    }
+    const sub = buf[@intCast(ctx.args[1].Int)..@intCast(ctx.args[2].Int)];
+    if (sub.len < 2) return ok(.{ .Bool = true });
+    const kind = std.meta.activeTag(sub[0]);
+    if (!sub[0].isNumeric() and kind != .Char and kind != .Bool and kind != .String) return ok(.{ .Bool = false });
+    for (sub[1..]) |v| if (std.meta.activeTag(v) != kind) return ok(.{ .Bool = false });
+    if (try sortValuesNaturalDesc(a, sub, descending)) |_| return ok(.{ .Bool = false });
     try arr.writeBack(a, buf);
-    return ok(Value.Unit);
+    return ok(.{ .Bool = true });
 }
 
 fn arraySumImpl(ctx: *CallCtx, what: []const u8) Error!EvalResult {

@@ -165,7 +165,7 @@ pub fn tryNative(self: *VmHost, allocator: Allocator, id: NativeId, args: []cons
 
 /// A host member's result as code lowered from sema reads it: a value
 /// needing no conversion as it is, else as `kotlinThrow` makes it.
-fn hostResult(self: *VmHost, allocator: Allocator, res: EvalResult) Allocator.Error!EvalResult {
+inline fn hostResult(self: *VmHost, allocator: Allocator, res: EvalResult) Allocator.Error!EvalResult {
     if (res == .ok and res.ok != .Result and res.ok != .CoroutineSuspended) return res;
     return kotlinThrow(self, allocator, res);
 }
@@ -449,14 +449,13 @@ fn callSlot(self: *VmHost, allocator: Allocator, module: *const Module, recv: *c
     else
         .none;
     if (native == .none and (host_value or target == null)) return null;
-    var sfa = std.heap.stackFallback(8 * @sizeOf(Value), allocator);
-    const la = sfa.get();
-    var list: std.ArrayList(Value) = .empty;
-    defer list.deinit(la);
-    try list.append(la, recv.*);
-    try list.appendSlice(la, args);
-    if (native != .none) return try callNative(self, allocator, native, list.items);
-    return try runResolved(self, allocator, module, target.?, list.items);
+    var buf: [8]Value = undefined;
+    const run = if (args.len < buf.len) buf[0 .. args.len + 1] else try allocator.alloc(Value, args.len + 1);
+    defer if (args.len >= buf.len) allocator.free(run);
+    run[0] = recv.*;
+    @memcpy(run[1..], args);
+    if (native != .none) return try callNative(self, allocator, native, run);
+    return try runResolved(self, allocator, module, target.?, run);
 }
 
 /// The hash `Any.hashCode` answers for instance `key` (its identity's low word) when the
@@ -537,9 +536,7 @@ pub fn runResolved(self: *VmHost, allocator: Allocator, module: *const Module, f
         if (try tryNative(self, allocator, r.func_try[f.int()], args)) |res| return res;
     };
     const func = module.funcById(f) orelse return fail(allocator, "function #{d} is not in the module", .{f.int()});
-    var list: std.ArrayList(Value) = .empty;
-    try list.appendSlice(allocator, args);
-    return ir.eval.evalWith(VmHost, allocator, module, func, list, self);
+    return ir.eval.evalSlices(VmHost, allocator, module, null, func, args, &.{}, null, self);
 }
 
 /// A closure over `func` of `module` holding `captures`, registered in the
@@ -568,20 +565,35 @@ pub fn callResolvedClosure(self: *VmHost, allocator: Allocator, callee: *const V
     const body = resolvedClosure(self, callee) orelse return null;
     const given = args.len + @intFromBool(this_value != null);
     if (given != body.arity()) return try fail(allocator, "closure of {s} takes {d} arguments, called with {d}", .{ body.func.fqn, body.arity(), given });
-    var params: std.ArrayList(Value) = .empty;
-    var caps: std.ArrayList(Value) = .empty;
-    {
-        const g = callee.IrClosure.borrow();
-        defer g.deinit();
-        const closure_caps = g.get().captures;
-        switch (body.kind) {
-            .property_ref => |p| if (p.bound and closure_caps.len != 0) try params.append(allocator, closure_caps[0]),
-            else => try caps.appendSlice(allocator, closure_caps),
-        }
+    var buf: [8]Value = undefined;
+    const call = try closureCall(allocator, &buf, callee, body, this_value, args);
+    defer if (call.params.ptr != @as([*]Value, &buf)) allocator.free(call.params);
+    return try ir.eval.evalSlices(VmHost, allocator, body.module, body.owning, body.func, call.params, call.captures, callee.IrClosure, self);
+}
+
+/// A resolved closure's parameters and captures for a call with `this_value` and `args`: a
+/// bound property reference's receiver first, then `this_value`, then `args`; the captures
+/// read from the closure, which never changes them. The parameters are in `buf` when they
+/// fit, else in memory the caller frees.
+pub fn closureCall(allocator: Allocator, buf: []Value, callee: *const Value, body: ir.resolved.ClosureBody, this_value: ?*const Value, args: []const Value) Allocator.Error!struct { params: []Value, captures: []const Value } {
+    const closure_caps = callee.IrClosure.asPtrConst().captures;
+    const bound = switch (body.kind) {
+        .property_ref => |p| p.bound and closure_caps.len != 0,
+        else => false,
+    };
+    const n = @intFromBool(bound) + @intFromBool(this_value != null) + args.len;
+    const params = if (n <= buf.len) buf[0..n] else try allocator.alloc(Value, n);
+    var k: usize = 0;
+    if (bound) {
+        params[0] = closure_caps[0];
+        k = 1;
     }
-    if (this_value) |t| try params.append(allocator, t.*);
-    try params.appendSlice(allocator, args);
-    return try ir.eval.evalClosure(VmHost, allocator, body.module, body.owning, body.func, params, caps, callee.IrClosure, self);
+    if (this_value) |t| {
+        params[k] = t.*;
+        k += 1;
+    }
+    @memcpy(params[k..], args);
+    return .{ .params = params, .captures = if (body.kind == .property_ref) &.{} else closure_caps };
 }
 
 /// The body of a closure lowered from sema, or null for any other value.

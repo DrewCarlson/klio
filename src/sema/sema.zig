@@ -273,6 +273,7 @@ pub const Sema = struct {
         try self.bindBuiltins();
         try decls.markHidden(self, Sym.from(first));
         try decls.linkExpectActual(self, Sym.from(first));
+        try decls.linkPlatformShadows(self, Sym.from(first));
         try decls.synthesizeFrom(self, Sym.from(first));
         try decls.checkDeclarations(self, Sym.from(first));
         // A program's imports resolve whether or not anything in the file

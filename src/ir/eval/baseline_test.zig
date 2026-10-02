@@ -1437,7 +1437,7 @@ test "compiled map reads and builder appends call their host code straight, and 
     for (&maps, [_]usize{ 40, 3 }) |*mp, n| {
         var pairs: std.ArrayList(runtime.MapPair) = .empty;
         for (0..n) |i| try pairs.append(a, .{ .key = .{ .Int = @intCast(i) }, .value = .{ .Long = @intCast(i * 10) } });
-        mp.* = try Value.newMap(a, .{ .entries = try runtime.MapEntries.init(a, .{ .pairs = pairs }), .mutable = true });
+        mp.* = try Value.newMap(a, .{ .entries = try runtime.MapEntries.init(a, .{ .slots = pairs }), .mutable = true });
     }
     // A case left to the host function (`want` null) fails here, as it does not run.
     const Get = struct { recv: Value, key: Value, want: ?Value };
@@ -2608,7 +2608,7 @@ test "an optimized loop calls a map's lookup and a builder's append straight, th
     try h.finish();
     var pairs: std.ArrayList(runtime.MapPair) = .empty;
     for (0..8) |i| try pairs.append(a, .{ .key = .{ .Int = @intCast(i) }, .value = .{ .Int = @intCast(i * 10) } });
-    const map = try Value.newMap(a, .{ .entries = try runtime.MapEntries.init(a, .{ .pairs = pairs }), .mutable = true });
+    const map = try Value.newMap(a, .{ .entries = try runtime.MapEntries.init(a, .{ .slots = pairs }), .mutable = true });
     const n = 64;
     var want: i64 = 0;
     for (0..n) |i| want += @intCast((i & 7) * 10);

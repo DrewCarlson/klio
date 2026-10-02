@@ -4,7 +4,8 @@
 //! bits, which compiled code compiles as its instructions (`baseline.zig`);
 //! and a map's lookup, store and size, a list's append, a builder's append
 //! of a string or a number and its length, which compiled code calls here
-//! straight. The
+//! straight; a host iterator's `hasNext()` and `next()`; and a map entry's
+//! `key` and `value`. The
 //! interpreter runs every one in place of the host call (`run`); both leave
 //! anything they do not take to the host function.
 
@@ -35,6 +36,11 @@ pub const Intrinsic = union(enum) {
     map_size,
     sb_append,
     sb_length,
+    iter_has_next,
+    /// `next()`, and a primitive iterator's `nextInt()` and kin.
+    iter_next,
+    entry_key,
+    entry_value,
 
     /// The arguments the call passes, its receiver first.
     pub fn arity(k: Intrinsic) u32 {
@@ -48,7 +54,7 @@ pub const Intrinsic = union(enum) {
     /// Whether compiled code compiles it as instructions.
     pub fn compiled(k: Intrinsic) bool {
         return switch (k) {
-            .none, .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length => false,
+            .none, .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length, .iter_has_next, .iter_next, .entry_key, .entry_value => false,
             else => true,
         };
     }
@@ -57,7 +63,7 @@ pub const Intrinsic = union(enum) {
     /// host function's handler.
     pub fn called(k: Intrinsic) bool {
         return switch (k) {
-            .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length => true,
+            .map_get, .map_put, .map_set, .map_size, .list_add, .sb_append, .sb_length, .iter_has_next, .iter_next, .entry_key, .entry_value => true,
             else => false,
         };
     }
@@ -99,6 +105,10 @@ pub const Intrinsic = union(enum) {
             .map_size => .map_size,
             .sb_append => .sb_append,
             .sb_length => .sb_length,
+            .iter_has_next => .iter_has_next,
+            .iter_next => .iter_next,
+            .entry_key => .entry_key,
+            .entry_value => .entry_value,
         };
     }
 };
@@ -130,6 +140,17 @@ pub fn of(module: *const ir.Module, nid: ir.NativeId) Intrinsic {
     if (std.mem.eql(u8, name, "kotlin.collections.MutableMap.set")) return .map_set;
     if (std.mem.eql(u8, name, "kotlin.text.StringBuilder.append")) return .sb_append;
     if (std.mem.eql(u8, name, "kotlin.text.StringBuilder.length")) return .sb_length;
+    inline for (.{ "Iterator", "ListIterator", "MutableListIterator" }) |cls| {
+        if (std.mem.eql(u8, name, "kotlin.collections." ++ cls ++ ".hasNext")) return .iter_has_next;
+        if (std.mem.eql(u8, name, "kotlin.collections." ++ cls ++ ".next")) return .iter_next;
+    }
+    inline for (.{ "Map.Entry", "MutableMap.MutableEntry" }) |cls| {
+        if (std.mem.eql(u8, name, "kotlin.collections." ++ cls ++ ".key")) return .entry_key;
+        if (std.mem.eql(u8, name, "kotlin.collections." ++ cls ++ ".value")) return .entry_value;
+    }
+    inline for (.{ "Byte", "Char", "Short", "Int", "Long", "Float", "Double", "Boolean" }) |p| {
+        if (std.mem.eql(u8, name, "kotlin.collections." ++ p ++ "Iterator.next" ++ p)) return .iter_next;
+    }
     const Kind = runtime.PrimitiveArrayKind;
     inline for (.{ Kind.Int, Kind.Long, Kind.Double, Kind.Float, Kind.Short, Kind.Byte, Kind.Boolean, Kind.Char }) |k| {
         if (std.mem.eql(u8, name, "kotlin." ++ @tagName(k) ++ "Array.size")) return .{ .array_size = @intFromEnum(k) + 1 };
@@ -149,12 +170,19 @@ pub fn cached(module: *const ir.Module, nid: ir.NativeId) Intrinsic {
     return k;
 }
 
-/// `k` over the call's arguments as its host function answers it, or null
-/// when the host function must run: another receiver, an index out of
-/// range, a list that is a view or cannot change, a key that is an
-/// instance, a builder append of anything but a string or a number. Only for
-/// the tracing collector, where a value is copied without counting.
-pub fn run(k: Intrinsic, a: std.mem.Allocator, module: *const ir.Module, args: []const Value) ?Value {
+/// `k` over the call's arguments as its host function answers it, written to `out`; false
+/// when the host function must run: another receiver, an index out of range, a list that is
+/// a view or cannot change, a key that is an instance, a builder append of anything but a
+/// string or a number. Only for the tracing collector, where a value is copied without
+/// counting. The answer goes through `out` rather than an optional result, which a declined
+/// call would build in memory and read back.
+pub fn run(k: Intrinsic, a: std.mem.Allocator, module: *const ir.Module, args: []const Value, out: *Value) bool {
+    out.* = answer(k, a, module, args) orelse return false;
+    return true;
+}
+
+/// `run`'s answer, or null where the host function must run.
+inline fn answer(k: Intrinsic, a: std.mem.Allocator, module: *const ir.Module, args: []const Value) ?Value {
     if (args.len < k.arity()) return null;
     const recv = args[0];
     switch (k) {
@@ -233,7 +261,138 @@ pub fn run(k: Intrinsic, a: std.mem.Allocator, module: *const ir.Module, args: [
         // `append(s, start, end)` is not `append(s)`.
         .sb_append => return if (args.len == 2) sbAppend(a, recv, &args[1]) else null,
         .sb_length => return sbLength(recv),
+        .iter_has_next => return iterHasNext(recv),
+        .iter_next => return iterNext(recv),
+        .entry_key => return entryKey(recv),
+        .entry_value => return entryValue(recv),
     }
+}
+
+/// `entry_key`: a map entry's key, which never changes; null for any other receiver and for
+/// a `buildMap` builder's entry, which the host function checks for a change first.
+fn entryKey(recv: Value) ?Value {
+    if (recv != .MapEntry or runtime.reclaimEnabled()) return null;
+    const me = recv.MapEntry;
+    if (me.backing.get()) |entries| if (@atomicLoad(bool, &entries.cell.data.builder, .monotonic)) return null;
+    return me.key;
+}
+
+/// `entry_value`: a map entry's value, its node's while the node is in the map, its own
+/// once it left (`MapEntryData.getValue`); null as `entryKey` answers it.
+fn entryValue(recv: Value) ?Value {
+    if (recv != .MapEntry or runtime.reclaimEnabled()) return null;
+    const me = recv.MapEntry;
+    if (me.backing.get()) |entries| if (@atomicLoad(bool, &entries.cell.data.builder, .monotonic)) return null;
+    return me.getValue();
+}
+
+/// `iter_has_next`: whether a host iterator's position is before the end of its elements,
+/// as `builtin_members.iteratorMember` answers; null for any other receiver, and for one
+/// over a set whose list holds holes or was closed up since the iterator last stood.
+fn iterHasNext(recv: Value) ?Value {
+    if (recv != .Iterator) return null;
+    const g = recv.Iterator.borrow();
+    defer g.deinit();
+    const cur = g.get();
+    // As the host function answers: from the element `next` last gave.
+    if (cur.map_kind != null or cur.set.isSome()) return .{ .Bool = !cur.ended };
+    return .{ .Bool = cur.pos < itemsLen(cur.items) };
+}
+
+/// Where an iterator over a map stands in its store `st`, past any holes; null when the
+/// entries moved since it last stood, which the host function finds again.
+fn mapSlotAt(cur: *const runtime.IterCursor, st: *const runtime.MapStore) ?usize {
+    if (st.epoch != cur.map_epoch) return null;
+    var p = cur.pos;
+    if (st.holes != 0) {
+        while (p < st.slots.items.len and st.isHole(p)) p += 1;
+    }
+    return p;
+}
+
+/// `iter_next` of an iterator over a map (`IterCursor.map_kind`): the next slot's key or
+/// value, or its node's entry object once the store made it; null where the host function
+/// must answer (an entry object yet to make, the end, the entries moved).
+fn mapCursorNext(cur: *runtime.IterCursor) ?Value {
+    if (runtime.reclaimEnabled()) return null;
+    const sg = cur.map_store.get().?.borrow();
+    defer sg.deinit();
+    const st = sg.get();
+    const p = mapSlotAt(cur, st) orelse return null;
+    if (p >= st.slots.items.len) return null;
+    const kv = st.slots.items[p];
+    const v: Value = switch (cur.map_kind.?) {
+        .Keys => kv.key,
+        .Values => kv.value,
+        .Entries => blk: {
+            if (!st.tracking) return null;
+            const c = st.nodes.items[p] orelse return null;
+            const me = &c.data;
+            me.exp_mod = cur.exp_mod;
+            me.at = @intCast(p);
+            // The value the entry read last: the node's now.
+            me.putValue(kv.value);
+            break :blk .{ .MapEntry = me };
+        },
+    };
+    cur.pos = p + 1;
+    cur.last_ret = @intCast(p);
+    cur.seen += 1;
+    cur.ended = st.pastHoles(p + 1) >= st.slots.items.len;
+    return v;
+}
+
+/// Whether an iterator over a set's own list reads it as a list does: no holes to pass
+/// over and no compaction since it last stood. True for any other iterator.
+fn setCursorPlain(cur: *const runtime.IterCursor) bool {
+    const st = cur.set.get() orelse return true;
+    const sd = &st.cell.data;
+    return @atomicLoad(u32, &sd.holes, .monotonic) == 0 and @atomicLoad(u32, &sd.epoch, .monotonic) == cur.set_epoch;
+}
+
+/// `iter_next`: a host iterator's element at its position, the position moved past it, as
+/// `builtin_members.iteratorMember` gives it; null, having done nothing, for any other
+/// receiver, a structural change since the iterator was made, an iterator at its end
+/// (the host function throws) and while `KLIO_ITER_TRACE` traces each step.
+fn iterNext(recv: Value) ?Value {
+    if (recv != .Iterator) return null;
+    if (runtime.envSetOnce("KLIO_ITER_TRACE")) return null;
+    const g = recv.Iterator.borrowMut();
+    defer g.deinit();
+    const cur = g.get();
+    if (cur.mod_count.get()) |mc| if (mc.cell.data.load() != cur.exp_mod) return null;
+    if (cur.map_kind != null) return mapCursorNext(cur);
+    if (!setCursorPlain(cur)) return null;
+    const v = itemAt(cur.items, cur.pos) orelse return null;
+    // A live map entry is stamped as it is yielded, so it reads until the next change.
+    if (v == .MapEntry) if (v.MapEntry.backing.get()) |entries| {
+        const eg = entries.borrow();
+        defer eg.deinit();
+        v.MapEntry.exp_mod = if (eg.get().mod_count.get()) |mc| mc.cell.data.load() else 0;
+    };
+    cur.last_ret = @intCast(cur.pos);
+    cur.pos += 1;
+    if (cur.set.isSome()) {
+        cur.seen += 1;
+        // A plain set's list holds no holes.
+        cur.ended = cur.pos >= itemsLen(cur.items);
+    }
+    return v;
+}
+
+fn itemsLen(items: runtime.ValueList) usize {
+    if (runtime.lockfreeReads()) if (items.lenMoving()) |n| return n;
+    const g = items.borrow();
+    defer g.deinit();
+    return g.get().items.len;
+}
+
+fn itemAt(items: runtime.ValueList, i: usize) ?Value {
+    if (runtime.lockfreeReads()) if (items.readAtMoving(i)) |v| return v;
+    const g = items.borrow();
+    defer g.deinit();
+    const xs = g.get().items;
+    return if (i < xs.len) xs[i] else null;
 }
 
 /// `list_add`: `v` appended to list `recv`, a structural change its iterators see, as the
@@ -274,12 +433,12 @@ pub fn mapPut(a: std.mem.Allocator, recv: Value, key: *const Value, value: *cons
     if (mc) |m| if (m.cell.data.frozen()) return null;
     const ba = runtime.gc.bufferAllocatorFor(&recv.Map.entries.cell.hdr, a);
     if (store.find(ba, key) catch return null) |i| {
-        const prev = store.pairs.items[i].value;
-        store.pairs.items[i].value = value.*;
+        const prev = store.slots.items[i].value;
+        store.slots.items[i].value = value.*;
         return prev;
     }
     // A map below the index's size keeps no hashes.
-    const small = store.pairs.items.len + 1 < runtime.MapStore.index_threshold;
+    const small = store.slots.items.len + 1 < runtime.MapStore.index_threshold;
     store.appendHashed(ba, .{ .key = key.*, .value = value.* }, if (small) null else runtime.MapStore.keyHash(key)) catch return null;
     if (mc) |m| m.cell.data.bump();
     return .Null;
@@ -289,10 +448,10 @@ pub fn mapPut(a: std.mem.Allocator, recv: Value, key: *const Value, value: *cons
 pub fn mapSize(recv: Value) ?Value {
     if (recv != .Map) return null;
     const entries = recv.Map.entries;
-    if (runtime.lockfreeReads()) return Value.newInt(@intCast(@atomicLoad(usize, &entries.cell.data.pairs.items.len, .monotonic)));
+    if (runtime.lockfreeReads()) if (runtime.mapLenNoLock(entries)) |n| return Value.newInt(@intCast(n));
     const g = entries.borrow();
     defer g.deinit();
-    return Value.newInt(@intCast(g.get().pairs.items.len));
+    return Value.newInt(@intCast(g.get().len()));
 }
 
 /// `sb_append`: builder `recv` with the string or the digits of the number `v` after it.
@@ -356,12 +515,12 @@ pub fn mapGet(a: std.mem.Allocator, module: *const ir.Module, recv: Value, key: 
         const g = recv.Map.entries.borrow();
         defer g.deinit();
         const store = g.get();
-        if (store.findIndexed(key)) |found| return if (found) |i| store.pairs.items[i].value else .Null;
+        if (store.findIndexed(key)) |found| return if (found) |i| store.slots.items[i].value else .Null;
     }
     const g = recv.Map.entries.borrowMut();
     defer g.deinit();
     const i = (g.get().find(a, key) catch return null) orelse return .Null;
-    return g.get().pairs.items[i].value;
+    return g.get().slots.items[i].value;
 }
 
 /// The value of instance `key` in a map whose every entry is in its index, when
@@ -388,14 +547,14 @@ fn identityGet(module: *const ir.Module, entries: runtime.MapEntries, key: *cons
     const g = entries.borrow();
     defer g.deinit();
     const store = g.get();
-    const n = store.pairs.items.len;
+    const n = store.slots.items.len;
     if (store.unhashable or n < runtime.MapStore.index_threshold or store.hashes.items.len != n or store.chain.items.len != n) return null;
     var slot = store.bucketHead(hash);
     while (slot != 0) : (slot = store.chain.items[slot - 1]) {
         if (store.hashes.items[slot - 1] != hash) continue;
-        const k = &store.pairs.items[slot - 1].key;
+        const k = &store.slots.items[slot - 1].key;
         if (k.* != .Instance) continue;
-        if (k.Instance.cell == key.Instance.cell) return store.pairs.items[slot - 1].value;
+        if (k.Instance.cell == key.Instance.cell) return store.slots.items[slot - 1].value;
         if (!identityKeyed(module, k)) return null;
     }
     return .Null;
@@ -454,13 +613,13 @@ test "a native's intrinsic survives its cache's encoding" {
 test "the interpreter's intrinsics answer as Kotlin's host functions" {
     const L: i64 = -0x0123_4567_89ab_cdef;
     const lu: u64 = @bitCast(L);
-    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, @truncate(lu ^ (lu >> 32))))), run(.long_hash, std.testing.allocator, undefined, &.{.{ .Long = L }}).?.Int);
-    try std.testing.expectEqual(@as(i32, 0x2), run(.rotate_left, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Int = 33 } }).?.Int);
-    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), run(.rotate_right, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Int = -31 } }).?.Int);
-    try std.testing.expectEqual(@as(i64, 1) << 63, run(.rotate_right, std.testing.allocator, undefined, &.{ .{ .Long = 1 }, .{ .Int = 1 } }).?.Long);
-    try std.testing.expectEqual(@as(i32, 64), run(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Long = -1 }}).?.Int);
-    try std.testing.expect(run(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Double = 1.0 }}) == null);
-    try std.testing.expect(run(.rotate_left, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Long = 1 } }) == null);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, @truncate(lu ^ (lu >> 32))))), answer(.long_hash, std.testing.allocator, undefined, &.{.{ .Long = L }}).?.Int);
+    try std.testing.expectEqual(@as(i32, 0x2), answer(.rotate_left, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Int = 33 } }).?.Int);
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), answer(.rotate_right, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Int = -31 } }).?.Int);
+    try std.testing.expectEqual(@as(i64, 1) << 63, answer(.rotate_right, std.testing.allocator, undefined, &.{ .{ .Long = 1 }, .{ .Int = 1 } }).?.Long);
+    try std.testing.expectEqual(@as(i32, 64), answer(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Long = -1 }}).?.Int);
+    try std.testing.expect(answer(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Double = 1.0 }}) == null);
+    try std.testing.expect(answer(.rotate_left, std.testing.allocator, undefined, &.{ .{ .Int = 1 }, .{ .Long = 1 } }) == null);
 }
 
 test "a builder's append of a string and a number is the intrinsic's, and of a range the host function's" {
@@ -470,12 +629,12 @@ test "a builder's append of a string and a number is the intrinsic's, and of a r
     const recv: Value = .{ .StringBuilder = sb };
     const text: Value = .{ .String = try runtime.strInit(a, "abcdef") };
     defer text.String.deinit();
-    try std.testing.expect(run(.sb_append, a, undefined, &.{ recv, text }) != null);
-    try std.testing.expect(run(.sb_append, a, undefined, &.{ recv, .{ .Int = -42 } }) != null);
+    try std.testing.expect(answer(.sb_append, a, undefined, &.{ recv, text }) != null);
+    try std.testing.expect(answer(.sb_append, a, undefined, &.{ recv, .{ .Int = -42 } }) != null);
     // `append(s, start, end)` appends part of `s`, which only the host function does.
-    try std.testing.expect(run(.sb_append, a, undefined, &.{ recv, text, .{ .Int = 1 }, .{ .Int = 3 } }) == null);
+    try std.testing.expect(answer(.sb_append, a, undefined, &.{ recv, text, .{ .Int = 1 }, .{ .Int = 3 } }) == null);
     try std.testing.expectEqualStrings("abcdef-42", sb.cell.data.items);
-    try std.testing.expectEqual(@as(i32, 9), run(.sb_length, a, undefined, &.{recv}).?.Int);
+    try std.testing.expectEqual(@as(i32, 9), answer(.sb_length, a, undefined, &.{recv}).?.Int);
 }
 
 test "a list's append is the intrinsic's for a plain mutable list, and the host function's otherwise" {
@@ -488,19 +647,19 @@ test "a list's append is the intrinsic's for a plain mutable list, and the host 
     };
     defer data.deinit(a);
     const recv: Value = .{ .List = &data };
-    try std.testing.expect(run(.list_add, a, undefined, &.{ recv, .{ .Int = 7 } }).?.Bool);
-    try std.testing.expect(run(.list_add, a, undefined, &.{ recv, .{ .Int = 8 } }).?.Bool);
+    try std.testing.expect(answer(.list_add, a, undefined, &.{ recv, .{ .Int = 7 } }).?.Bool);
+    try std.testing.expect(answer(.list_add, a, undefined, &.{ recv, .{ .Int = 8 } }).?.Bool);
     try std.testing.expectEqual(@as(usize, 2), data.items.cell.data.items.len);
     try std.testing.expectEqual(@as(i32, 8), data.items.cell.data.items[1].Int);
     // Each append is a structural change an iterator made before it sees.
     try std.testing.expectEqual(@as(u64, 2), data.mod_count.get().?.cell.data.load());
     // `add(index, element)` inserts, which only the host function does.
-    try std.testing.expect(run(.list_add, a, undefined, &.{ recv, .{ .Int = 0 }, .{ .Int = 9 } }) == null);
+    try std.testing.expect(answer(.list_add, a, undefined, &.{ recv, .{ .Int = 0 }, .{ .Int = 9 } }) == null);
     data.mod_count.get().?.cell.data.freeze();
-    try std.testing.expect(run(.list_add, a, undefined, &.{ recv, .{ .Int = 9 } }) == null);
+    try std.testing.expect(answer(.list_add, a, undefined, &.{ recv, .{ .Int = 9 } }) == null);
     _ = data.mod_count.get().?.cell.data.n.fetchAnd(~runtime.FROZEN_MOD_BIT, .monotonic);
     data.mutable = false;
-    try std.testing.expect(run(.list_add, a, undefined, &.{ recv, .{ .Int = 9 } }) == null);
+    try std.testing.expect(answer(.list_add, a, undefined, &.{ recv, .{ .Int = 9 } }) == null);
     try std.testing.expectEqual(@as(usize, 2), data.items.cell.data.items.len);
 }
 
@@ -513,22 +672,31 @@ test "a map's put, set and size are the intrinsics' for a key compared by its va
     const mod = &entries.cell.data.mod_count.get().?.cell.data;
     // Past the index's size, so the index is kept as the host keeps it.
     var i: i32 = 0;
-    while (i < 20) : (i += 1) try std.testing.expect(run(.map_put, a, undefined, &.{ recv, .{ .Int = i }, .{ .Int = i * 10 } }).? == .Null);
+    while (i < 20) : (i += 1) try std.testing.expect(answer(.map_put, a, undefined, &.{ recv, .{ .Int = i }, .{ .Int = i * 10 } }).? == .Null);
     try std.testing.expectEqual(@as(u64, 20), mod.load());
     // A replaced value is answered, and a replacement is no structural change.
-    try std.testing.expectEqual(@as(i32, 30), run(.map_put, a, undefined, &.{ recv, .{ .Int = 3 }, .{ .Int = 33 } }).?.Int);
-    try std.testing.expect(run(.map_set, a, undefined, &.{ recv, .{ .Int = 4 }, .{ .Int = 44 } }).? == .Unit);
+    try std.testing.expectEqual(@as(i32, 30), answer(.map_put, a, undefined, &.{ recv, .{ .Int = 3 }, .{ .Int = 33 } }).?.Int);
+    try std.testing.expect(answer(.map_set, a, undefined, &.{ recv, .{ .Int = 4 }, .{ .Int = 44 } }).? == .Unit);
     try std.testing.expectEqual(@as(u64, 20), mod.load());
-    try std.testing.expectEqual(@as(i32, 33), run(.map_get, a, undefined, &.{ recv, .{ .Int = 3 } }).?.Int);
-    try std.testing.expectEqual(@as(i32, 44), run(.map_get, a, undefined, &.{ recv, .{ .Int = 4 } }).?.Int);
-    try std.testing.expectEqual(@as(i32, 190), run(.map_get, a, undefined, &.{ recv, .{ .Int = 19 } }).?.Int);
-    try std.testing.expect(run(.map_get, a, undefined, &.{ recv, .{ .Long = 4 } }).? == .Null);
-    try std.testing.expectEqual(@as(i32, 20), run(.map_size, a, undefined, &.{recv}).?.Int);
+    try std.testing.expectEqual(@as(i32, 33), answer(.map_get, a, undefined, &.{ recv, .{ .Int = 3 } }).?.Int);
+    try std.testing.expectEqual(@as(i32, 44), answer(.map_get, a, undefined, &.{ recv, .{ .Int = 4 } }).?.Int);
+    try std.testing.expectEqual(@as(i32, 190), answer(.map_get, a, undefined, &.{ recv, .{ .Int = 19 } }).?.Int);
+    try std.testing.expect(answer(.map_get, a, undefined, &.{ recv, .{ .Long = 4 } }).? == .Null);
+    try std.testing.expectEqual(@as(i32, 20), answer(.map_size, a, undefined, &.{recv}).?.Int);
     // A frozen or read-only map throws from the host function.
     mod.freeze();
-    try std.testing.expect(run(.map_put, a, undefined, &.{ recv, .{ .Int = 99 }, .Null }) == null);
+    try std.testing.expect(answer(.map_put, a, undefined, &.{ recv, .{ .Int = 99 }, .Null }) == null);
     _ = mod.n.fetchAnd(~runtime.FROZEN_MOD_BIT, .monotonic);
     data.mutable = false;
-    try std.testing.expect(run(.map_set, a, undefined, &.{ recv, .{ .Int = 99 }, .Null }) == null);
-    try std.testing.expectEqual(@as(i32, 20), run(.map_size, a, undefined, &.{recv}).?.Int);
+    try std.testing.expect(answer(.map_set, a, undefined, &.{ recv, .{ .Int = 99 }, .Null }) == null);
+    try std.testing.expectEqual(@as(i32, 20), answer(.map_size, a, undefined, &.{recv}).?.Int);
+}
+
+test "run writes the answer through its pointer, and leaves it alone where the host function must run" {
+    var out: Value = .{ .Int = -7 };
+    try std.testing.expect(run(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Int = 7 }}, &out));
+    try std.testing.expectEqual(@as(i32, 3), out.Int);
+    out = .{ .Int = -7 };
+    try std.testing.expect(!run(.count_one_bits, std.testing.allocator, undefined, &.{.{ .Double = 1.0 }}, &out));
+    try std.testing.expectEqual(@as(i32, -7), out.Int);
 }

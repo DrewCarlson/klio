@@ -31,7 +31,6 @@ const makeListVL = common_mod.makeListVL;
 const makePair = common_mod.makePair;
 const makeSetH = common_mod.makeSetH;
 const makeStringOwned = common_mod.makeStringOwned;
-const mapViewAddGuard = common_mod.mapViewAddGuard;
 const ok = common_mod.ok;
 const okElem = common_mod.okElem;
 const readOnlyMutationGuard = common_mod.readOnlyMutationGuard;
@@ -48,7 +47,6 @@ const mutCollRemoveRetain = set_mod.mutCollRemoveRetain;
 
 const views_mod = @import("views.zig");
 const sublistComodGuard = views_mod.sublistComodGuard;
-const syncMapView = views_mod.syncMapView;
 const syncSublist = views_mod.syncSublist;
 
 pub fn coll_list_size(ctx: *CallCtx) Error!EvalResult {
@@ -98,11 +96,30 @@ pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
+    if (plainIndexOf(it, &needle)) |at| return ok(.{ .Bool = at != null });
     // Snapshot first: re-entering the VM for a user `equals` under the list
     // borrow is unsafe.
     const items = try snapshotItems(ctx.allocator, it);
     defer if (runtime.freeScratch()) ctx.allocator.free(items);
     return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
+}
+
+/// The position of `needle` in `items`, read in place under the list's read borrow, when no
+/// comparison on the way runs Kotlin code (`eqBoxedH` is `eqBoxed` for every element before
+/// the one found); null, having decided nothing, at an element that is an instance or a
+/// pair, triple or entry of them, or for an instance needle.
+fn plainIndexOf(items: runtime.ValueList, needle: *const Value) ??usize {
+    if (needle.* == .Instance) return null;
+    const g = items.borrow();
+    defer g.deinit();
+    for (g.get().items, 0..) |*v, i| {
+        switch (v.*) {
+            .Instance, .Pair, .Triple, .MapEntry => return null,
+            else => {},
+        }
+        if (common_mod.eqBoxed(v, needle)) return @as(?usize, i);
+    }
+    return @as(?usize, null);
 }
 pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.indexOf")) {
@@ -111,6 +128,7 @@ pub fn coll_list_index_of(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("indexOf requires an argument");
     const needle = ctx.args[1];
+    if (plainIndexOf(it, &needle)) |at| return ok(Value.newInt(if (at) |p| @intCast(p) else -1));
     const items = try snapshotItems(ctx.allocator, it);
     defer if (runtime.freeScratch()) ctx.allocator.free(items);
     const pos = try indexOfBoxedH(ctx.host, ctx.out, items, &needle);
@@ -397,12 +415,24 @@ pub fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     if (try sublistComodGuard(a, &ctx.args[0])) |e| return e;
     const recv = ctx.args[0];
     if (recv == .Map) {
-        const entries = try snapshotEntries(a, recv.Map.entries);
-        defer a.free(entries);
+        // As `AbstractMap.toString`: the entries where they stand, each key and value
+        // written by its own `toString`, which may run Kotlin code.
+        var walk = runtime.MapWalk.init(recv.Map.entries);
+        const mark = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(mark);
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
         try out.append(a, '{');
-        for (entries, 0..) |kv, i| {
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            var one = [1]runtime.MapPair{switch (walk.next()) {
+                .pair => |p| p,
+                .end => break,
+                .changed => return try thrown(a, "kotlin.ConcurrentModificationException", null),
+            }};
+            runtime.keepaliveRestore(mark);
+            runtime.keepalivePushPairs(&one);
+            const kv = one[0];
             if (i > 0) try out.appendSlice(a, ", ");
             const kp = if (Value.referenceEq(&kv.key, &recv)) try a.dupe(u8, "(this Map)") else try elemPiece(ctx, kv.key);
             defer if (runtime.freeScratch()) a.free(kp);
@@ -417,7 +447,7 @@ pub fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
     }
     const items: ?[]Value = switch (recv) {
         .List => |l| try snapshotItems(a, l.items),
-        .Set => |s| try snapshotItems(a, s.items),
+        .Set => |s| try snapshotItems(a, s.dense()),
         else => null,
     };
     if (items) |elems| {
@@ -453,7 +483,6 @@ pub fn coll_list_to_string(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (try readOnlyMutationGuard(a, ctx.args)) |e| return e;
-    if (try mapViewAddGuard(a, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     const _szb = listLenOf(&ctx.args[0]);
@@ -582,7 +611,6 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
         if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
-    syncMapView(a, ctx.args[0]);
     return ok(Value.Unit);
 }
 pub fn coll_array_list_capacity_noop(ctx: *CallCtx) Error!EvalResult {
@@ -605,7 +633,7 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
     for (src) |v| {
         switch (v) {
             .List => |l| try appendVL(&out, a, l.items),
-            .Set => |s| try appendVL(&out, a, s.items),
+            .Set => |s| try appendVL(&out, a, s.dense()),
             else => {
                 const inner = switch (try iterableItemsCtx(ctx, v, "flatten")) {
                     .items => |x| x,
@@ -643,8 +671,11 @@ pub fn coll_list_contains_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    const other = (try collectColl(a, if (ctx.args.len > 1) ctx.args[1] else null)) orelse
-        return typeErr("containsAll requires a collection");
+    if (ctx.args.len < 2) return arityErr("containsAll requires a collection");
+    const other = switch (try iterableItemsCtx(ctx, ctx.args[1], "List.containsAll")) {
+        .items => |x| x,
+        .err => |e| return e,
+    };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
     for (other) |o| {
@@ -677,7 +708,7 @@ pub fn coll_list_to_set(ctx: *CallCtx) Error!EvalResult {
     };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
-    return ok(try makeSetH(ctx.host, ctx.out, a, items, false));
+    return try makeSetH(ctx.host, ctx.out, a, items, false);
 }
 pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -689,7 +720,7 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     defer if (runtime.freeScratch()) a.free(items);
     // `distinct()` is `toMutableSet().toList()`, so it dedups by `equals`, not
     // structurally.
-    return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
+    return try makeSetH(ctx.host, ctx.out, a, items, true);
 }
 
 /// Each of `items` with its index, as the `IndexedValue`s `withIndex` yields,
@@ -730,7 +761,6 @@ pub fn coll_array_with_index(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
-    if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
     // `addAll` bumps the counter even for an empty argument, as JVM
@@ -750,7 +780,7 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     var to_add: []Value = undefined;
     switch (arg) {
         .List => |l| to_add = try snapshotItems(a, l.items),
-        .Set => |s| to_add = try snapshotItems(a, s.items),
+        .Set => |s| to_add = try snapshotItems(a, s.dense()),
         .Array => |arr| to_add = try arr.snapshot(a),
         else => to_add = switch (try iterableItemsCtx(ctx, arg, "addAll")) {
             .items => |x| x,
@@ -795,7 +825,6 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
             removed = true;
         }
     }
-    if (removed) syncMapView(a, ctx.args[0]);
     return ok(.{ .Bool = removed });
 }
 
@@ -810,7 +839,7 @@ pub fn coll_mut_list_remove_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return mutCollRemoveRetain(ctx, it, ctx.args[0], "removeAll", false, false);
+    return mutCollRemoveRetain(ctx, it, "removeAll", false, false);
 }
 pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
@@ -823,7 +852,7 @@ pub fn coll_mut_list_retain_all(ctx: *CallCtx) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    return mutCollRemoveRetain(ctx, it, ctx.args[0], "retainAll", true, false);
+    return mutCollRemoveRetain(ctx, it, "retainAll", true, false);
 }
 
 pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {

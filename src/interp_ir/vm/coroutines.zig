@@ -25,13 +25,16 @@ fn monotonicNanos() i128 {
 
 /// Event-wait one idle slice on the pump's gate, capped at `cap_us`. The epoch is
 /// read before the emptiness checks, so a post between the two returns at once.
-fn gateWaitBrief(wakeup: *const ObjRef(DriverWakeup), cap_us: u64) void {
+/// Waits on the pump's gate for a post, at most `cap_us`. `rings_seen`, `runtime.parkedRings()`
+/// read before the caller checked for what `ringParkedGates` announces, ends the wait at once
+/// when a ring came after that check.
+fn gateWaitBrief(wakeup: *const ObjRef(DriverWakeup), cap_us: u64, rings_seen: ?u64) void {
     const w = wakeup.borrowMut();
     const gp = &w.get().gate;
     const seen = gp.epochNow();
     const nonempty = w.get().mailboxNonEmpty() or queuedElsewhere();
     w.deinit();
-    if (!nonempty) gp.waitFrom(seen, cap_us);
+    if (!nonempty) gp.waitAfter(seen, rings_seen, cap_us);
 }
 
 /// Whether the top pump has work waiting outside its mailbox, in a queue it
@@ -1759,6 +1762,7 @@ pub const CooperativeInterceptor = struct {
 
 const vmhost = @import("vmhost.zig");
 const intrinsic_host = @import("intrinsic_host.zig");
+const host_call_func = @import("host_call_func.zig");
 const Output = runtime.Output;
 const RuntimeError = runtime.RuntimeError;
 const RuntimeEvalResult = runtime.EvalResult;
@@ -2038,39 +2042,45 @@ const InstanceData = runtime.InstanceData;
 
 const PendingKind = enum { value, yield_all, none };
 
-/// Read-and-clears the single-value flag.
-fn classifySuspension(scope: *const Value) struct { kind: PendingKind, value: Value } {
-    if (scope.* != .Instance) return .{ .kind = .none, .value = .Unit };
-    const g = scope.Instance.borrowMut();
-    defer g.deinit();
-    const inst = g.get();
-    if (inst.get(seq_has_value_field)) |has| {
+/// Where a builder scope's fields are, found once for its class: every element reads them.
+var has_value_slot: runtime.InstanceData.SlotCache = .init(0);
+var value_slot: runtime.InstanceData.SlotCache = .init(0);
+var yield_iter_slot: runtime.InstanceData.SlotCache = .init(0);
+
+/// What the builder suspended on, its value written to `out`: a `yield`'s value (the
+/// single-value flag read and cleared) or a `yieldAll`'s iterator. The scope's slots are read
+/// and stored with no cell lock, as slot access takes none (`InstanceData.storeSlot`).
+fn classifySuspension(scope: *const Value, out: *Value) PendingKind {
+    if (scope.* != .Instance) return .none;
+    const inst = &scope.Instance.cell.data;
+    if (inst.slotIndexCached(&has_value_slot, seq_has_value_field)) |hi| {
+        const has = inst.loadSlot(hi) orelse Value.Unit;
         if (has == .Bool and has.Bool) {
-            const v = inst.get(seq_value_field) orelse Value.Unit;
-            _ = inst.set(seq_has_value_field, .{ .Bool = false });
-            return .{ .kind = .value, .value = v };
+            out.* = inst.getCached(&value_slot, seq_value_field) orelse Value.Unit;
+            _ = inst.storeSlot(hi, .{ .Bool = false });
+            return .value;
         }
     }
-    if (inst.get(seq_yield_iter_field)) |it| {
-        if (it != .Null) return .{ .kind = .yield_all, .value = it };
+    if (inst.getCached(&yield_iter_slot, seq_yield_iter_field)) |it| {
+        if (it != .Null) {
+            out.* = it;
+            return .yield_all;
+        }
     }
-    return .{ .kind = .none, .value = .Unit };
+    return .none;
 }
 
 fn pendingYieldIter(scope: *const Value) ?Value {
     if (scope.* != .Instance) return null;
-    const g = scope.Instance.borrow();
-    defer g.deinit();
-    const it = g.get().get(seq_yield_iter_field) orelse return null;
+    const it = scope.Instance.cell.data.getCached(&yield_iter_slot, seq_yield_iter_field) orelse return null;
     if (it == .Null) return null;
     return it;
 }
 
 fn clearYieldIter(scope: *const Value) void {
     if (scope.* != .Instance) return;
-    const g = scope.Instance.borrowMut();
-    defer g.deinit();
-    _ = g.get().set(seq_yield_iter_field, .Null);
+    const inst = &scope.Instance.cell.data;
+    if (inst.slotIndexCached(&yield_iter_slot, seq_yield_iter_field)) |i| _ = inst.storeSlot(i, .Null);
 }
 
 /// `.done` when the iterator is exhausted, where the caller clears it and
@@ -2160,9 +2170,14 @@ pub fn builderStep(self: anytype, state: runtime.BuilderStateRef, out: Output) A
                 return .done;
             };
             ir.eval.resume_route = "yield-rotate";
-            r = try self.resumeRaw(old, .Unit, out);
-            // `resumeContinuation` freed `old.frames`; free the box itself.
-            a.destroy(old);
+            if (try intrinsic_host.resumeSingleRaw(self, old, .Unit, out, &r)) {
+                // The producer ran on from its live frame; `old` serves its next suspension.
+                host_call_func.recycleSuspendState(a, old);
+            } else {
+                r = try self.resumeRaw(old, .Unit, out);
+                // `resumeContinuation` freed `old.frames`; free the box itself.
+                a.destroy(old);
+            }
         }
 
         switch (r) {
@@ -2179,9 +2194,9 @@ pub fn builderStep(self: anytype, state: runtime.BuilderStateRef, out: Output) A
                         g.get().cont = @ptrCast(new_state);
                         g.deinit();
                     }
-                    const cls = classifySuspension(&scope);
-                    switch (cls.kind) {
-                        .value => return .{ .value = cls.value },
+                    var yielded: Value = .Unit;
+                    switch (classifySuspension(&scope, &yielded)) {
+                        .value => return .{ .value = yielded },
                         .yield_all => {
                             const it = pendingYieldIter(&scope) orelse continue;
                             switch (try drainOne(self, &it, out)) {
@@ -2664,7 +2679,7 @@ fn pumpLoop(
             // on this thread holds parked; that pump cannot answer while this
             // one runs above it.
             try serveOwnSurrenders();
-            gateWaitBrief(&wakeup, idleSliceUs(1_000));
+            gateWaitBrief(&wakeup, idleSliceUs(1_000), null);
             _ = try drainWakeupInto(a, &wakeup, coroTop().?);
             continue;
         }
@@ -2703,7 +2718,9 @@ fn pumpLoop(
                 }
             }
             // A dispatched task that died with an internal error never completes its
-            // coroutine, so no resume arrives and the run would idle here forever.
+            // coroutine, so no resume arrives and the run would idle here forever. Its
+            // ring may come between this check and the wait: the wait sees it then.
+            const rings_seen = runtime.parkedRings();
             if (vmhost.scheduler.takeFirstError()) |pool_err| {
                 try pumpExit(self, out, persist);
                 return .{ .err = pool_err };
@@ -2730,7 +2747,7 @@ fn pumpLoop(
             // outer pump on this thread holds parked, as an unconfined
             // dispatcher's resume from there runs there.
             try serveOwnSurrenders();
-            gateWaitBrief(&wakeup, idleSliceUs(1_000));
+            gateWaitBrief(&wakeup, idleSliceUs(1_000), rings_seen);
             continue;
         }
 

@@ -139,6 +139,7 @@ fn listIterator(h: *anyopaque, a: Allocator, args: []const Value) Allocator.Erro
     return .{ .ok = try Value.newIterator(a, .{
         .items = l.items.clone(),
         .prim = null,
+        .source = .list,
         .mod_count = .from(cap.mod_count),
         .mutable = l.mutable and l.backing == null and !coll.modCountFrozen(l.mod_count),
         .pos = @intCast(idx),
@@ -639,6 +640,12 @@ const iterator_members = [_]Entry{
     .{ "kotlin.collections.Iterator.hasNext", iterHasNext, null },
     .{ "kotlin.collections.Iterator.next", iterNext, null },
     .{ "kotlin.collections.MutableIterator.remove", iterMember("remove"), null },
+    // The list iterators' own declarations of the members they override.
+    .{ "kotlin.collections.ListIterator.hasNext", iterHasNext, null },
+    .{ "kotlin.collections.ListIterator.next", iterNext, null },
+    .{ "kotlin.collections.MutableListIterator.hasNext", iterHasNext, null },
+    .{ "kotlin.collections.MutableListIterator.next", iterNext, null },
+    .{ "kotlin.collections.MutableListIterator.remove", iterMember("remove"), null },
     .{ "kotlin.collections.ListIterator.hasPrevious", iterMember("hasPrevious"), null },
     .{ "kotlin.collections.ListIterator.previous", iterMember("previous"), null },
     .{ "kotlin.collections.ListIterator.nextIndex", iterMember("nextIndex"), null },

@@ -8,6 +8,7 @@ const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
 const testing = std.testing;
 
 const array_mod = @import("array.zig");
+const EvalResult = runtime.EvalResult;
 const array_content_equals = array_mod.array_content_equals;
 
 const builders_mod = @import("builders.zig");
@@ -32,7 +33,6 @@ const coll_mut_list_add = list_mod.coll_mut_list_add;
 
 const list_transforms_mod = @import("list_transforms.zig");
 const coll_list_reversed = list_transforms_mod.coll_list_reversed;
-const coll_list_sorted = list_transforms_mod.coll_list_sorted;
 const coll_list_sum = list_transforms_mod.coll_list_sum;
 
 const map_mod = @import("map.zig");
@@ -94,7 +94,7 @@ test "setOf dedupes structurally" {
     var c = h.ctx(&args);
     const r = try coll_set_of(&c);
     try testing.expect(r == .ok and r.ok == .Set);
-    try testing.expectEqual(@as(usize, 2), listLen(r.ok.Set.items));
+    try testing.expectEqual(@as(usize, 2), r.ok.Set.len());
 }
 
 test "list get out of bounds throws IndexOutOfBoundsException" {
@@ -107,6 +107,33 @@ test "list get out of bounds throws IndexOutOfBoundsException" {
     const r = try coll_list_get(&c);
     try testing.expect(r == .err and r.err == .Thrown);
     try testing.expect(r.err.Thrown == .Exception);
+}
+
+fn thrownText(r: EvalResult) ![2][]const u8 {
+    try testing.expect(r == .err and r.err == .Thrown and r.err.Thrown == .Exception);
+    const e = r.err.Thrown.Exception;
+    const msg = e.message.get() orelse return error.TestUnexpectedResult;
+    return .{ e.fqn.asPtrConst().bytes, msg.asPtrConst().bytes };
+}
+
+test "copyInto out of range throws as System.arraycopy does, naming the array's type" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const objs = try makeArray(a, &.{ Value.newInt(1), Value.newInt(2), Value.newInt(3) }, null);
+    const packed_ints = try runtime.ArrayData.initPacked(a, .Int, &.{ Value.newInt(1), Value.newInt(2) });
+    const cases = [_]struct { args: []const Value, want: []const u8 }{
+        .{ .args = &.{ objs, objs, Value.newInt(2), Value.newInt(0), Value.newInt(2) }, .want = "arraycopy: last destination index 4 out of bounds for object array[3]" },
+        .{ .args = &.{ objs, objs, Value.newInt(0), Value.newInt(2), Value.newInt(1) }, .want = "arraycopy: length -1 is negative" },
+        .{ .args = &.{ packed_ints, packed_ints, Value.newInt(0), Value.newInt(-1), Value.newInt(1) }, .want = "arraycopy: source index -1 out of bounds for int[2]" },
+        .{ .args = &.{ packed_ints, packed_ints, Value.newInt(0), Value.newInt(0), Value.newInt(3) }, .want = "arraycopy: last source index 3 out of bounds for int[2]" },
+    };
+    for (cases) |cs| {
+        var c = h.ctx(cs.args);
+        const got = try thrownText(try array_mod.array_copy_into(&c));
+        try testing.expectEqualStrings("klio.ArrayIndexOutOfBoundsException", got[0]);
+        try testing.expectEqualStrings(cs.want, got[1]);
+    }
 }
 
 test "list get returns the element" {
@@ -139,20 +166,31 @@ test "mapOf builds entries and get finds the value" {
     }
 }
 
-test "list sorted orders ascending" {
+fn intsOf(arr: Value) ![6]i32 {
+    var out: [6]i32 = undefined;
+    for (&out, 0..) |*o, i| o.* = arr.Array.get(i).Int;
+    return out;
+}
+
+test "a host sort of a range answers true for the natural order or its reverse over one kind of value, false otherwise" {
     var h = TestHarness.init();
     defer h.deinit();
     const a = h.arena.allocator();
-    const list = try makeList(a, &.{ Value.newInt(3), Value.newInt(1), Value.newInt(2) }, false);
-    const args = [_]Value{list};
-    var c = h.ctx(&args);
-    const r = try coll_list_sorted(&c);
-    try testing.expect(r == .ok and r.ok == .List);
-    const g = r.ok.List.items.borrow();
-    defer g.deinit();
-    try testing.expectEqual(@as(i32, 1), g.get().items[0].Int);
-    try testing.expectEqual(@as(i32, 2), g.get().items[1].Int);
-    try testing.expectEqual(@as(i32, 3), g.get().items[2].Int);
+    const xs = [_]Value{ Value.newInt(9), Value.newInt(3), Value.newInt(1), Value.newInt(2), Value.newInt(8), Value.newInt(0) };
+    const arr = try makeArray(a, &xs, null);
+    var c = h.ctx(&.{ arr, Value.newInt(1), Value.newInt(5), .Null });
+    const r = try array_mod.array_sort_natively(&c);
+    try testing.expect(r == .ok and r.ok.Bool);
+    try testing.expectEqual([6]i32{ 9, 1, 2, 3, 8, 0 }, try intsOf(arr));
+    // A comparator the host does not know, and elements of two kinds, are the Kotlin sort's.
+    var other = h.ctx(&.{ arr, Value.newInt(0), Value.newInt(6), Value.newInt(1) });
+    const r2 = try array_mod.array_sort_natively(&other);
+    try testing.expect(r2 == .ok and !r2.ok.Bool);
+    const mixed = try makeArray(a, &.{ Value.newInt(2), .{ .Long = 1 }, Value.newInt(0), Value.newInt(5), Value.newInt(4), Value.newInt(3) }, null);
+    var m = h.ctx(&.{ mixed, Value.newInt(0), Value.newInt(6), .Null });
+    const r3 = try array_mod.array_sort_natively(&m);
+    try testing.expect(r3 == .ok and !r3.ok.Bool);
+    try testing.expectEqual(@as(i64, 1), mixed.Array.get(1).Long);
 }
 
 test "list reversed reverses" {
@@ -389,4 +427,243 @@ test "a map over instance keys that hash by identity puts, finds and removes the
         try testing.expectEqual(@as(usize, 30), mapLen(map.Map.entries));
         if (identity) try testing.expectEqual(@as(u32, 0), counting.calls) else try testing.expect(counting.calls > 0);
     }
+}
+
+const set_mod = @import("set.zig");
+
+fn setOfInts(h: *TestHarness, n: usize) !Value {
+    const a = h.arena.allocator();
+    const args = try a.alloc(Value, n);
+    for (args, 0..) |*v, i| v.* = Value.newInt(@intCast(i * 3));
+    var c = h.ctx(args);
+    const r = try builders_mod.coll_mutable_set_of(&c);
+    try testing.expect(r == .ok and r.ok == .Set);
+    return r.ok;
+}
+
+fn setCall(h: *TestHarness, f: anytype, set: Value, arg: Value) !Value {
+    var c = h.ctx(&.{ set, arg });
+    const r = try f(&c);
+    try testing.expect(r == .ok);
+    return r.ok;
+}
+
+fn indexLen(set: Value) ?usize {
+    const ix = set.Set.index orelse return null;
+    const seq = set.Set.elems.cell.lock.seq.load(.monotonic);
+    if (ix.cell.data.seq != seq) return null;
+    return ix.cell.data.len();
+}
+
+test "a set past a few elements keeps a hash index, which add, contains and remove keep in step" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const small = try setOfInts(&h, 4);
+    try testing.expect(small.Set.index == null);
+    const s = try setOfInts(&h, 100);
+    try testing.expectEqual(@as(?usize, 100), indexLen(s));
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(297))).Bool);
+    try testing.expect(!(try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(298))).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_add, s, Value.newInt(298))).Bool);
+    try testing.expect(!(try setCall(&h, set_mod.coll_mut_set_add, s, Value.newInt(3))).Bool);
+    try testing.expectEqual(@as(?usize, 101), indexLen(s));
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(0))).Bool);
+    try testing.expect(!(try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(0))).Bool);
+    // The first element out leaves a hole at its position.
+    try testing.expectEqual(@as(?usize, 101), indexLen(s));
+    try testing.expectEqual(@as(u32, 1), s.Set.holes);
+    try testing.expectEqual(@as(usize, 100), s.Set.len());
+    // Every element is still found where it now stands.
+    for (1..100) |i| try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(@intCast(i * 3)))).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(298))).Bool);
+}
+
+fn setInts(h: *TestHarness, set: Value) ![]i32 {
+    var c = h.ctx(&.{set});
+    const r = try set_mod.coll_set_to_list(&c);
+    try testing.expect(r == .ok and r.ok == .List);
+    const g = r.ok.List.items.borrow();
+    defer g.deinit();
+    const out = try h.arena.allocator().alloc(i32, g.get().items.len);
+    for (g.get().items, out) |v, *o| o.* = if (v == .Int) v.Int else -1;
+    return out;
+}
+
+test "a set's removal leaves a hole that lookups, its size and its elements in order pass over" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const s = try setOfInts(&h, 20);
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(3))).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(6))).Bool);
+    try testing.expectEqual(@as(u32, 2), s.Set.holes);
+    try testing.expectEqual(@as(usize, 18), s.Set.len());
+    try testing.expect(!(try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(3))).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(9))).Bool);
+    // `Unit`, which a hole holds, is no element until it is added, and then the one added.
+    try testing.expect(!(try setCall(&h, set_mod.coll_set_contains, s, .Unit)).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_add, s, .Unit)).Bool);
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, .Unit)).Bool);
+    try testing.expectEqual(@as(usize, 19), s.Set.len());
+    // The last element out takes no hole.
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_remove, s, .Unit)).Bool);
+    try testing.expectEqual(@as(u32, 2), s.Set.holes);
+    // A removed element added again goes last, as in a `LinkedHashSet`.
+    try testing.expect((try setCall(&h, set_mod.coll_mut_set_add, s, Value.newInt(3))).Bool);
+    const xs = try setInts(&h, s);
+    try testing.expectEqual(@as(u32, 0), s.Set.holes);
+    try testing.expectEqualSlices(i32, &.{ 0, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57, 3 }, xs);
+    for (0..19) |i| try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(xs[i]))).Bool);
+}
+
+test "a set's last element out takes the holes before it, and holes as many as the elements close up" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const s = try setOfInts(&h, 20);
+    _ = try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(51));
+    _ = try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(54));
+    try testing.expectEqual(@as(u32, 2), s.Set.holes);
+    _ = try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(57));
+    try testing.expectEqual(@as(u32, 0), s.Set.holes);
+    try testing.expectEqual(@as(?usize, 17), indexLen(s));
+    // Seventeen elements: the ninth hole is as many as the eight left.
+    for (0..8) |i| _ = try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(@intCast(i * 3)));
+    try testing.expectEqual(@as(u32, 8), s.Set.holes);
+    _ = try setCall(&h, set_mod.coll_mut_set_remove, s, Value.newInt(24));
+    try testing.expectEqual(@as(u32, 0), s.Set.holes);
+    try testing.expectEqual(@as(?usize, 8), indexLen(s));
+    try testing.expectEqualSlices(i32, &.{ 27, 30, 33, 36, 39, 42, 45, 48 }, try setInts(&h, s));
+    for ([_]i32{ 27, 48 }) |x| try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(x))).Bool);
+    try testing.expect(!(try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(24))).Bool);
+}
+
+test "a set whose list changed another way builds its index again before a lookup" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const s = try setOfInts(&h, 20);
+    {
+        const g = s.Set.dense().borrowMut();
+        defer g.deinit();
+        g.get().items[5] = Value.newInt(1000);
+    }
+    try testing.expectEqual(@as(?usize, null), indexLen(s));
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(1000))).Bool);
+    try testing.expect(!(try setCall(&h, set_mod.coll_set_contains, s, Value.newInt(15))).Bool);
+    try testing.expectEqual(@as(?usize, 20), indexLen(s));
+}
+
+test "a set finds pairs by value, and the builders keep the first of equal elements and the last value of equal keys" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    var elems: [40]Value = undefined;
+    for (&elems, 0..) |*v, i| v.* = try makePair(a, Value.newInt(@intCast(i % 20)), Value.newInt(7));
+    var c = h.ctx(&elems);
+    const r = try coll_set_of(&c);
+    try testing.expect(r == .ok and r.ok == .Set);
+    try testing.expectEqual(@as(usize, 20), r.ok.Set.len());
+    const probe = try makePair(a, Value.newInt(13), Value.newInt(7));
+    try testing.expect((try setCall(&h, set_mod.coll_set_contains, r.ok, probe)).Bool);
+    var pairs: [30]Value = undefined;
+    for (&pairs, 0..) |*v, i| v.* = try makePair(a, Value.newInt(@intCast(i % 10)), Value.newInt(@intCast(i)));
+    var mc = h.ctx(&pairs);
+    const m = try coll_map_of(&mc);
+    try testing.expect(m == .ok and m.ok == .Map);
+    try testing.expectEqual(@as(usize, 10), mapLen(m.ok.Map.entries));
+    var gc = h.ctx(&.{ m.ok, Value.newInt(4) });
+    const got = try coll_map_get(&gc);
+    try testing.expectEqual(@as(i32, 24), got.ok.Int);
+}
+
+fn mapOfInts(h: *TestHarness, n: usize) !Value {
+    const map = try common_mod.makeMapH(h.noop.host(), h.sink.output(), h.arena.allocator(), &.{}, true);
+    for (0..n) |i| _ = try setCall2(h, map_mod.coll_mut_map_put, map, Value.newInt(@intCast(i)), Value.newInt(@intCast(i * 10)));
+    return map;
+}
+
+fn setCall2(h: *TestHarness, f: anytype, recv: Value, x: Value, y: Value) !Value {
+    var c = h.ctx(&.{ recv, x, y });
+    const r = try f(&c);
+    try testing.expect(r == .ok);
+    return r.ok;
+}
+
+fn viewOf(h: *TestHarness, f: anytype, map: Value) !Value {
+    var c = h.ctx(&.{map});
+    const r = try f(&c);
+    try testing.expect(r == .ok);
+    return r.ok;
+}
+
+fn ints(h: *TestHarness, v: Value) ![]i32 {
+    var c = h.ctx(&.{v});
+    const items = switch (try common_mod.iterableItemsCtx(&c, v, "test")) {
+        .items => |xs| xs,
+        .err => return error.TestUnexpectedResult,
+    };
+    const out = try h.arena.allocator().alloc(i32, items.len);
+    for (items, out) |x, *o| o.* = x.Int;
+    return out;
+}
+
+fn mapKeys(h: *TestHarness, map: Value) ![]i32 {
+    const g = map.Map.entries.borrow();
+    defer g.deinit();
+    var out: std.ArrayList(i32) = .empty;
+    var it = g.get().live();
+    while (it.next()) |kv| try out.append(h.arena.allocator(), kv.key.Int);
+    return out.items;
+}
+
+test "pairs and maps put into a map go through its lookup, and a new map from one is one copy of it" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const a = h.arena.allocator();
+    const dest = try mapOfInts(&h, 20);
+    const before = dest.Map.entries.cell.data.mod_count.get().?.cell.data.load();
+    // `toMap(destination)` over pairs: a key the map holds keeps its place, a new one goes last.
+    const pairs = [_]Value{ try makePair(a, Value.newInt(3), Value.newInt(-3)), try makePair(a, Value.newInt(40), Value.newInt(400)), try makePair(a, Value.newInt(3), Value.newInt(-4)) };
+    const list = try common_mod.makeList(a, &pairs, false);
+    var c = h.ctx(&.{ list, dest });
+    try testing.expect((try list_transforms_mod.coll_list_to_map(&c)) == .ok);
+    try testing.expectEqual(@as(usize, 21), mapLen(dest.Map.entries));
+    try testing.expectEqual(@as(i32, 40), (try mapKeys(&h, dest))[20]);
+    try testing.expectEqual(@as(i32, -4), (try setCall(&h, map_mod.coll_map_get, dest, Value.newInt(3))).Int);
+    try testing.expect(dest.Map.entries.cell.data.mod_count.get().?.cell.data.load() != before);
+    // `plus` and `minus` leave the map as it was and answer a map of their own.
+    const plus = try setCall(&h, map_mod.coll_map_plus, dest, try makePair(a, Value.newInt(0), Value.newInt(99)));
+    try testing.expect(plus.Map.entries.cell != dest.Map.entries.cell);
+    try testing.expectEqual(@as(i32, 99), (try setCall(&h, map_mod.coll_map_get, plus, Value.newInt(0))).Int);
+    try testing.expectEqual(@as(i32, 0), (try setCall(&h, map_mod.coll_map_get, dest, Value.newInt(0))).Int);
+    const minus = try setCall(&h, map_mod.coll_map_minus, dest, Value.newInt(3));
+    try testing.expectEqual(@as(usize, 20), mapLen(minus.Map.entries));
+    try testing.expectEqual(@as(usize, 21), mapLen(dest.Map.entries));
+    // `putAll` of a map into itself changes nothing.
+    _ = try setCall(&h, map_mod.coll_mut_map_put_all, dest, dest);
+    try testing.expectEqual(@as(usize, 21), mapLen(dest.Map.entries));
+    try testing.expectEqualSlices(i32, try mapKeys(&h, dest), try mapKeys(&h, try setCall(&h, map_mod.coll_map_to_mutable_map, dest, .Null)));
+}
+
+test "a map's keys remove a key whatever its value, answering whether the map held it" {
+    var h = TestHarness.init();
+    defer h.deinit();
+    const map = try mapOfInts(&h, 3);
+    _ = try setCall2(&h, map_mod.coll_mut_map_put, map, Value.newInt(7), .Null);
+    try testing.expect((try setCall(&h, map_mod.map_remove_key, map, Value.newInt(7))).Bool);
+    try testing.expect(!(try setCall(&h, map_mod.map_remove_key, map, Value.newInt(7))).Bool);
+    try testing.expect((try setCall(&h, map_mod.map_remove_key, map, Value.newInt(1))).Bool);
+    {
+        const g = map.Map.entries.borrow();
+        defer g.deinit();
+        var it = g.get().live();
+        try testing.expectEqual(@as(i32, 0), it.next().?.key.Int);
+        try testing.expectEqual(@as(i32, 2), it.next().?.key.Int);
+        try testing.expect(it.next() == null);
+    }
+    try testing.expect((try setCall(&h, map_mod.map_view_iterator, map, Value.newInt(1))) == .Iterator);
+    // A read-only map refuses, and the iterator takes only the three kinds.
+    map.Map.mutable = false;
+    var c = h.ctx(&.{ map, Value.newInt(0) });
+    try testing.expect((try map_mod.map_remove_key(&c)) == .err);
+    c = h.ctx(&.{ map, Value.newInt(3) });
+    try testing.expect((try map_mod.map_view_iterator(&c)) == .err);
 }

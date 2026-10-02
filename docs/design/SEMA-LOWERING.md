@@ -252,6 +252,7 @@ positions in the callee's declared order.
 | `NotNullAssert`, `LateinitCheck` | dst, src (+message name) | `!!`; `lateinit` reads |
 | `BinOp`, `UnOp`, `Not` | primitive operands only | operator calls whose callee binds to a primitive operation |
 | `ArrayGet`, `ArraySet` | registers | `get`/`set` bound to an array or string element intrinsic |
+| `IterOpen`, `IterHas`, `IterGet` | dst, src (+idx, stamp) | a `for` over a list, set, array or string the host holds, by position (`runtime.forloop`); the loop calls `iterator()`, `hasNext()` and `next()` for any other value |
 | `NewArray` | dst, class, args, n_args | vararg packing, `arrayOf` |
 | `Trace` | span | debugging |
 

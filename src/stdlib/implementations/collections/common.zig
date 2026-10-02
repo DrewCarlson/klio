@@ -20,6 +20,7 @@ const RangeKind = runtime.RangeKind;
 const ObjRef = runtime.ObjRef;
 const InstanceData = runtime.InstanceData;
 const IntrinsicHost = runtime.IntrinsicHost;
+const hashing = @import("hashing.zig");
 const Output = runtime.Output;
 const Allocator = std.mem.Allocator;
 const Error = std.mem.Allocator.Error;
@@ -72,7 +73,7 @@ pub fn modCountFor(a: Allocator, mutable: bool) Error!runtime.OptRef(runtime.Mod
 pub fn listLenOf(v: *const Value) usize {
     return switch (v.*) {
         .List => |l| listLen(l.items),
-        .Set => |s| listLen(s.items),
+        .Set => |s| s.len(),
         else => 0,
     };
 }
@@ -100,7 +101,7 @@ pub fn structuralBump(v: *const Value, before: usize) void {
 pub fn mapEntriesLen(entries: MapEntries) usize {
     const g = entries.borrow();
     defer g.deinit();
-    return g.get().pairs.items.len;
+    return g.get().len();
 }
 
 /// Bumps the map's `mod_count` only when the entry count changed, so
@@ -109,7 +110,7 @@ pub fn mapEntriesLen(entries: MapEntries) usize {
 pub fn mapStructuralBump(entries: MapEntries, before: usize) void {
     const g = entries.borrowMut();
     defer g.deinit();
-    if (g.get().pairs.items.len == before) return;
+    if (g.get().len() == before) return;
     if (g.get().mod_count.get()) |mc| mc.cell.data.bump();
 }
 
@@ -186,20 +187,9 @@ pub fn appendArrItems(dst: *std.ArrayList(Value), a: Allocator, arr: runtime.Arr
 
 /// Build a `Set`, deduping by boxed structural equality.
 pub fn makeSet(a: Allocator, items: []const Value, mutable: bool) Error!Value {
-    var deduped: std.ArrayList(Value) = .empty;
-    for (items) |v| {
-        if (!containsBoxed(deduped.items, &v)) {
-            // Borrowed input element; the set owns one ref per kept element.
-            if (runtime.reclaimEnabled()) v.retain();
-            try deduped.append(a, v);
-        }
-    }
-    return try Value.newSet(a, .{
-        .items = try ValueList.init(a, deduped),
-        .mutable = mutable,
-        .backing = null,
-        .mod_count = try modCountFor(a, mutable),
-    });
+    // With no host nothing runs user code, so nothing throws.
+    const r = try dedupeIntoSet(null, undefined, a, items, mutable);
+    return r.ok;
 }
 
 pub fn makeArray(a: Allocator, items: []const Value, prim: ?PrimitiveArrayKind) Error!Value {
@@ -231,8 +221,10 @@ pub fn makeArrayBorrowed(a: Allocator, list: std.ArrayList(Value), prim: ?Primit
 
 pub fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
     var out: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     for (entries) |kv| {
-        if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+        if (try hashing.findQuiet(&keys, null, undefined, a, out.items, &kv.key)) |i| {
             if (runtime.reclaimEnabled()) {
                 out.items[i].value.release(a);
                 kv.value.retain();
@@ -246,11 +238,27 @@ pub fn makeMap(a: Allocator, entries: []const MapPair, mutable: bool) Error!Valu
             try out.append(a, kv);
         }
     }
-    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .slots = out, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
+}
+
+/// A new map holding the entries of map `entries` in order, copied once where they stand
+/// with the hashes kept for them, as `LinkedHashMap(map)` copies its source.
+pub fn copyMap(a: Allocator, entries: MapEntries, mutable: bool) Error!Value {
+    var st = blk: {
+        const g = entries.borrow();
+        defer g.deinit();
+        break :blk try g.get().copyLive(a);
+    };
+    if (runtime.reclaimEnabled()) for (st.slots.items) |kv| {
+        kv.key.retain();
+        kv.value.retain();
+    };
+    st.mod_count = try modCountFor(a, mutable);
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, st), .mutable = mutable });
 }
 
 pub fn makeMapFromArrayList(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
-    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .slots = entries, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
 pub fn makeMapBorrowed(a: Allocator, entries: std.ArrayList(MapPair), mutable: bool) Error!Value {
@@ -293,25 +301,6 @@ pub fn modCountFrozen(mc: runtime.OptRef(runtime.ModCount)) bool {
     return cell.cell.data.frozen();
 }
 
-/// A live `MutableMap` view supports write-through removal but never insertion:
-/// Kotlin's map views throw from `add` and `addAll`.
-pub fn mapViewAddGuard(a: Allocator, args: []const Value) Error!?EvalResult {
-    if (args.len == 0) return null;
-    const backing: ?*CollBackingRef.Cell = switch (args[0]) {
-        .Set => |x| x.backing,
-        .List => |x| x.backing,
-        else => null,
-    };
-    const cell = backing orelse return null;
-    const ref = CollBackingRef{ .cell = cell };
-    const g = ref.borrow();
-    defer g.deinit();
-    if (g.get().* == .map) {
-        return try thrown(a, "kotlin.UnsupportedOperationException", null);
-    }
-    return null;
-}
-
 pub fn readOnlyMutationGuard(a: Allocator, args: []const Value) Error!?EvalResult {
     if (args.len == 0) return null;
     const read_only = switch (args[0]) {
@@ -344,13 +333,13 @@ pub fn listLen(items: ValueList) usize {
 pub fn mapLen(entries: MapEntries) usize {
     const g = entries.borrow();
     defer g.deinit();
-    return g.get().pairs.items.len;
+    return g.get().len();
 }
 
 pub fn snapshotEntries(a: Allocator, entries: MapEntries) Error![]MapPair {
     const g = entries.borrow();
     defer g.deinit();
-    return a.dupe(MapPair, g.get().pairs.items);
+    return g.get().liveCopy(a);
 }
 
 pub fn eqBoxed(x: *const Value, y: *const Value) bool {
@@ -379,8 +368,10 @@ pub fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Val
             (try eqBoxedH(host, out, x.Triple.third.asPtrConst(), y.Triple.third.asPtrConst()));
     }
     if (x.* == .MapEntry and y.* == .MapEntry) {
-        return (try eqBoxedH(host, out, x.MapEntry.key.asPtrConst(), y.MapEntry.key.asPtrConst())) and
-            (try eqBoxedH(host, out, x.MapEntry.value.asPtrConst(), y.MapEntry.value.asPtrConst()));
+        if (!try eqBoxedH(host, out, &x.MapEntry.key, &y.MapEntry.key)) return false;
+        const xv = x.MapEntry.getValue();
+        const yv = y.MapEntry.getValue();
+        return eqBoxedH(host, out, &xv, &yv);
     }
     return eqBoxed(x, y);
 }
@@ -415,8 +406,10 @@ pub fn findKeyIndexBoxedH(host: IntrinsicHost, out: Output, entries: []const Map
 
 pub fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const MapPair, mutable: bool) Error!Value {
     var o: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     for (entries) |kv| {
-        if (try findKeyIndexBoxedH(host, out, o.items, &kv.key)) |i| {
+        if (try hashing.findQuiet(&keys, host, out, a, o.items, &kv.key)) |i| {
             if (runtime.reclaimEnabled()) {
                 o.items[i].value.release(a);
                 kv.value.retain();
@@ -430,23 +423,25 @@ pub fn makeMapH(host: IntrinsicHost, out: Output, a: Allocator, entries: []const
             try o.append(a, kv);
         }
     }
-    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .pairs = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
+    return try Value.newMap(a, .{ .entries = try MapEntries.init(a, .{ .slots = o, .mod_count = try modCountFor(a, mutable) }), .mutable = mutable });
 }
 
-pub fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!Value {
-    var deduped: std.ArrayList(Value) = .empty;
-    for (items) |v| {
-        if (!try containsBoxedH(host, out, deduped.items, &v)) {
-            if (runtime.reclaimEnabled()) v.retain();
-            try deduped.append(a, v);
-        }
-    }
-    return try Value.newSet(a, .{
-        .items = try ValueList.init(a, deduped),
-        .mutable = mutable,
-        .backing = null,
-        .mod_count = try modCountFor(a, mutable),
-    });
+/// A set of `items`' distinct elements, in order, as a `LinkedHashSet` keeps them: each
+/// element's `hashCode()`, then `equals` among those of one hash (`hashing.Seen`). The
+/// exception when an override throws.
+pub fn makeSetH(host: IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!EvalResult {
+    return dedupeIntoSet(host, out, a, items, mutable);
+}
+
+/// `makeSetH`, structurally with no host (`host` null, `out` unused).
+fn dedupeIntoSet(host: ?IntrinsicHost, out: Output, a: Allocator, items: []const Value, mutable: bool) Error!EvalResult {
+    var seen = hashing.Seen.init();
+    defer seen.deinit(a);
+    for (items) |v| switch (try seen.add(host, out, a, v)) {
+        .added, .present => {},
+        .thrown => |e| return e,
+    };
+    return ok(try seen.intoSet(a, mutable));
 }
 
 /// Reinterpret a numeric `needle` into a primitive array's element kind, the
@@ -588,23 +583,27 @@ fn sortValuesNatural(a: Allocator, items: []Value) Error!?EvalResult {
 }
 
 pub fn sortValuesNaturalDesc(a: Allocator, items: []Value, descending: bool) Error!?EvalResult {
-    var i: usize = 1;
-    while (i < items.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareValues(a, items[j - 1], items[j])) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            const flipped = if (descending) reverseOrder(o) else o;
-            if (flipped == .gt) {
-                std.mem.swap(Value, &items[j - 1], &items[j]);
-                j -= 1;
-            } else break;
-        }
-    }
-    return null;
+    const by = NaturalOrder{ .a = a, .descending = descending };
+    return runtime.stableSort(Value, EvalResult, a, items, by, NaturalOrder.cmp);
 }
+
+/// Natural order (`compareValues`), flipped when `descending`, as `runtime.stableSort`
+/// compares: of values, or of the keys of map entries (`cmpKeys`).
+pub const NaturalOrder = struct {
+    a: Allocator,
+    descending: bool,
+
+    pub fn cmp(self: NaturalOrder, x: *const Value, y: *const Value) Error!runtime.SortOrder(EvalResult) {
+        return switch (try compareValues(self.a, x.*, y.*)) {
+            .order => |o| .{ .order = if (self.descending) reverseOrder(o) else o },
+            .err => |e| .{ .err = e },
+        };
+    }
+
+    pub fn cmpKeys(self: NaturalOrder, x: *const MapPair, y: *const MapPair) Error!runtime.SortOrder(EvalResult) {
+        return self.cmp(&x.key, &y.key);
+    }
+};
 
 pub fn writeBackItems(items: ValueList, a: Allocator, src: []const Value) Error!void {
     const g = items.borrowMut();
@@ -629,8 +628,21 @@ pub fn recvListItems(a: Allocator, args: []const Value, what: []const u8) Error!
     return .{ .err = typeErr(try fmt(a, "{s} requires a List receiver", .{what})) };
 }
 
+pub const SetOutcome = union(enum) { set: *runtime.SetData, err: EvalResult };
+
+/// The receiver set, for an operation that reads it through its own lookups and size,
+/// which pass over a removal's holes: the list is left as it stands.
+pub fn recvSet(a: Allocator, args: []const Value, what: []const u8) Error!SetOutcome {
+    if (args.len > 0 and args[0] == .Set) {
+        return .{ .set = args[0].Set };
+    }
+    return .{ .err = typeErr(try fmt(a, "{s} requires a Set receiver", .{what})) };
+}
+
 pub fn recvSetItems(a: Allocator, args: []const Value, what: []const u8) Error!ListItemsOutcome {
-    if (args.len > 0 and args[0] == .Set) return .{ .items = args[0].Set.items };
+    if (args.len > 0 and args[0] == .Set) {
+        return .{ .items = args[0].Set.dense() };
+    }
     return .{ .err = typeErr(try fmt(a, "{s} requires a Set receiver", .{what})) };
 }
 
@@ -725,6 +737,22 @@ fn instNum(inst: *const InstanceData, names: []const []const u8) ?i64 {
     return null;
 }
 
+/// The entry object of each of map `entries`'s nodes, in order: the ones a walk of the map's
+/// `entries` hands out, made for any node that has none yet. A read-only map's store keeps
+/// no structural count, so `setValue` on one throws.
+pub fn nodeEntries(a: Allocator, entries: MapEntries) Error![]Value {
+    const g = entries.borrowMut();
+    defer g.deinit();
+    const st = g.get();
+    const stamp: u64 = if (st.mod_count.get()) |mc| mc.cell.data.load() else 0;
+    const ba = runtime.gc.bufferAllocatorFor(&entries.cell.hdr, a);
+    const out = try a.alloc(Value, st.len());
+    var it = st.live();
+    var k: usize = 0;
+    while (it.nextSlot()) |i| : (k += 1) out[k] = try st.nodeEntry(ba, a, entries, i, stamp);
+    return out;
+}
+
 pub const ItemsOutcome = union(enum) { items: []Value, err: EvalResult };
 
 /// Collect a List/Set/Array/Map/Range receiver into a fresh slice; a Map yields
@@ -736,28 +764,14 @@ pub fn iterableItems(a: Allocator, v: Value, what: []const u8) Error!ItemsOutcom
             if (v == .List) (&v).refreshSublistView();
             const items = switch (v) {
                 .List => |l| try snapshotItems(a, l.items),
-                .Set => |s| try snapshotItems(a, s.items),
+                .Set => |s| try snapshotItems(a, s.dense()),
                 .Array => |arr| try arr.snapshot(a),
                 else => unreachable,
             };
             return .{ .items = items };
         },
-        .Map => |m| {
-            const g = m.entries.borrow();
-            defer g.deinit();
-            const src = g.get().pairs.items;
-            var out = try a.alloc(Value, src.len);
-            for (src, 0..) |kv, i| {
-                kv.key.retain();
-                kv.value.retain();
-                out[i] = try Value.newMapEntry(a, .{
-                    .key = try Value.boxRef(a, kv.key),
-                    .value = try Value.boxRef(a, kv.value),
-                    .backing = .{},
-                });
-            }
-            return .{ .items = out };
-        },
+        // A map's entries are its nodes' entry objects, as a walk of its `entries` hands out.
+        .Map => |m| return .{ .items = try nodeEntries(a, m.entries) },
         .Range => {
             const view = asRangeView(v) orelse {
                 return .{ .err = typeErr(try fmt(a, "{s} requires an iterable receiver", .{what})) };

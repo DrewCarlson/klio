@@ -5,3 +5,17 @@
 [a, b, c]
 6
 a=1, b=2, c=3
+true true true
+[b, z] [20, 26] [b=20, z=26] true false true 2
+{z=26} [z]
+{q=2} [q] [2] [q=2]
+true true 0 []
+true false false true
+true false true true
+true false
+true {b=2}
+[0, 1, 2, 3, 4] {1=b, 3=d}
+UnsupportedOperationException
+UnsupportedOperationException
+UnsupportedOperationException
+hits 50000 of 50000

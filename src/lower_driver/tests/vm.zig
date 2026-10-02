@@ -628,7 +628,7 @@ test "a host map entry equals an entry instance by the key and value its getters
             return inst;
         }
     }.of;
-    const host_entry = try Value.newMapEntry(a, .{ .key = try Value.boxRef(a, try str(a, "Foo")), .value = try Value.boxRef(a, try str(a, "bar")) });
+    const host_entry = try Value.newMapEntry(a, .{ .key = try str(a, "Foo"), .value = try str(a, "bar") });
     const same = try make(a, r, stored, try str(a, "Foo"), try str(a, "bar"));
     const other_value = try make(a, r, stored, try str(a, "Foo"), try str(a, "baz"));
     const not_entry = try make(a, r, other, try str(a, "Foo"), try str(a, "bar"));
@@ -1035,6 +1035,97 @@ test "a native builds a well-known class through its primary constructor" {
     try testing.expectEqual(iv, ir.resolved.classOf(h.r, &got.ok).?);
     try testing.expectEqual(@as(i32, 3), runtime.InstanceData.slotGet(got.ok.Instance, 0).?.Int);
     try testing.expectEqual(@as(i32, 9), runtime.InstanceData.slotGet(got.ok.Instance, 1).?.Int);
+}
+
+test "a map's view is the tables' class over the map, made once, and its iterator walks the map in place" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    const keys_c = try h.class("HashMapKeys", .{ .seeds = &.{.null_ref}, .slot_names = &.{"backing"} });
+    const ctor = try h.func("HashMapKeys.<init>", 2);
+    try h.body(ctor, &.{.{ .insts = &.{ param(0, 0), param(1, 1), hand.setField(0, 0, 1) }, .term = ret(0) }});
+    try h.finish();
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    h.r.well_known_classes.set(.hash_map_keys, .{ .class = keys_c, .ctor = ctor });
+    // Three entries, too few for the map to index: a removal moves the ones after it.
+    const entries = try runtime.MapEntries.init(a, .{ .mod_count = .from(try runtime.ModCount.new(a)) });
+    for (0..3) |i| try entries.cell.data.append(a, .{ .key = .{ .Int = @intCast(i) }, .value = .{ .Int = @intCast(i * 10) } });
+    const map = try Value.newMap(a, .{ .entries = entries, .mutable = true });
+    const coll = stdlib.implementations.collections;
+    var ctx: runtime.CallCtx = .{ .args = &.{map}, .out = rig.cap.output(), .host = rig.natives(), .allocator = a };
+    const view = (try coll.coll_map_keys(&ctx)).ok;
+    try testing.expectEqual(keys_c, ir.resolved.classOf(h.r, &view).?);
+    try testing.expect(runtime.InstanceData.slotGet(view.Instance, 0).?.Map == map.Map);
+    try testing.expect(Value.referenceEq(&view, &(try coll.coll_map_keys(&ctx)).ok));
+    // The keys, the first taken out through the iterator: the next is the one after it.
+    ctx.args = &.{ map, .{ .Int = 0 } };
+    const iter = (try coll.map_view_iterator(&ctx)).ok;
+    const next = interp_ir.hostMemberFn("kotlin.collections.Iterator.next").?;
+    const has_next = interp_ir.hostMemberFn("kotlin.collections.Iterator.hasNext").?;
+    const remove = interp_ir.hostMemberFn("kotlin.collections.MutableIterator.remove").?;
+    var seen: std.ArrayList(i32) = .empty;
+    while ((try has_next(&rig.host, a, &.{iter})).ok.Bool) {
+        const k = (try next(&rig.host, a, &.{iter})).ok.Int;
+        try seen.append(a, k);
+        if (k == 0) try testing.expect((try remove(&rig.host, a, &.{iter})) == .ok);
+    }
+    try testing.expectEqualSlices(i32, &.{ 0, 1, 2 }, seen.items);
+    try testing.expectEqual(@as(usize, 2), entries.cell.data.len());
+}
+
+test "a map's or a set's iterator ends after the element that was last when it gave it, whatever came since" {
+    var mem = hand.TestMemory.init();
+    defer mem.deinit();
+    const a = mem.allocator();
+    var h = try Hand.init(a);
+    try h.finish();
+    var rig: HostRig = undefined;
+    try rig.init(a, &h);
+    defer rig.deinit();
+    const coll = stdlib.implementations.collections;
+    const next = interp_ir.hostMemberFn("kotlin.collections.Iterator.next").?;
+    const has_next = interp_ir.hostMemberFn("kotlin.collections.Iterator.hasNext").?;
+    var ctx: runtime.CallCtx = .{ .args = &.{}, .out = rig.cap.output(), .host = rig.natives(), .allocator = a };
+    const map = (try coll.coll_mutable_map_of(&ctx)).ok;
+    const set = (try coll.coll_mutable_set_of(&ctx)).ok;
+    for (0..2) |i| {
+        ctx.args = &.{ map, .{ .Int = @intCast(i) }, .{ .Int = 0 } };
+        _ = try coll.coll_mut_map_put(&ctx);
+        ctx.args = &.{ set, .{ .Int = @intCast(i) } };
+        _ = try coll.coll_mut_set_add(&ctx);
+    }
+    const set_iter = interp_ir.hostMemberFn("kotlin.collections.LinkedHashSet.iterator").?;
+    for ([_]Value{ map, set }, 0..) |c, which| {
+        // An element added once the last was given: the walk is over.
+        ctx.args = &.{ c, .{ .Int = 0 } };
+        const it = if (which == 0) (try coll.map_view_iterator(&ctx)).ok else (try set_iter(&rig.host, a, &.{c})).ok;
+        _ = try next(&rig.host, a, &.{it});
+        _ = try next(&rig.host, a, &.{it});
+        if (which == 0) {
+            ctx.args = &.{ c, .{ .Int = 9 }, .{ .Int = 0 } };
+            _ = try coll.coll_mut_map_put(&ctx);
+        } else {
+            ctx.args = &.{ c, .{ .Int = 9 } };
+            _ = try coll.coll_mut_set_add(&ctx);
+        }
+        try testing.expect(!(try has_next(&rig.host, a, &.{it})).ok.Bool);
+        // One added before the last was given: there is a next, and taking it throws.
+        ctx.args = &.{ c, .{ .Int = 0 } };
+        const it2 = if (which == 0) (try coll.map_view_iterator(&ctx)).ok else (try set_iter(&rig.host, a, &.{c})).ok;
+        _ = try next(&rig.host, a, &.{it2});
+        if (which == 0) {
+            ctx.args = &.{ c, .{ .Int = 10 }, .{ .Int = 0 } };
+            _ = try coll.coll_mut_map_put(&ctx);
+        } else {
+            ctx.args = &.{ c, .{ .Int = 10 } };
+            _ = try coll.coll_mut_set_add(&ctx);
+        }
+        try testing.expect((try has_next(&rig.host, a, &.{it2})).ok.Bool);
+        try testing.expect((try next(&rig.host, a, &.{it2})) == .err);
+    }
 }
 
 test "a host instance holds the native's state and has no class in the tables" {

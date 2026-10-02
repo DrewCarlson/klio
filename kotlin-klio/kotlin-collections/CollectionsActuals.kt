@@ -53,6 +53,11 @@ private fun <E> __klio_freezeSet(set: MutableSet<E>): Set<E> =
 private fun <K, V> __klio_freezeMap(map: MutableMap<K, V>): Map<K, V> =
     error("intrinsic kotlin.collections.__klio_freezeMap not installed")
 
+// A builder's map until it is frozen: its entries fail fast after a structural
+// change, as `MapBuilder`'s do on every platform.
+private fun <K, V> __klio_builderMap(map: LinkedHashMap<K, V>): LinkedHashMap<K, V> =
+    error("intrinsic kotlin.collections.__klio_builderMap not installed")
+
 internal actual inline fun <E> buildListInternal(builderAction: MutableList<E>.() -> Unit): List<E> {
     return __klio_freezeList(ArrayList<E>().apply(builderAction))
 }
@@ -70,16 +75,22 @@ internal actual inline fun <E> buildSetInternal(capacity: Int, builderAction: Mu
 }
 
 internal actual inline fun <K, V> buildMapInternal(builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    return __klio_freezeMap(LinkedHashMap<K, V>().apply(builderAction))
+    return __klio_freezeMap(__klio_builderMap(LinkedHashMap<K, V>()).apply(builderAction))
 }
 
 internal actual inline fun <K, V> buildMapInternal(capacity: Int, builderAction: MutableMap<K, V>.() -> Unit): Map<K, V> {
-    return __klio_freezeMap(LinkedHashMap<K, V>(capacity).apply(builderAction))
+    return __klio_freezeMap(__klio_builderMap(LinkedHashMap<K, V>(capacity)).apply(builderAction))
 }
 
-// The interpreter's arrays are exact-sized; collection-to-array
-// termination is the identity, as on JS.
-internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: Array<T>): Array<T> = array
+// As the JVM's `Collection.toArray(array)`: an array longer than the
+// collection takes a null after its last element.
+internal actual fun <T> terminateCollectionToArray(collectionSize: Int, array: Array<T>): Array<T> {
+    if (collectionSize < array.size) {
+        @Suppress("UNCHECKED_CAST")
+        array[collectionSize] = null as T
+    }
+    return array
+}
 
 // Platform hooks the baked AbstractCollection.toArray path calls bare;
 // the common implementations serve directly.
@@ -109,12 +120,16 @@ public actual fun <T> MutableList<T>.reverse(): Unit {
     }
 }
 
+// As the JVM's `List.sort`: the elements sorted in an array (`Sorting.kt`), then
+// written back in order.
 public actual fun <T : Comparable<T>> MutableList<T>.sort(): Unit {
-    val sorted = this.sorted()
-    for (index in 0..lastIndex) this[index] = sorted[index]
+    if (size > 1) sortWith(naturalOrder())
 }
 
 public actual fun <T> MutableList<T>.sortWith(comparator: Comparator<in T>): Unit {
-    val sorted = this.sortedWith(comparator)
-    for (index in 0..lastIndex) this[index] = sorted[index]
+    if (size <= 1) return
+    @Suppress("UNCHECKED_CAST")
+    val sorted = (this as Collection<T>).toTypedArray<Any?>() as Array<T>
+    sorted.sortWith(comparator)
+    for (index in sorted.indices) this[index] = sorted[index]
 }

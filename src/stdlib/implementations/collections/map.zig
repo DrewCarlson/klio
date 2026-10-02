@@ -1,6 +1,7 @@
 //! `Map` intrinsics: scope helpers, map algebra, access, views and mutation.
 
 const std = @import("std");
+const hashing = @import("hashing.zig");
 const runtime = @import("runtime");
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -17,6 +18,7 @@ const builders_mod = @import("builders.zig");
 const sortMapByKey = builders_mod.sortMapByKey;
 
 const common_mod = @import("common.zig");
+const views_mod = @import("views.zig");
 const MapEntriesOutcome = common_mod.MapEntriesOutcome;
 const appendVL = common_mod.appendVL;
 const arityErr = common_mod.arityErr;
@@ -31,6 +33,8 @@ const iterableItemsCtx = common_mod.iterableItemsCtx;
 const makeListFromArrayList = common_mod.makeListFromArrayList;
 const makeMap = common_mod.makeMap;
 const makeMapH = common_mod.makeMapH;
+const makeMapBorrowed = common_mod.makeMapBorrowed;
+const copyMap = common_mod.copyMap;
 const makePair = common_mod.makePair;
 const mapEntriesLen = common_mod.mapEntriesLen;
 const mapLen = common_mod.mapLen;
@@ -49,7 +53,6 @@ const collToString = list_mod.collToString;
 
 const list_transforms_mod = @import("list_transforms.zig");
 const pairsFromValues = list_transforms_mod.pairsFromValues;
-const userMapPairs = list_transforms_mod.userMapPairs;
 
 const sequence_mod = @import("sequence.zig");
 const materialiseSequence = sequence_mod.materialiseSequence;
@@ -65,7 +68,7 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
         // `getOrElse` is `get(key) ?: defaultValue()`: a present-but-null value
         // falls through to the default like an absent key.
         if (try g.get().find(a, &key)) |i| {
-            const v = g.get().pairs.items[i].value;
+            const v = g.get().slots.items[i].value;
             if (v != .Null) return okElem(v);
         }
     }
@@ -85,7 +88,7 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
         // `getOrPut` returns a stored value only when non-null; a present-but-null
         // value is recomputed and stored.
         if (try g.get().find(a, &key)) |i| {
-            const v = g.get().pairs.items[i].value;
+            const v = g.get().slots.items[i].value;
             if (v != .Null) return okElem(v);
         }
     }
@@ -101,8 +104,8 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
         // handed back untouched.
         if (runtime.reclaimEnabled()) new_v.retain();
         if (try g.get().find(a, &key)) |i| {
-            const old = g.get().pairs.items[i].value;
-            g.get().pairs.items[i].value = new_v;
+            const old = g.get().slots.items[i].value;
+            g.get().slots.items[i].value = new_v;
             if (runtime.reclaimEnabled()) old.release(a);
         } else {
             if (runtime.reclaimEnabled()) key.retain();
@@ -115,65 +118,65 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_map_to_mutable_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMutableMap requires a Map receiver");
-    return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
+    return ok(try copyMap(a, ctx.args[0].Map.entries, true));
 }
 pub fn coll_map_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMap requires a Map receiver");
     // `toMap(destination)` merges into the supplied map and returns it, live.
     if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
-        const src = try snapshotEntries(a, ctx.args[0].Map.entries);
-        defer if (runtime.freeScratch()) a.free(src);
         const dest = ctx.args[1];
-        for (src) |kv| switch (try putEntry(ctx, dest.Map.entries, kv.key, kv.value)) {
-            .prev => |p| if (p) |old| if (runtime.reclaimEnabled()) old.release(a),
-            .thrown => |e| return e,
-        };
+        const _mb = mapEntriesLen(dest.Map.entries);
+        defer mapStructuralBump(dest.Map.entries, _mb);
+        const r = try putAllOf(ctx, dest.Map.entries, ctx.args[0].Map.entries);
+        if (r == .err) return r;
         return ok(dest);
     }
-    return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), false));
+    return ok(try copyMap(a, ctx.args[0].Map.entries, false));
 }
 
+/// `Map.plus`, as `LinkedHashMap(this).apply { put(..) }`: one copy of the map, the pair or
+/// pairs put into it through their keys' `hashCode()` and `equals`.
 pub fn coll_map_plus(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.plus")) {
         .entries => |x| x,
         .err => |e| return e,
     };
-    var out: std.ArrayList(MapPair) = .empty;
-    try out.appendSlice(a, try snapshotEntries(a, entries));
     if (ctx.args.len < 2) return arityErr("plus requires an argument");
     const arg = ctx.args[1];
-    switch (arg) {
-        .Pair => try out.append(a, .{ .key = arg.Pair.first.asPtrConst().*, .value = arg.Pair.second.asPtrConst().* }),
-        .Map => |e| try out.appendSlice(a, try snapshotEntries(a, e.entries)),
-        .List => |l| {
-            const g = l.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
+    const out = try copyMap(a, entries, false);
+    const dest = out.Map.entries;
+    const mark = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(mark);
+    runtime.keepalivePush(out);
+    const items: []const Value = switch (arg) {
+        .Pair => |p| {
+            switch (try putEntry(ctx, dest, p.first.asPtrConst().*, p.second.asPtrConst().*)) {
+                .prev => |old| if (old) |o| if (runtime.reclaimEnabled()) o.release(a),
+                .thrown => |e| return e,
             }
+            return ok(out);
         },
-        .Set => |s| {
-            const g = s.items.borrow();
-            defer g.deinit();
-            for (g.get().items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
-            }
+        .Map => |m| {
+            const r = try putAllOf(ctx, dest, m.entries);
+            return if (r == .err) r else ok(out);
         },
-        .Array, .Sequence, .Range => {
-            const items = switch (try iterableItemsCtx(ctx, arg, "Map.plus")) {
-                .items => |x| x,
-                .err => |e| return e,
-            };
-            defer if (runtime.freeScratch()) a.free(items);
-            for (items) |p| {
-                if (p == .Pair) try out.append(a, .{ .key = p.Pair.first.asPtrConst().*, .value = p.Pair.second.asPtrConst().* });
-            }
+        .List, .Set, .Array, .Sequence, .Range => switch (try iterableItemsCtx(ctx, arg, "Map.plus")) {
+            .items => |x| x,
+            .err => |e| return e,
         },
         else => return typeErr("Map.plus expects a Pair, Map, or Iterable<Pair>"),
+    };
+    runtime.keepalivePushSlice(items);
+    for (items) |p| {
+        if (p != .Pair) continue;
+        switch (try putEntry(ctx, dest, p.Pair.first.asPtrConst().*, p.Pair.second.asPtrConst().*)) {
+            .prev => |old| if (old) |o| if (runtime.reclaimEnabled()) o.release(a),
+            .thrown => |e| return e,
+        }
     }
-    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
+    return ok(out);
 }
 
 pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
@@ -187,7 +190,7 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
     var keys: std.ArrayList(Value) = .empty;
     switch (arg) {
         .List => |l| try appendVL(&keys, a, l.items),
-        .Set => |s| try appendVL(&keys, a, s.items),
+        .Set => |s| try appendVL(&keys, a, s.dense()),
         .Array, .Sequence, .Range => {
             const items = switch (try iterableItemsCtx(ctx, arg, "Map.minus")) {
                 .items => |x| x,
@@ -198,12 +201,21 @@ pub fn coll_map_minus(ctx: *CallCtx) Error!EvalResult {
         },
         else => try keys.append(a, arg),
     }
+    var gone = hashing.Seen.init();
+    defer gone.deinit(a);
+    for (keys.items) |k| _ = try gone.add(null, undefined, a, k);
+    // As `toMutableMap().apply { minusAssign(keys) }`: one copy, of the entries kept.
     var out: std.ArrayList(MapPair) = .empty;
-    const src = try snapshotEntries(a, entries);
-    for (src) |kv| {
-        if (!containsBoxed(keys.items, &kv.key)) try out.append(a, kv);
+    {
+        const g = entries.borrow();
+        defer g.deinit();
+        var it = g.get().live();
+        while (it.next()) |kv| switch (try gone.find(null, undefined, a, kv.key)) {
+            .none => try out.append(a, kv.*),
+            .at, .thrown => {},
+        };
     }
-    return ok(try makeMapH(ctx.host, ctx.out, a, out.items, false));
+    return ok(try makeMapBorrowed(a, out, false));
 }
 
 pub fn coll_map_size(ctx: *CallCtx) Error!EvalResult {
@@ -230,7 +242,7 @@ pub fn coll_map_is_not_empty(ctx: *CallCtx) Error!EvalResult {
 
 /// Where a key is among a map's entries. A miss carries the key's hash when
 /// the lookup took it, for the entry a put appends.
-const Lookup = union(enum) {
+pub const Lookup = union(enum) {
     at: usize,
     none: ?u64,
     thrown: EvalResult,
@@ -274,19 +286,19 @@ fn instanceKeyEq(ctx: *CallCtx, k: *const Value, key: *const Value) Error!Eq {
 
 /// The entry of `key`: an instance key through its own `hashCode()` and
 /// `equals`, as a `HashMap` finds it, any other by value.
-fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
+pub fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
     if (key != .Instance) {
         const g = entries.borrowMut();
         defer g.deinit();
         if (try g.get().find(ctx.allocator, &key)) |i| return .{ .at = i };
         // A map below the index's size keeps no hashes.
-        const small = g.get().pairs.items.len + 1 < MapStore.index_threshold;
+        const small = g.get().slots.items.len + 1 < MapStore.index_threshold;
         return .{ .none = if (small) null else MapStore.keyHash(&key) };
     }
     const indexed = blk: {
         const g = entries.borrow();
         defer g.deinit();
-        break :blk g.get().pairs.items.len >= MapStore.index_threshold and !g.get().unhashable;
+        break :blk g.get().slots.items.len >= MapStore.index_threshold and !g.get().unhashable;
     };
     if (!indexed) return instanceKeyScan(ctx, entries, &key, 0, null);
     switch (try hashEntries(ctx, entries)) {
@@ -312,7 +324,7 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
         const g = entries.borrowMut();
         defer g.deinit();
         try g.get().bucketOf(ctx.allocator, h, &at, a);
-        for (at.items) |i| try keys.append(a, g.get().pairs.items[i].key);
+        for (at.items) |i| try keys.append(a, g.get().slots.items[i].key);
         break :blk g.get().hashedLen();
     };
     for (at.items, keys.items) |i, *k| switch (try instanceKeyEq(ctx, k, &key)) {
@@ -332,15 +344,15 @@ const Put = union(enum) {
 /// Puts `value` at `key` as `MutableMap.put` does: over the entry
 /// `mapKeyIndex` finds, else as a new last entry. The map takes a reference
 /// to what it keeps; the replaced value's moves to the caller.
-fn putEntry(ctx: *CallCtx, entries: MapEntries, key: Value, value: Value) Error!Put {
+pub fn putEntry(ctx: *CallCtx, entries: MapEntries, key: Value, value: Value) Error!Put {
     const found = try mapKeyIndex(ctx, entries, key);
     const g = entries.borrowMut();
     defer g.deinit();
     const h = switch (found) {
-        .at => |i| if (i < g.get().pairs.items.len) {
+        .at => |i| if (i < g.get().slots.items.len and !g.get().isHole(i)) {
             if (runtime.reclaimEnabled()) value.retain();
-            const prev = g.get().pairs.items[i].value;
-            g.get().pairs.items[i].value = value;
+            const prev = g.get().slots.items[i].value;
+            g.get().slots.items[i].value = value;
             return .{ .prev = prev };
         } else null,
         .none => |h| h,
@@ -354,18 +366,28 @@ fn putEntry(ctx: *CallCtx, entries: MapEntries, key: Value, value: Value) Error!
     return .{ .prev = null };
 }
 
-/// The entry of instance `key` among those from `from` on, by `equals`.
+/// The entry of instance `key` among the slots from `from` on, by `equals`.
 fn instanceKeyScan(ctx: *CallCtx, entries: MapEntries, key: *const Value, from: usize, h: ?u64) Error!Lookup {
+    var slots: std.ArrayList(u32) = .empty;
+    defer if (runtime.freeScratch()) slots.deinit(ctx.allocator);
     const keys = blk: {
         const g = entries.borrow();
         defer g.deinit();
-        const pairs = g.get().pairs.items;
-        var ks = try ctx.allocator.alloc(Value, pairs.len -| from);
-        for (pairs[@min(from, pairs.len)..], 0..) |kv, i| ks[i] = kv.key;
+        const st = g.get();
+        var ks: std.ArrayList(Value) = .empty;
+        var i = from;
+        while (i < st.slots.items.len) : (i += 1) {
+            if (st.isHole(i)) continue;
+            try ks.append(ctx.allocator, st.slots.items[i].key);
+            try slots.append(ctx.allocator, @intCast(i));
+        }
         break :blk ks;
     };
-    defer if (runtime.freeScratch()) ctx.allocator.free(keys);
-    for (keys, from..) |*k, i| switch (try instanceKeyEq(ctx, k, key)) {
+    defer if (runtime.freeScratch()) {
+        var ks = keys;
+        ks.deinit(ctx.allocator);
+    };
+    for (keys.items, slots.items) |*k, i| switch (try instanceKeyEq(ctx, k, key)) {
         .yes => return .{ .at = i },
         .no => {},
         .thrown => |e| return .{ .thrown = e },
@@ -392,7 +414,8 @@ fn hashEntries(ctx: *CallCtx, entries: MapEntries) Error!Hashing {
             const g = entries.borrow();
             defer g.deinit();
             from = g.get().hashedLen();
-            const pairs = g.get().pairs.items;
+            // No hole is past the hashes.
+            const pairs = g.get().slots.items;
             if (from >= pairs.len) return .done;
             var ks = try a.alloc(Value, pairs.len - from);
             for (pairs[from..], 0..) |kv, i| ks[i] = kv.key;
@@ -429,7 +452,7 @@ pub fn coll_map_get(ctx: *CallCtx) Error!EvalResult {
         .at => |i| {
             const g = entries.borrow();
             defer g.deinit();
-            if (i < g.get().pairs.items.len) return okElem(g.get().pairs.items[i].value);
+            if (i < g.get().slots.items.len and !g.get().isHole(i)) return okElem(g.get().slots.items[i].value);
         },
         .none => {},
         .thrown => |e| return e,
@@ -460,78 +483,87 @@ pub fn coll_map_contains_value(ctx: *CallCtx) Error!EvalResult {
     const value = ctx.args[1];
     const g = entries.borrow();
     defer g.deinit();
-    for (g.get().pairs.items) |kv| {
+    var it = g.get().live();
+    while (it.next()) |kv| {
         if (eqBoxed(&kv.value, &value)) return ok(.{ .Bool = true });
     }
     return ok(.{ .Bool = false });
 }
 
 pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
-    const entries = switch (try recvMapEntries(a, ctx.args, "Map.keys")) {
-        .entries => |x| x,
-        .err => |e| return e,
-    };
-    var keys: std.ArrayList(Value) = .empty;
-    {
-        const g = entries.borrow();
-        defer g.deinit();
-        for (g.get().pairs.items) |kv| {
-            if (runtime.reclaimEnabled()) kv.key.retain();
-            try keys.append(a, kv.key);
-        }
-    }
-    const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Keys } });
-    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, keys), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
+    return mapView(ctx, .Keys, "Map.keys");
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
-    const entries = switch (try recvMapEntries(a, ctx.args, "Map.values")) {
-        .entries => |x| x,
-        .err => |e| return e,
-    };
-    var values: std.ArrayList(Value) = .empty;
-    {
-        const g = entries.borrow();
-        defer g.deinit();
-        for (g.get().pairs.items) |kv| {
-            if (runtime.reclaimEnabled()) kv.value.retain();
-            try values.append(a, kv.value);
-        }
-    }
-    const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Values } });
-    return ok(try Value.newList(a, .{ .items = try ValueList.init(a, values), .mutable = writable, .enum_entries = false, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
+    return mapView(ctx, .Values, "Map.values");
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
-    const a = ctx.allocator;
-    // A read-only map's entries are read-only too: they carry no backing, so
-    // `setValue` throws and the view set refuses mutation.
-    const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
-    const entries = switch (try recvMapEntries(a, ctx.args, "Map.entries")) {
-        .entries => |x| x,
-        .err => |e| return e,
-    };
-    var map_entries: std.ArrayList(Value) = .empty;
-    const stamp = entriesCounterNow(entries);
-    {
-        const g = entries.borrow();
-        defer g.deinit();
-        for (g.get().pairs.items) |kv| {
-            kv.key.retain();
-            kv.value.retain();
-            try map_entries.append(a, try Value.newMapEntry(a, .{
-                .key = try Value.boxRef(a, kv.key),
-                .value = try Value.boxRef(a, kv.value),
-                .backing = if (writable) .from(entries) else .{},
-                .exp_mod = stamp,
-            }));
-        }
-    }
-    const backing = try CollBackingRef.init(a, .{ .map = .{ .entries = entries, .kind = .Entries } });
-    return ok(try Value.newSet(a, .{ .items = try ValueList.init(a, map_entries), .mutable = writable, .backing = backing.cell, .mod_count = entriesModCountClone(entries) }));
+    return mapView(ctx, .Entries, "Map.entries");
 }
+
+/// The map's view of `kind`, an instance of the class `MapViews.kt` declares for it, which
+/// reads the map through its lookups and walks it in place: made on first use and kept on
+/// the map, as the JVM's and Kotlin/Native's maps keep theirs.
+fn mapView(ctx: *CallCtx, kind: runtime.MapViewKind, what: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr(try fmt(a, "{s} requires a Map receiver", .{what}));
+    const m = ctx.args[0].Map;
+    if (m.views[@intFromEnum(kind)]) |v| {
+        v.retain();
+        return ok(v);
+    }
+    const class: runtime.WellKnownClass = switch (kind) {
+        .Keys => .hash_map_keys,
+        .Values => .hash_map_values,
+        .Entries => .hash_map_entry_set,
+    };
+    const made = (try ctx.host.constructWellKnown(class, ctx.args[0..1], ctx.out)) orelse
+        return typeErr(try fmt(a, "{s}: no {s} class", .{ what, class.fqn() }));
+    const v = switch (made) {
+        .ok => |x| x,
+        else => return made,
+    };
+    m.setView(kind, v);
+    v.retain();
+    return ok(v);
+}
+
+/// `__klio_mapIterator(map, kind)` (`MapViews.kt`): an iterator over the map's keys, values
+/// or entries that walks the map itself.
+pub fn map_view_iterator(ctx: *CallCtx) Error!EvalResult {
+    if (ctx.args.len != 2 or ctx.args[0] != .Map or ctx.args[1] != .Int) return typeErr("__klio_mapIterator expects a Map and a kind");
+    const kind: runtime.MapViewKind = switch (ctx.args[1].Int) {
+        0 => .Keys,
+        1 => .Values,
+        2 => .Entries,
+        else => return typeErr("__klio_mapIterator: no such kind"),
+    };
+    const m = ctx.args[0].Map;
+    return ok(try views_mod.mapIterator(ctx.allocator, m.entries, kind, m.mutable));
+}
+
+/// `__klio_mapCheckMutable(map)` (`MapViews.kt`): `UnsupportedOperationException` for a map
+/// that may not change, before a view's bulk removal reads any element.
+pub fn map_check_mutable(ctx: *CallCtx) Error!EvalResult {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    return ok(Value.Unit);
+}
+
+/// `__klio_mapRemoveKey(map, key)` (`MapViews.kt`): removes the key, answering whether the
+/// map held it, whatever its value.
+pub fn map_remove_key(ctx: *CallCtx) Error!EvalResult {
+    return switch (try removeKey(ctx, "MutableMap.keys.remove")) {
+        .pair => |kv| {
+            if (runtime.reclaimEnabled()) {
+                kv.key.release(ctx.allocator);
+                kv.value.release(ctx.allocator);
+            }
+            return ok(.{ .Bool = true });
+        },
+        .absent => ok(.{ .Bool = false }),
+        .err => |e| e,
+    };
+}
+
 pub fn coll_map_to_string(ctx: *CallCtx) Error!EvalResult {
     return collToString(ctx, "Map.toString");
 }
@@ -556,29 +588,42 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     };
 }
 pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
-    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
+    return switch (try removeKey(ctx, "MutableMap.remove")) {
+        // The value's owned ref moves to the result; the removed key must be released.
+        .pair => |kv| {
+            if (runtime.reclaimEnabled()) kv.key.release(ctx.allocator);
+            return ok(kv.value);
+        },
+        .absent => ok(Value.Null),
+        .err => |e| e,
+    };
+}
+
+const Removed = union(enum) { pair: MapPair, absent, err: EvalResult };
+
+/// Takes key `ctx.args[1]` out of map `ctx.args[0]`: the pair the map held for it, owned by
+/// the caller, or `absent`.
+fn removeKey(ctx: *CallCtx, what: []const u8) Error!Removed {
+    if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return .{ .err = e };
     const a = ctx.allocator;
-    const entries = switch (try recvMapEntries(a, ctx.args, "MutableMap.remove")) {
+    const entries = switch (try recvMapEntries(a, ctx.args, what)) {
         .entries => |x| x,
-        .err => |e| return e,
+        .err => |e| return .{ .err = e },
     };
     const _mb = mapEntriesLen(entries);
     defer mapStructuralBump(entries, _mb);
-    if (ctx.args.len < 2) return arityErr("remove requires a key");
-    const key = ctx.args[1];
-    const pos = switch (try mapKeyIndex(ctx, entries, key)) {
+    if (ctx.args.len < 2) return .{ .err = arityErr("remove requires a key") };
+    const pos = switch (try mapKeyIndex(ctx, entries, ctx.args[1])) {
         .at => |i| i,
-        .none => return ok(Value.Null),
-        .thrown => |e| return e,
+        .none => return .absent,
+        .thrown => |e| return .{ .err = e },
     };
     const g = entries.borrowMut();
     defer g.deinit();
-    if (pos >= g.get().pairs.items.len) return ok(Value.Null);
+    if (pos >= g.get().slots.items.len or g.get().isHole(pos)) return .absent;
     const kv = g.get().removeAt(pos);
-    // The value's owned ref moves to the result; the removed key must be
-    // released.
-    if (runtime.reclaimEnabled()) kv.key.release(a);
-    return ok(kv.value);
+    g.get().compactIfSparse();
+    return .{ .pair = kv };
 }
 pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
@@ -603,7 +648,8 @@ fn mutMapEntriesRc(a: Allocator, recv: Value, who: []const u8) Error!MapEntriesO
 fn mapFind(entries: MapEntries, key: Value) ?Value {
     const g = entries.borrow();
     defer g.deinit();
-    for (g.get().pairs.items) |kv| {
+    var it = g.get().live();
+    while (it.next()) |kv| {
         if (eqBoxed(&kv.key, &key)) return kv.value;
     }
     return null;
@@ -612,7 +658,8 @@ fn mapFind(entries: MapEntries, key: Value) ?Value {
 fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!void {
     const g = entries.borrowMut();
     defer g.deinit();
-    for (g.get().pairs.items) |*kv| {
+    var it = g.get().live();
+    while (it.next()) |kv| {
         if (eqBoxed(&kv.key, &key)) {
             if (runtime.reclaimEnabled()) {
                 value.retain();
@@ -632,9 +679,11 @@ fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!voi
 fn mapRemoveKey(entries: MapEntries, key: Value) void {
     const g = entries.borrowMut();
     defer g.deinit();
-    for (g.get().pairs.items, 0..) |kv, i| {
-        if (eqBoxed(&kv.key, &key)) {
+    var it = g.get().live();
+    while (it.nextSlot()) |i| {
+        if (eqBoxed(&g.get().slots.items[i].key, &key)) {
             _ = g.get().removeAt(i);
+            g.get().compactIfSparse();
             return;
         }
     }
@@ -786,7 +835,7 @@ pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
     const default = ctx.args[2];
     const g = entries.borrowMut();
     defer g.deinit();
-    if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+    if (try g.get().find(a, &key)) |i| return okElem(g.get().slots.items[i].value);
     return ok(default);
 }
 
@@ -807,7 +856,7 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrowMut();
         defer g.deinit();
-        if (try g.get().find(a, &key)) |i| return okElem(g.get().pairs.items[i].value);
+        if (try g.get().find(a, &key)) |i| return okElem(g.get().slots.items[i].value);
     }
     const kd = try display(a, key);
     const msg = try fmt(a, "Key {s} is missing in the map.", .{kd});
@@ -826,7 +875,8 @@ pub fn coll_map_to_list(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        for (g.get().pairs.items) |kv| {
+        var it = g.get().live();
+        while (it.next()) |kv| {
             kv.key.retain();
             kv.value.retain();
             try pairs.append(a, try makePair(a, kv.key, kv.value));
@@ -855,7 +905,8 @@ pub fn coll_map_to_sorted_map(ctx: *CallCtx) Error!EvalResult {
         }
     }
     if (try sortMapByKey(a, entries, descending)) |e| return e;
-    return ok(try makeMap(a, entries, false));
+    // The sorted entries are the new map's: its keys are the map's, each once.
+    return ok(try makeMapBorrowed(a, .fromOwnedSlice(entries), false));
 }
 
 pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
@@ -884,6 +935,101 @@ pub fn coll_map_count_no_pred(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.newInt(@intCast(mapLen(entries))));
 }
 
+/// Puts the entries of a user `Map`, `inst`, into map `entries`, as `HashMap.putMapEntries`
+/// does: its `size` first, then, unless it is empty, each entry of its `entries` as their
+/// iterator gives it. Null for an instance that is not a `Map`.
+pub fn putUserMap(ctx: *CallCtx, entries: MapEntries, inst: Value, who: []const u8) Error!?EvalResult {
+    const a = ctx.allocator;
+    const n = (try ctx.host.callWellKnown(&inst, .map_size, &.{}, ctx.out)) orelse return null;
+    switch (n) {
+        .ok => |v| if (v == .Int and v.Int == 0) return ok(Value.Unit),
+        .err => |e| return .{ .err = e },
+    }
+    const user_entries = switch ((try ctx.host.callWellKnown(&inst, .entries, &.{}, ctx.out)) orelse
+        return typeErr(try fmt(a, "{s}: a map has no entries", .{who}))) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    return try putEntriesOf(ctx, entries, user_entries, who);
+}
+
+/// Puts each entry of a user map's `entries` (`user_entries`) into map `entries` as its
+/// iterator gives it, as `HashMap.putMapEntries` walks the source's `entrySet()`: an entry
+/// may be a `Map.Entry` instance, a host entry or a `Pair`.
+fn putEntriesOf(ctx: *CallCtx, entries: MapEntries, user_entries: Value, who: []const u8) Error!EvalResult {
+    const a = ctx.allocator;
+    const mark = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(mark);
+    runtime.keepalivePush(user_entries);
+    const iter = switch ((try ctx.host.callWellKnown(&user_entries, .iterator, &.{}, ctx.out)) orelse
+        return typeErr(try fmt(a, "{s}: a map's entries have no iterator", .{who}))) {
+        .ok => |v| v,
+        .err => |e| return .{ .err = e },
+    };
+    runtime.keepalivePush(iter);
+    const step = runtime.keepaliveMark();
+    while (true) {
+        runtime.keepaliveRestore(step);
+        const more = switch ((try ctx.host.callWellKnown(&iter, .has_next, &.{}, ctx.out)) orelse
+            return typeErr(try fmt(a, "{s}: an iterator has no hasNext()", .{who}))) {
+            .ok => |v| v == .Bool and v.Bool,
+            .err => |e| return .{ .err = e },
+        };
+        if (!more) return ok(Value.Unit);
+        const entry = switch ((try ctx.host.callWellKnown(&iter, .next, &.{}, ctx.out)) orelse
+            return typeErr(try fmt(a, "{s}: an iterator has no next()", .{who}))) {
+            .ok => |v| v,
+            .err => |e| return .{ .err = e },
+        };
+        runtime.keepalivePush(entry);
+        const key: Value, const val: Value = switch (entry) {
+            .MapEntry => |me| .{ me.key, me.getValue() },
+            .Pair => |p| .{ p.first.asPtrConst().*, p.second.asPtrConst().* },
+            else => blk: {
+                const k = switch ((try ctx.host.callWellKnown(&entry, .entry_key, &.{}, ctx.out)) orelse
+                    return typeErr(try fmt(a, "{s}: an entry has no key", .{who}))) {
+                    .ok => |v| v,
+                    .err => |e| return .{ .err = e },
+                };
+                runtime.keepalivePush(k);
+                const v = switch ((try ctx.host.callWellKnown(&entry, .entry_value, &.{}, ctx.out)) orelse
+                    return typeErr(try fmt(a, "{s}: an entry has no value", .{who}))) {
+                    .ok => |x| x,
+                    .err => |e| return .{ .err = e },
+                };
+                break :blk .{ k, v };
+            },
+        };
+        runtime.keepalivePush(val);
+        switch (try putEntry(ctx, entries, key, val)) {
+            .prev => |p| if (p) |old| if (runtime.reclaimEnabled()) old.release(a),
+            .thrown => |e| return e,
+        }
+    }
+}
+
+/// Puts every entry of map `src` into map `entries`, as `HashMap.putMapEntries` does: the
+/// source's entries where they stand, each put through the keys' `hashCode()` and `equals`.
+fn putAllOf(ctx: *CallCtx, entries: MapEntries, src: MapEntries) Error!EvalResult {
+    const a = ctx.allocator;
+    var walk = runtime.MapWalk.init(src);
+    const mark = runtime.keepaliveMark();
+    defer runtime.keepaliveRestore(mark);
+    while (true) {
+        var one = [1]MapPair{switch (walk.next()) {
+            .pair => |p| p,
+            .end => return ok(Value.Unit),
+            .changed => return try thrown(a, "kotlin.ConcurrentModificationException", null),
+        }};
+        runtime.keepaliveRestore(mark);
+        runtime.keepalivePushPairs(&one);
+        switch (try putEntry(ctx, entries, one[0].key, one[0].value)) {
+            .prev => |p| if (p) |old| if (runtime.reclaimEnabled()) old.release(a),
+            .thrown => |e| return e,
+        }
+    }
+}
+
 pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     if (try readOnlyMutationGuard(ctx.allocator, ctx.args)) |e| return e;
     const a = ctx.allocator;
@@ -902,7 +1048,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
             one[0] = .{ .key = p.first.asPtrConst().*, .value = p.second.asPtrConst().* };
             to_add = one;
         },
-        .Map => |m| to_add = try snapshotEntries(a, m.entries),
+        .Map => |m| return putAllOf(ctx, entries, m.entries),
         .Array => |arr| to_add = (switch (try pairsFromValues(a, try arr.snapshot(a), "putAll")) {
             .entries => |x| x,
             .err => |e| return e,
@@ -911,7 +1057,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
             .entries => |x| x,
             .err => |e| return e,
         }).items,
-        .Set => |s| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, s.items), "putAll")) {
+        .Set => |s| to_add = (switch (try pairsFromValues(a, try snapshotItems(a, s.dense()), "putAll")) {
             .entries => |x| x,
             .err => |e| return e,
         }).items,
@@ -925,29 +1071,19 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
                 .err => |e| return e,
             }).items;
         },
-        // An Instance is either a user `Map`, drained through `entries`, or an
+        // An Instance is either a user `Map`, walked through `entries`, or an
         // `Iterable<Pair>` with no `entries` property, which is what
         // `MutableMap.putAll(pairs: Iterable<Pair>)` passes.
         .Instance => {
-            const is_map = blk: {
-                const er = (try ctx.host.callWellKnown(&arg, .entries, &.{}, ctx.out)) orelse break :blk false;
-                break :blk er == .ok;
+            if (try putUserMap(ctx, entries, arg, "putAll")) |r| return r;
+            const its = switch (try iterableItemsCtx(ctx, arg, "putAll")) {
+                .items => |x| x,
+                .err => |e| return e,
             };
-            if (is_map) {
-                to_add = switch (try userMapPairs(ctx, arg, "putAll")) {
-                    .entries => |x| x,
-                    .err => |e| return e,
-                };
-            } else {
-                const its = switch (try iterableItemsCtx(ctx, arg, "putAll")) {
-                    .items => |x| x,
-                    .err => |e| return e,
-                };
-                to_add = (switch (try pairsFromValues(ctx.allocator, its, "putAll")) {
-                    .entries => |x| x,
-                    .err => |e| return e,
-                }).items;
-            }
+            to_add = (switch (try pairsFromValues(ctx.allocator, its, "putAll")) {
+                .entries => |x| x,
+                .err => |e| return e,
+            }).items;
         },
         else => return typeErr("putAll requires a Map or a collection of Pairs"),
     }

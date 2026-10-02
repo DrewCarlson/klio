@@ -220,6 +220,15 @@ pub fn resumeRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out
     return ir.eval.resumeContinuation(VmHost, self.allocator, module, state, value, &host);
 }
 
+/// `resumeRaw` through `ir.eval.resumeSingleLive`, its result written to `result`: false,
+/// having done nothing, unless `state` is one live activation resumed with a plain value.
+pub fn resumeSingleRaw(self: *VmIntrinsicHost, state: *SuspendState, value: Value, out: Output, result: *RawResult) Allocator.Error!bool {
+    const module_g = self.module.borrow();
+    defer module_g.deinit();
+    var host = vmHost(self, out);
+    return ir.eval.resumeSingleLive(VmHost, self.allocator, state, value, &host, result);
+}
+
 const coroutines = @import("coroutines.zig");
 
 pub fn runBlocking(self: *VmIntrinsicHost, block: *const Value, scope: *const Value, out: Output) Allocator.Error!RuntimeEvalResult {
@@ -391,20 +400,10 @@ fn invokeResolvedClosure(self: *VmIntrinsicHost, callable: *const Value, this_va
         const msg = try std.fmt.allocPrint(self.allocator, "closure of {s} takes {d} arguments, called with {d}", .{ body.func.fqn, body.arity(), given });
         return .{ .err = .{ .Type = msg } };
     }
-    var params: std.ArrayList(Value) = .empty;
-    var caps: std.ArrayList(Value) = .empty;
-    {
-        const g = callable.IrClosure.borrow();
-        defer g.deinit();
-        const closure_caps = g.get().captures;
-        switch (body.kind) {
-            .property_ref => |p| if (p.bound and closure_caps.len != 0) try params.append(self.allocator, closure_caps[0]),
-            else => try caps.appendSlice(self.allocator, closure_caps),
-        }
-    }
-    if (this_value) |t| try params.append(self.allocator, t.*);
-    try params.appendSlice(self.allocator, args);
-    const result = try ir.eval.evalClosure(VmHost, self.allocator, body.module, body.owning, body.func, params, caps, callable.IrClosure, &host);
+    var buf: [8]Value = undefined;
+    const call = try vmhost.host_resolved.closureCall(self.allocator, &buf, callable, body, this_value, args);
+    defer if (call.params.ptr != @as([*]Value, &buf)) self.allocator.free(call.params);
+    const result = try ir.eval.evalSlices(VmHost, self.allocator, body.module, body.owning, body.func, call.params, call.captures, callable.IrClosure, &host);
     return flattenEval(result);
 }
 

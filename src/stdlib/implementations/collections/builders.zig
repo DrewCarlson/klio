@@ -1,6 +1,7 @@
 //! Array constructors and the collection builder intrinsics.
 
 const std = @import("std");
+const hashing = @import("hashing.zig");
 const runtime = @import("runtime");
 const CallCtx = runtime.CallCtx;
 const EvalResult = runtime.EvalResult;
@@ -43,10 +44,10 @@ const snapshotEntries = common_mod.snapshotEntries;
 const snapshotItems = common_mod.snapshotItems;
 const thrown = common_mod.thrown;
 const typeErr = common_mod.typeErr;
+const map_mod = @import("map.zig");
 
 const list_transforms_mod = @import("list_transforms.zig");
 const sortListHostAware = list_transforms_mod.sortListHostAware;
-const userMapPairs = list_transforms_mod.userMapPairs;
 
 fn arrayLen(recv: Value) ?usize {
     return switch (recv) {
@@ -346,7 +347,7 @@ fn arrayRecvItems(a: Allocator, ctx: *CallCtx, who: []const u8) Error!ItemsOutco
         switch (ctx.args[0]) {
             .Array => |arr| return .{ .items = try arr.snapshot(a) },
             .List => |l| return .{ .items = try snapshotItems(a, l.items) },
-            .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
+            .Set => |s| return .{ .items = try snapshotItems(a, s.dense()) },
             else => {},
         }
     }
@@ -486,10 +487,10 @@ pub fn coll_empty_list(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_set_of(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return ok(try sharedEmptySet(ctx.allocator));
-    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, false));
+    return try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, false);
 }
 pub fn coll_mutable_set_of(ctx: *CallCtx) Error!EvalResult {
-    return ok(try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, true));
+    return try makeSetH(ctx.host, ctx.out, ctx.allocator, ctx.args, true);
 }
 pub fn coll_empty_set(ctx: *CallCtx) Error!EvalResult {
     return ok(try sharedEmptySet(ctx.allocator));
@@ -509,8 +510,10 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
 
 fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
     var out: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     for (entries.items) |kv| {
-        if (findKeyIndexBoxed(out.items, &kv.key)) |i| {
+        if (try hashing.findQuiet(&keys, null, undefined, a, out.items, &kv.key)) |i| {
             out.items[i].value = kv.value;
         } else {
             try out.append(a, kv);
@@ -521,8 +524,10 @@ fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.Arr
 
 fn dedupeMapInPlaceH(host: IntrinsicHost, out_w: Output, a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
     var out: std.ArrayList(MapPair) = .empty;
+    var keys: hashing.KeyIndex = .{};
+    defer keys.deinit(a);
     for (entries.items) |kv| {
-        if (try findKeyIndexBoxedH(host, out_w, out.items, &kv.key)) |i| {
+        if (try hashing.findQuiet(&keys, host, out_w, a, out.items, &kv.key)) |i| {
             out.items[i].value = kv.value;
         } else {
             try out.append(a, kv);
@@ -545,7 +550,7 @@ pub fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutco
     const a = ctx.allocator;
     switch (value) {
         .List => |l| return .{ .items = try snapshotItems(a, l.items) },
-        .Set => |s| return .{ .items = try snapshotItems(a, s.items) },
+        .Set => |s| return .{ .items = try snapshotItems(a, s.dense()) },
         else => {},
     }
     const keepalive = runtime.keepaliveMark();
@@ -638,22 +643,8 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
 }
 
 pub fn sortMapByKey(a: Allocator, entries: []MapPair, descending: bool) Error!?EvalResult {
-    var i: usize = 1;
-    while (i < entries.len) : (i += 1) {
-        var j = i;
-        while (j > 0) {
-            const o = switch (try compareValues(a, entries[j - 1].key, entries[j].key)) {
-                .order => |o| o,
-                .err => |e| return e,
-            };
-            const flipped = if (descending) reverseOrder(o) else o;
-            if (flipped == .gt) {
-                std.mem.swap(MapPair, &entries[j - 1], &entries[j]);
-                j -= 1;
-            } else break;
-        }
-    }
-    return null;
+    const by = common_mod.NaturalOrder{ .a = a, .descending = descending };
+    return runtime.stableSort(MapPair, EvalResult, a, entries, by, common_mod.NaturalOrder.cmpKeys);
 }
 
 pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
@@ -675,7 +666,7 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
                     return ok(try makeListFromArrayList(a, list, true));
                 },
                 .List => |l| return ok(try makeListVL(a, l.items, true)),
-                .Set => |s| return ok(try makeListVL(a, s.items, true)),
+                .Set => |s| return ok(try makeListVL(a, s.dense(), true)),
                 .Array => |arr| {
                     var list: std.ArrayList(Value) = .empty;
                     const n = arr.len();
@@ -706,14 +697,17 @@ pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0) return ok(try makeMap(a, &.{}, true));
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
-        return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
+        return ok(try common_mod.copyMap(a, ctx.args[0].Map.entries, true));
     }
-    // An interpreted Map implementation copies through its `entries` view.
+    // A user Map's entries, put in as its `entries` view's iterator gives them.
     if (ctx.args.len == 1 and ctx.args[0] == .Instance) {
-        switch (try userMapPairs(ctx, ctx.args[0], "HashMap")) {
-            .entries => |pairs| return ok(try makeMap(a, pairs, true)),
-            .err => |e| return e,
-        }
+        const out = try makeMap(a, &.{}, true);
+        const mark = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(mark);
+        runtime.keepalivePush(out);
+        const r = (try map_mod.putUserMap(ctx, out.Map.entries, ctx.args[0], "HashMap")) orelse
+            return typeErr("HashMap requires a Map");
+        return if (r == .err) r else ok(out);
     }
     if (ctx.args[0] == .Int) {
         // A negative capacity or a non-positive load factor is a catchable
@@ -765,9 +759,9 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
                 .List => |l| {
                     const items = try snapshotItems(a, l.items);
                     defer if (runtime.freeScratch()) a.free(items);
-                    return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
+                    return try makeSetH(ctx.host, ctx.out, a, items, true);
                 },
-                .Set => |s| return ok(try makeSetVL(a, s.items, true)),
+                .Set => |s| return ok(try makeSetVL(a, s.dense(), true)),
                 .Instance => {
                     const items = switch (try materialiseIterableInstance(ctx, arg)) {
                         .items => |x| x,

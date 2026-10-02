@@ -131,11 +131,13 @@ pub const dumpFnIfRequested = ev_enter.dumpFnIfRequested;
 pub const evalWithCaptures = ev_enter.evalWithCaptures;
 pub const evalWithCapturesIn = ev_enter.evalWithCapturesIn;
 pub const evalClosure = ev_enter.evalClosure;
+pub const evalSlices = ev_enter.evalSlices;
 
 const ev_activation = @import("eval/activation.zig");
 
 pub const takeInFlightSuspend = ev_activation.takeInFlightSuspend;
 pub const resumeContinuation = ev_activation.resumeContinuation;
+pub const resumeSingleLive = ev_activation.resumeSingleLive;
 
 
 

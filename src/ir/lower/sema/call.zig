@@ -1209,12 +1209,16 @@ pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
         try b.emit(.{ .Move = .{ .dst = r.*, .src = try b.emitConst(.{ .Int = 0 }) } });
     }
     // An actual's defaults are its expect's expressions, which name the
-    // expect's parameters and, in an expect class, its `this`.
+    // expect's parameters and, in an expect class, its `this`, and an
+    // extension's its receiver.
     const expect = expectOf(s, target);
     const expect_params: []const Sym = if (expect != .none) s.syms.functionInfo(expect).params else &.{};
     if (expect != .none) {
         const ecls = s.syms.owner(expect);
         if (this_reg) |t| if (s.syms.kind(ecls) == .class) try env.bindReceiver(b, env.thisKind(s, ecls), ecls, t);
+        if (s.syms.functionInfo(expect).receiver != .none and s.syms.functionInfo(target).receiver != .none) {
+            try env.bindReceiver(b, .extension, expect, try env.receiver(b, .extension, target));
+        }
     }
     for (params, 0..) |p, i| {
         const given = try loadParam(b, lay.valueStart() + @as(u16, @intCast(i)));

@@ -2,14 +2,14 @@
  * KLIO actuals for the stdlib commonTest infrastructure. These satisfy the
  * `expect` declarations in `kotlin/libraries/stdlib/test/testUtils.kt` so the
  * common test sources resolve and run through `klio test`. KLIO is reported as
- * `Native`: it is a from-scratch interpreter with no JVM/JS host facilities, so
- * the JVM/Native-gated common behavior runs and the JS/Wasm-specific gates skip.
+ * `Jvm`: it runs Kotlin as kotlinc's JVM output does, so the tests hold it to
+ * the JVM's behavior where platforms differ.
  */
 package test
 
 import kotlin.test.assertEquals
 
-actual val TestPlatform.Companion.current: TestPlatform get() = TestPlatform.Native
+actual val TestPlatform.Companion.current: TestPlatform get() = TestPlatform.Jvm
 
 /** Asserts that two values have the same runtime type (or are both null). The
  *  platform `testUtils` actuals compare host class objects; KLIO compares the
