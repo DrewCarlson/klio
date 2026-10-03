@@ -216,6 +216,22 @@ const Image = struct {
 /// (`Front.driver`). What a program may ask of the base's declarations is
 /// asked first (`base_sema.complete`). The result is owned by `gpa`.
 pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const bridge.Bridge, lowered: *const std.DynamicBitSetUnmanaged, prefix: u32, map: *const span.SourceMap, n_sources: usize, driver: []const u8) ![]u8 {
+    var out = codec.Stream.init(gpa);
+    defer out.deinit();
+    try encodeInto(&out, gpa, scratch, s, br, lowered, prefix, map, n_sources, driver);
+    return out.toOwnedSlice();
+}
+
+/// `encode` into `sink`, a file say: of the image only the bodies' section
+/// is held whole in memory. `error.SinkFailed` when a write to it failed.
+pub fn encodeTo(sink: codec.Sink, gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const bridge.Bridge, lowered: *const std.DynamicBitSetUnmanaged, prefix: u32, map: *const span.SourceMap, n_sources: usize, driver: []const u8) !void {
+    var out = codec.Stream.initTo(gpa, sink);
+    defer out.deinit();
+    try encodeInto(&out, gpa, scratch, s, br, lowered, prefix, map, n_sources, driver);
+    try out.finish();
+}
+
+fn encodeInto(out: *codec.Stream, gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const bridge.Bridge, lowered: *const std.DynamicBitSetUnmanaged, prefix: u32, map: *const span.SourceMap, n_sources: usize, driver: []const u8) !void {
     const m = br.m;
     var lowered_ids: std.ArrayList(u32) = .empty;
     var lit = lowered.iterator(.{});
@@ -225,12 +241,12 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
     var section = codec.Stream.init(gpa);
     defer section.deinit();
     const funcs = try scratch.alloc(ir.Func, m.funcs.items.len);
-    for (m.funcs.items, funcs) |*f, *out| {
-        out.* = f.*;
-        out.deferred_offset = 0;
+    for (m.funcs.items, funcs) |*f, *copy| {
+        copy.* = f.*;
+        copy.deferred_offset = 0;
         if (f.blocks.len == 0) continue;
-        out.deferred_offset = @intCast(try section.value([]ir.Block, &f.blocks) + 1);
-        out.blocks = &.{};
+        copy.deferred_offset = @intCast(try section.value([]ir.Block, &f.blocks) + 1);
+        copy.blocks = &.{};
     }
     var dispatch: std.ArrayList(KV(u64, FuncId)) = .empty;
     var it = m.method_dispatch.iterator();
@@ -257,9 +273,7 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
     };
     const fr: Front = .{ .sources = try base_sema.sources(scratch, map, n_sources), .driver = driver };
     // The image is written once, its header filled in when the lengths are
-    // known: the body section is most of it.
-    var out = codec.Stream.init(gpa);
-    defer out.deinit();
+    // known.
     try out.ensureUnusedCapacity(section.len() + section.len() / 2);
     try out.raw(magic);
     const hdr_at = out.len();
@@ -274,8 +288,7 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
         .digest = s.prefixDigest(prefix),
         .len = out.len(),
     };
-    @memcpy(out.bytes()[hdr_at..][0..@sizeOf(Header)], std.mem.asBytes(&hdr));
-    return out.toOwnedSlice();
+    out.patch(hdr_at, std.mem.asBytes(&hdr));
 }
 
 fn bridgeImage(a: Allocator, br: *const bridge.Bridge) !BridgeImage {

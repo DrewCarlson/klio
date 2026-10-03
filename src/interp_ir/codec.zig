@@ -140,6 +140,16 @@ const Encoder = struct {
     node_count: u32 = 0,
     slices: std.AutoHashMap(SliceKey, u32),
     slice_count: u32 = 0,
+    /// Where the bytes go once `out` is full, in place of growing it
+    /// (`Stream.initTo`); `spilled` of them are there.
+    sink: ?Sink = null,
+    spilled: usize = 0,
+    /// The first write to the sink that failed, which `Stream.finish`
+    /// reports; nothing is written after it.
+    sink_error: ?anyerror = null,
+
+    /// The most a stream with a sink holds in memory.
+    const spill_len: usize = 1024 * 1024;
 
     fn init(gpa: Allocator) Encoder {
         return .{
@@ -166,11 +176,40 @@ const Encoder = struct {
     }
 
     fn byte(self: *Encoder, b: u8) Allocator.Error!void {
-        try self.out.append(self.gpa, b);
+        if (self.out.items.len == self.out.capacity) try self.room(1);
+        self.out.appendAssumeCapacity(b);
     }
 
     fn bytes(self: *Encoder, b: []const u8) Allocator.Error!void {
-        try self.out.appendSlice(self.gpa, b);
+        if (self.out.capacity - self.out.items.len < b.len) {
+            try self.room(b.len);
+            // With a sink, a run longer than the buffer goes there as it is.
+            if (self.out.capacity - self.out.items.len < b.len) return self.put(b);
+        }
+        self.out.appendSliceAssumeCapacity(b);
+    }
+
+    /// Room for `n` more bytes: the buffer moved to the sink when there is
+    /// one, else grown.
+    fn room(self: *Encoder, n: usize) Allocator.Error!void {
+        if (self.sink == null) return self.out.ensureUnusedCapacity(self.gpa, n);
+        self.put(self.out.items);
+        self.out.clearRetainingCapacity();
+        if (self.out.capacity < spill_len) try self.out.ensureTotalCapacityPrecise(self.gpa, spill_len);
+    }
+
+    /// Writes `b` to the sink after what it holds.
+    fn put(self: *Encoder, b: []const u8) void {
+        self.putAt(self.spilled, b);
+        self.spilled += b.len;
+    }
+
+    fn putAt(self: *Encoder, at: usize, b: []const u8) void {
+        if (b.len == 0 or self.sink_error != null) return;
+        const sink = self.sink.?;
+        sink.writeAt(sink.ctx, at, b) catch |err| {
+            self.sink_error = err;
+        };
     }
 
     fn varint(self: *Encoder, value: u64) Allocator.Error!void {
@@ -583,6 +622,15 @@ const TestTag = union(enum) {
 /// the bytes `encodeBytes` gives for each, back to back, with raw bytes
 /// between them as the caller writes them. A file of several sections is
 /// written once, not encoded section by section and then copied together.
+/// Where a `Stream` puts what it has encoded once its buffer is full, in
+/// place of growing the buffer: a file, say. `writeAt` writes `bytes` at
+/// `offset`; a stream writes each byte once, in order, except those
+/// `Stream.patch` writes again.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    writeAt: *const fn (ctx: *anyopaque, offset: u64, bytes: []const u8) anyerror!void,
+};
+
 pub const Stream = struct {
     e: Encoder,
 
@@ -590,21 +638,56 @@ pub const Stream = struct {
         return .{ .e = Encoder.init(gpa) };
     }
 
+    /// A stream that holds at most a megabyte, putting the rest into
+    /// `sink`; `finish` puts the last of it.
+    pub fn initTo(gpa: Allocator, sink: Sink) Stream {
+        var e = Encoder.init(gpa);
+        e.sink = sink;
+        return .{ .e = e };
+    }
+
     pub fn deinit(self: *Stream) void {
         self.e.deinit();
     }
 
     pub fn len(self: *const Stream) usize {
-        return self.e.out.items.len;
+        return self.e.spilled + self.e.out.items.len;
     }
 
-    /// The bytes so far, to patch a header written ahead of what it counts.
+    /// The bytes so far, of a stream without a sink.
     pub fn bytes(self: *Stream) []u8 {
+        std.debug.assert(self.e.sink == null);
         return self.e.out.items;
     }
 
+    /// Writes `b` over the bytes at `at`, written before: a header filled
+    /// in once what it counts is known.
+    pub fn patch(self: *Stream, at: usize, b: []const u8) void {
+        const held = self.e.spilled;
+        if (at >= held) {
+            @memcpy(self.e.out.items[at - held ..][0..b.len], b);
+            return;
+        }
+        const n = @min(b.len, held - at);
+        self.e.putAt(at, b[0..n]);
+        @memcpy(self.e.out.items[0 .. b.len - n], b[n..]);
+    }
+
     pub fn ensureUnusedCapacity(self: *Stream, n: usize) Allocator.Error!void {
+        if (self.e.sink != null) return;
         try self.e.out.ensureUnusedCapacity(self.e.gpa, n);
+    }
+
+    /// Puts what the stream holds into its sink. `error.SinkFailed` when a
+    /// write to it failed (`sinkError` says why).
+    pub fn finish(self: *Stream) error{SinkFailed}!void {
+        self.e.put(self.e.out.items);
+        self.e.out.clearRetainingCapacity();
+        if (self.e.sink_error != null) return error.SinkFailed;
+    }
+
+    pub fn sinkError(self: *const Stream) ?anyerror {
+        return self.e.sink_error;
     }
 
     pub fn raw(self: *Stream, b: []const u8) Allocator.Error!void {
@@ -616,7 +699,7 @@ pub const Stream = struct {
         self.e.resetRegistry();
         // What `toCodec` made for the previous value is keyed by nothing now.
         if (self.e.images) |*arena| _ = arena.reset(.retain_capacity);
-        const start = self.e.out.items.len;
+        const start = self.len();
         try encodeValue(T, &self.e, v);
         return start;
     }
@@ -963,6 +1046,51 @@ test "a growable list decodes with room to grow" {
     const before = l.items.ptr;
     try l.append(a, 1);
     try testing.expect(l.items.ptr == before);
+}
+
+test "a stream into a sink writes what a stream in memory holds, patches included" {
+    const A = struct { ids: []const u32, name: []const u8 };
+    var many: [300_000]u32 = undefined;
+    for (&many, 0..) |*v, i| v.* = @intCast(i * 7919);
+    const x: A = .{ .ids = &many, .name = "x" };
+    const File = struct {
+        data: std.ArrayList(u8) = .empty,
+        fail_at: usize = std.math.maxInt(usize),
+        fn writeAt(ctx: *anyopaque, offset: u64, b: []const u8) anyerror!void {
+            const f: *@This() = @ptrCast(@alignCast(ctx));
+            const end: usize = @intCast(offset + b.len);
+            if (end > f.fail_at) return error.NoSpaceLeft;
+            if (f.data.items.len < end) try f.data.appendNTimes(testing.allocator, 0, end - f.data.items.len);
+            @memcpy(f.data.items[@intCast(offset)..end], b);
+        }
+    };
+    var mem = Stream.init(testing.allocator);
+    defer mem.deinit();
+    var file: File = .{};
+    defer file.data.deinit(testing.allocator);
+    var to = Stream.initTo(testing.allocator, .{ .ctx = &file, .writeAt = File.writeAt });
+    defer to.deinit();
+    for ([_]*Stream{ &mem, &to }) |st| {
+        try st.raw("hd....");
+        _ = try st.value(A, &x);
+        try st.raw(&@as([3 * Encoder.spill_len]u8, @splat(0x5A)));
+        _ = try st.value(A, &x);
+        // Written long after the first megabyte went to the sink.
+        st.patch(2, "ok");
+    }
+    try testing.expect(to.e.spilled > Encoder.spill_len);
+    try testing.expectEqual(mem.len(), to.len());
+    try to.finish();
+    try testing.expectEqualSlices(u8, mem.bytes(), file.data.items);
+
+    // A write that fails is reported when the stream ends.
+    var short: File = .{ .fail_at = Encoder.spill_len / 2 };
+    defer short.data.deinit(testing.allocator);
+    var broken = Stream.initTo(testing.allocator, .{ .ctx = &short, .writeAt = File.writeAt });
+    defer broken.deinit();
+    _ = try broken.value(A, &x);
+    try testing.expectError(error.SinkFailed, broken.finish());
+    try testing.expectEqual(@as(?anyerror, error.NoSpaceLeft), broken.sinkError());
 }
 
 test "a stream holds each value as encodeBytes encodes it, back to back" {

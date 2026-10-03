@@ -722,6 +722,11 @@ const Build = struct {
     /// Marks every declaration that gets an id and resolves the headers
     /// allocation reads, until resolving makes no new symbol.
     fn prepare(b: *Build) Error!void {
+        // Resolving the headers works in sema's scratch, emptied after each
+        // declaration: what it keeps goes to sema's own tables.
+        const opened = !b.s.scratch_open;
+        if (opened) b.s.openScratch();
+        defer if (opened) b.s.closeScratch();
         while (true) {
             const n0: u32 = @intCast(b.s.syms.count());
             try b.growBits(n0);
@@ -735,6 +740,7 @@ const Build = struct {
                 const sym = Sym.from(i);
                 if (!b.global.isSet(i) and !b.local.isSet(i)) continue;
                 try b.resolveHeader(sym);
+                b.s.resetScratch();
             }
             if (b.s.syms.count() == n0) break;
         }

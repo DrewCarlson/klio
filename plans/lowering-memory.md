@@ -129,6 +129,26 @@ Then the parse ahead of all of it:
   in source order, as a whole parse numbers it: a bake from pieces and one
   from whole files now give the same image byte for byte.
 
+Then where a bake peaks, in its image's encode: the image was encoded into
+one buffer, grown by doubling to 75 MB for its 54 MB (on macOS a grown
+buffer is a copy, so for a moment both), and then only written to the
+cache file and mapped back.
+
+- `codec.Stream` takes a sink (`Stream.initTo`): once its buffer holds a
+  megabyte it writes the buffer there, and a header is patched in place
+  (`Stream.patch`). A bake writes its image into the cache's temporary
+  file as it encodes it (`sema_base_cache.Writing`), renamed into place
+  when whole; the image is byte for byte the one encoded in memory.
+- The bridge resolves the headers it asks for (a class's supertypes, a
+  member's overrides) in sema's scratch, emptied after each declaration:
+  outside `resolveAll` sema's scratch is its arena, so their working data
+  stayed for good.
+
+| | peak RSS |
+|---|---:|
+| bake compose_material3 | 946 MB to 817 MB |
+| cold compose_material3 | 664 MB to 635 MB |
+
 ## Next
 
 - Register compaction is a third of lowering now: liveness, interference

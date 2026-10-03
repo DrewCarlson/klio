@@ -657,13 +657,16 @@ fn overImage(arena: Allocator, map: *span.SourceMap, scan_map: *const span.Sourc
 }
 
 /// Parses, analyzes, lowers and bakes the base on the build heap
-/// (`runtime.slab.buildHeap`), writes the image to the cache under `key`,
-/// and drops the heap: nothing of the build outlives the bake but the
-/// image. The image as the cache maps it, else its bytes on the process
-/// heap when the cache cannot keep it.
+/// (`runtime.slab.buildHeap`), writes the image to the cache under `key`
+/// as it is encoded, and drops the heap: nothing of the build outlives the
+/// bake but the image. The image as the cache maps it; its bytes on the
+/// process heap when there is no cache directory; null, for the base to be
+/// analyzed without an image, when the cache could not be written.
 fn bakeOnOwnHeap(arena: Allocator, stdlib_files: []const pack.schema.SourceFile, actuals: []const BaseFile, scanned: *const std.ArrayList(sema.SourceFile), opts: LoadOptions, key: [16]u8) !?Found {
     const gpa = std.heap.smp_allocator;
-    const bytes = blk: {
+    const cache_path = sema_base_cache.pathFor(arena, key);
+    const writing: ?*sema_base_cache.Writing = if (cache_path) |p| sema_base_cache.Writing.begin(arena, p) catch return null else null;
+    const bytes: ?[]u8 = blk: {
         const heap = runtime.slab.buildHeap();
         defer runtime.slab.releaseAll(heap);
         const ba = heap.allocator();
@@ -690,22 +693,30 @@ fn bakeOnOwnHeap(arena: Allocator, stdlib_files: []const pack.schema.SourceFile,
         files.shrinkRetainingCapacity(n_stdlib);
         try files.appendSlice(ba, serial.packs);
         var t = lower_driver.pipeline.Timing.start();
-        const baked = try lower_driver.pipeline.bakeBase(ba, gpa, files.items, hostBinding(gpa), map, try serial.record(ba));
+        const record = try serial.record(ba);
+        if (writing) |w| {
+            lower_driver.pipeline.bakeBaseTo(w.sink(), ba, gpa, files.items, hostBinding(gpa), map, record) catch |e| {
+                w.abort();
+                if (e == error.SinkFailed) return null;
+                return e;
+            };
+            t.mark("bake base image");
+            break :blk null;
+        }
+        const baked = try lower_driver.pipeline.bakeBase(ba, gpa, files.items, hostBinding(gpa), map, record);
         t.mark("bake base image");
         break :blk baked;
     };
-    if (sema_base_cache.pathFor(arena, key)) |path| {
-        sema_base_cache.write(arena, path, bytes);
-        if (try cachedImage(arena, key)) |found| {
-            gpa.free(bytes);
-            return found;
-        }
+    if (writing) |w| {
+        w.commit() catch return null;
+        sema_base_cache.pruneFor(arena, cache_path.?);
+        return cachedImage(arena, key);
     }
-    const fr = lower_driver.pipeline.base_image.front(arena, bytes) catch |e| switch (e) {
+    const fr = lower_driver.pipeline.base_image.front(arena, bytes.?) catch |e| switch (e) {
         error.OutOfMemory => return e,
         else => return null,
     };
-    return .{ .bytes = bytes, .front = fr };
+    return .{ .bytes = bytes.?, .front = fr };
 }
 
 /// The cached image of the base `key` names, when the cache has one this

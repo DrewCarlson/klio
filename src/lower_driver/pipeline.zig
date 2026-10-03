@@ -12,6 +12,7 @@ const interp_ir = @import("interp_ir");
 const Allocator = std.mem.Allocator;
 const bridge = ir.bridge;
 const lower = ir.lower_sema;
+const codec = interp_ir.codec;
 pub const base_image = @import("base_image.zig");
 pub const base_sema = @import("base_sema.zig");
 
@@ -84,6 +85,21 @@ pub fn build(a: Allocator, src: Sources, binding: Binding) !Built {
 /// base's files of `map` and the driver's own `record`. Owned by
 /// `gpa`; `a` holds the build and can be dropped after.
 pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, binding: Binding, map: *const span.SourceMap, record: []const u8) ![]u8 {
+    const b = try bakeBuild(a, base, binding);
+    return base_image.encode(gpa, a, b.s, b.br, &b.lowered, b.prefix, map, sourceCount(base), record);
+}
+
+/// `bakeBase` with the image written into `sink` as it is encoded
+/// (`base_image.encodeTo`).
+pub fn bakeBaseTo(sink: codec.Sink, a: Allocator, gpa: Allocator, base: []const sema.SourceFile, binding: Binding, map: *const span.SourceMap, record: []const u8) !void {
+    const b = try bakeBuild(a, base, binding);
+    return base_image.encodeTo(sink, gpa, a, b.s, b.br, &b.lowered, b.prefix, map, sourceCount(base), record);
+}
+
+const Baked = struct { s: *sema.Sema, br: *bridge.Bridge, lowered: std.DynamicBitSetUnmanaged, prefix: u32 };
+
+/// Analyzes and lowers the base for its image, in `a`.
+fn bakeBuild(a: Allocator, base: []const sema.SourceFile, binding: Binding) !Baked {
     var t = Timing.start();
     const s = try sema.Sema.init(a);
     try s.addFiles(base);
@@ -107,7 +123,7 @@ pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, bin
         const syms = &s.syms;
         std.debug.print("[sema-timing] bake: {d} symbols ({d} declared; {d} functions, {d} properties, {d} params, {d} locals, {d} classes), {d} types, {d} names\n", .{ syms.count(), prefix, syms.functions.items.len, syms.properties.items.len, syms.params.items.len, syms.locals.items.len, syms.classes.items.len, s.types.items.items.len, s.names.strs.items.len });
     }
-    return base_image.encode(gpa, a, s, br, &prog.lowered, prefix, map, sourceCount(base), record);
+    return .{ .s = s, .br = br, .lowered = prog.lowered, .prefix = prefix };
 }
 
 /// How many files of the source map the base's are: they are registered

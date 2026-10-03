@@ -18,6 +18,7 @@ const lower_driver = @import("lower_driver");
 
 const Allocator = std.mem.Allocator;
 const base_image = lower_driver.pipeline.base_image;
+const codec = @import("interp_ir").codec;
 
 /// Whether the environment turns the base image off.
 pub fn disabled() bool {
@@ -124,9 +125,65 @@ fn shippedPath(a: Allocator, name: []const u8) ?[]const u8 {
 /// (`prune`). A cache that cannot be written is only slower.
 pub fn write(a: Allocator, path: []const u8, bytes: []const u8) void {
     writeOrFail(a, path, bytes) catch return;
+    pruneFor(a, path);
+}
+
+/// Keeps the cache the image at `path` is in to its size, never evicting
+/// that image (`prune`).
+pub fn pruneFor(a: Allocator, path: []const u8) void {
     const dir = std.fs.path.dirname(path) orelse return;
     prune(a, dir, std.fs.path.basename(path), budget());
 }
+
+/// An image written as it is encoded (`sink`) into a temporary file beside
+/// `path`, which `commit` renames into place: a reader never sees half of
+/// one.
+pub const Writing = struct {
+    threaded: std.Io.Threaded,
+    file: std.Io.File,
+    tmp: []const u8,
+    path: []const u8,
+
+    pub fn begin(a: Allocator, path: []const u8) !*Writing {
+        const w = try a.create(Writing);
+        w.threaded = .init(a, .{});
+        errdefer w.threaded.deinit();
+        const pid = runtime.platform.processId();
+        w.tmp = try std.fmt.allocPrint(a, "{s}.tmp-{x}", .{ path, runtime.clockMonotonicNanos() ^ (pid << 32) });
+        w.path = path;
+        w.file = try std.Io.Dir.cwd().createFile(w.threaded.io(), w.tmp, .{});
+        return w;
+    }
+
+    pub fn sink(self: *Writing) codec.Sink {
+        return .{ .ctx = self, .writeAt = writeAt };
+    }
+
+    fn writeAt(ctx: *anyopaque, offset: u64, bytes: []const u8) anyerror!void {
+        const self: *Writing = @ptrCast(@alignCast(ctx));
+        try self.file.writePositionalAll(self.threaded.io(), bytes, offset);
+    }
+
+    /// Puts the image at its path.
+    pub fn commit(self: *Writing) !void {
+        const io = self.threaded.io();
+        defer self.threaded.deinit();
+        self.file.close(io);
+        const cwd = std.Io.Dir.cwd();
+        cwd.rename(self.tmp, cwd, self.path, io) catch |e| {
+            cwd.deleteFile(io, self.tmp) catch {};
+            return e;
+        };
+    }
+
+    /// Drops what was written.
+    pub fn abort(self: *Writing) void {
+        const io = self.threaded.io();
+        self.file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, self.tmp) catch {};
+        self.threaded.deinit();
+    }
+};
 
 /// The cache's size: `KLIO_CACHE_MAX_MB` megabytes, else 1 GiB.
 fn budget() u64 {
@@ -249,4 +306,39 @@ test "a pruned cache keeps within its size, the newest images and the one just w
     _ = try tmp.dir.statFile(io, "sema-base-c.klio-sema", .{});
     try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "stdlib-x.klio-image", .{}));
     _ = try tmp.dir.statFile(io, "notes.txt", .{});
+}
+
+test "an image written as it is encoded appears at its path only once committed" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", arena.allocator());
+    const path = try std.fs.path.join(arena.allocator(), &.{ dir_path, "sema-base-k.klio-sema" });
+
+    const w = try Writing.begin(arena.allocator(), path);
+    const sink = w.sink();
+    try sink.writeAt(sink.ctx, 0, "head....");
+    try sink.writeAt(sink.ctx, 8, "body");
+    // A header filled in last.
+    try sink.writeAt(sink.ctx, 4, "1234");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "sema-base-k.klio-sema", .{}));
+    try w.commit();
+    const got = try tmp.dir.readFileAlloc(io, "sema-base-k.klio-sema", a, .limited(64));
+    defer a.free(got);
+    try std.testing.expectEqualStrings("head1234body", got);
+
+    // An abandoned image leaves nothing behind.
+    const dropped = try Writing.begin(arena.allocator(), try std.fs.path.join(arena.allocator(), &.{ dir_path, "sema-base-d.klio-sema" }));
+    const ds = dropped.sink();
+    try ds.writeAt(ds.ctx, 0, "partial");
+    dropped.abort();
+    var it = tmp.dir.iterate();
+    var files: usize = 0;
+    while (try it.next(io)) |_| files += 1;
+    try std.testing.expectEqual(@as(usize, 1), files);
 }
