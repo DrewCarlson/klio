@@ -28,7 +28,7 @@ const ClassId = ir.ClassId;
 const magic = "KLIOSEMB";
 
 /// Bumped with any change to the layout below.
-pub const version: u32 = 32;
+pub const version: u32 = 33;
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -46,6 +46,8 @@ pub const Header = extern struct {
     front_len: u32,
     /// `Sema.prefixDigest(prefix)` at the bake.
     digest: u64,
+    /// The whole image's length, so a file cut short is not read as one.
+    len: u64,
 };
 
 /// `Bridge`'s tables, with its maps and bit sets flattened to slices. The
@@ -261,7 +263,14 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
     const fr: Front = .{ .sources = try base_sema.sources(scratch, map, n_sources), .driver = driver };
     const src_bytes = try codec.encodeBytes(Front, gpa, &fr);
     defer gpa.free(src_bytes);
-    const hdr: Header = .{ .version = version, .codec = codec.FORMAT_VERSION, .prefix = prefix, .front_len = @intCast(src_bytes.len), .digest = s.prefixDigest(prefix) };
+    const hdr: Header = .{
+        .version = version,
+        .codec = codec.FORMAT_VERSION,
+        .prefix = prefix,
+        .front_len = @intCast(src_bytes.len),
+        .digest = s.prefixDigest(prefix),
+        .len = magic.len + @sizeOf(Header) + src_bytes.len + payload.len,
+    };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, magic);
@@ -366,13 +375,15 @@ pub const Loaded = struct {
 
 pub const LoadError = error{ OutOfMemory, Malformed, Stale };
 
-/// The header of an image, or null when `bytes` is not one this build reads.
+/// The header of an image, or null when `bytes` is not one this build reads
+/// or is cut short.
 pub fn header(bytes: []const u8) ?Header {
     if (bytes.len < magic.len + @sizeOf(Header)) return null;
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return null;
     var h: Header = undefined;
     @memcpy(std.mem.asBytes(&h), bytes[magic.len .. magic.len + @sizeOf(Header)]);
     if (h.version != version or h.codec != codec.FORMAT_VERSION) return null;
+    if (h.len != bytes.len) return null;
     return h;
 }
 

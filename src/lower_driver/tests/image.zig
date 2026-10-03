@@ -31,6 +31,9 @@ test "an image names its layout, and a foreign file is not one" {
     var bad = try arena.allocator().dupe(u8, bytes);
     bad[0] = 'X';
     try testing.expect(base_image.header(bad) == null);
+    // Cut short, as an interrupted write leaves it.
+    try testing.expect(base_image.header(bytes[0 .. bytes.len / 2]) == null);
+    try testing.expectError(error.Malformed, base_image.front(arena.allocator(), bytes[0 .. bytes.len - 1]));
 }
 
 test "a base whose symbols differ from the image's is stale" {

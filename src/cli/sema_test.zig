@@ -5,7 +5,6 @@
 //! inherits. The report is the name-resolving runner's.
 
 const std = @import("std");
-const span = @import("span");
 const sema = @import("sema");
 const ir = @import("ir");
 const runtime = @import("runtime");
@@ -31,15 +30,14 @@ pub const Options = struct {
 
 pub fn run(gpa: Allocator, paths: []const []const u8, feature_specs: []const []const u8, opts: Options) u8 {
     pipeline.hooks.start();
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var map = span.SourceMap.init(arena);
-    span.active_map = &map;
-    defer span.active_map = null;
+    // Freed as a run's is, once the collector is held off.
+    const mem = sema_run.RunMemory.init() catch return 2;
+    defer mem.deinit();
+    const arena = mem.arena();
+    const map = mem.map;
 
     var load_report: sema_cmd.LoadReport = .{};
-    const loaded = sema_cmd.loadSources(arena, &map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &load_report, .test_roots = true, .image = true });
+    const loaded = sema_cmd.loadSources(arena, map, paths, .{ .feature_specs = feature_specs, .report_pack_failures = true, .report = &load_report, .test_roots = true, .image = true });
     io.writeStderr(load_report.syntax.items);
     const src = loaded catch |e| switch (e) {
         error.ProgramSyntax => return 1,
@@ -56,7 +54,7 @@ pub fn run(gpa: Allocator, paths: []const []const u8, feature_specs: []const []c
         io.writeStderr("error: no `.kt` files found\n");
         return 1;
     }
-    const built = sema_run.buildRun(gpa, arena, &map, src, sema_cmd.hostBinding(gpa)) catch |e| {
+    const built = sema_run.buildRun(gpa, arena, map, src, sema_cmd.hostBinding(gpa)) catch |e| {
         io.printStderr(gpa, "error: the sema pipeline failed: {s}\n", .{@errorName(e)});
         return 2;
     };
@@ -64,7 +62,7 @@ pub fn run(gpa: Allocator, paths: []const []const u8, feature_specs: []const []c
     // reaches it fails with it, the others run.
     {
         var out: std.ArrayList(u8) = .empty;
-        _ = sema_run.programDiagnostics(arena, &map, src.program, &built, .Warning, &out) catch |e| {
+        _ = sema_run.programDiagnostics(arena, map, src.program, &built, .Warning, &out) catch |e| {
             io.printStderr(gpa, "error: cannot report the tests' errors: {s}\n", .{@errorName(e)});
             return 2;
         };
@@ -104,7 +102,12 @@ fn runEntry(ctx: RunCtx) RunOutcome {
     // The program's objects come from the process allocator, which the
     // collector frees through; the build's arena never frees.
     var vm = interp_ir.Vm.new(ctx.gpa, module_ref) catch |e| return .{ .err = e };
-    defer vm.deinit();
+    // The marking thread may still trace what the VM frees.
+    defer {
+        runtime.gc.quiesce();
+        vm.deinit();
+        runtime.gc.unquiesce();
+    }
     // The `KLIO_PROF` sampler is per thread, and this thread runs the tests.
     runtime.prof.maybeStart();
     defer runtime.prof.maybeReport();
