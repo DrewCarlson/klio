@@ -39,6 +39,7 @@ fn lowerFrom(a: Allocator, s: *sema.Sema, br: *bridge.Bridge, base_lowered: std.
     const prims = try a.create(operator.PrimTable);
     prims.* = try operator.PrimTable.init(a, s);
     var p: Program = .{ .a = a, .s = s, .br = br, .m = br.m, .prims = prims };
+    errdefer p.freeScratch();
     const n = br.origin.len;
     const first: u32 = @intCast(@min(base_lowered.bit_length, n));
     p.lowered = try std.DynamicBitSetUnmanaged.initEmpty(a, n);
@@ -60,7 +61,29 @@ fn lowerFrom(a: Allocator, s: *sema.Sema, br: *bridge.Bridge, base_lowered: std.
             try body.lowerBody(&p, f);
         }
     }
+    p.freeScratch();
+    if (std.c.getenv("KLIO_LOWER_FINGERPRINT") != null) printFingerprints(&p, first);
     return p;
+}
+
+/// `KLIO_LOWER_FINGERPRINT`: a line for each body lowered from `first` on,
+/// with its block, instruction and register counts and a hash of its
+/// blocks by value, to compare two builds' lowering body by body.
+fn printFingerprints(p: *const Program, first: u32) void {
+    var i: u32 = first;
+    while (i < p.m.funcs.items.len) : (i += 1) {
+        if (!p.isLowered(FuncId.from(i))) continue;
+        const f = &p.m.funcs.items[i];
+        var h = std.hash.Wyhash.init(0);
+        var insts: usize = 0;
+        for (f.blocks) |*blk| {
+            insts += blk.insts.len;
+            std.hash.autoHashStrat(&h, blk.insts, .DeepRecursive);
+            std.hash.autoHash(&h, blk.terminator);
+            std.hash.autoHashStrat(&h, blk.h().*, .DeepRecursive);
+        }
+        std.debug.print("[fn] {d} blocks={d} insts={d} locals={d} hash={x}\n", .{ i, f.blocks.len, insts, f.n_locals, h.final() });
+    }
 }
 
 /// Whether a function's body is an inline function's, which callers

@@ -204,9 +204,9 @@ fn throwNoBranch(b: *Builder, sp: @import("span").Span) Error!void {
     if (cls == .none) return b.fail(sp, "the base declares no NoWhenBranchMatchedException", .{});
     const ctor = noArgCtor(s, cls) orelse return b.fail(sp, "NoWhenBranchMatchedException has no constructor taking no arguments", .{});
     const n = s.syms.functionInfo(ctor).params.len;
-    const args = try b.p.a.alloc(sema.records.ArgSource, n);
+    const args = try b.sa.alloc(sema.records.ArgSource, n);
     @memset(args, .default);
-    const conv = try b.p.a.alloc(sema.records.Conv, n);
+    const conv = try b.sa.alloc(sema.records.Conv, n);
     @memset(conv, .none);
     const rec: records.CallRec = .{ .callee = ctor, .form = .ctor, .args = args, .conv = conv };
     const exc = try call.emitCall(b, &rec, .{ .exprs = &.{}, .regs = &.{}, .receiver = null });
@@ -255,7 +255,7 @@ fn pattern(b: *Builder, when_id: ast.NodeId, pat: *const ast.WhenPattern, subjec
                 .contains => |c| c,
                 else => return error.Unrecorded,
             };
-            const r = try operator.callTyped(b, &rec, range, &.{sv}, .{ .recv = b.exprType(v.id()), .operands = try b.p.a.dupe(TypeId, &.{subject_t}) });
+            const r = try operator.callTyped(b, &rec, range, &.{sv}, .{ .recv = b.exprType(v.id()), .operands = try b.sa.dupe(TypeId, &.{subject_t}) });
             return if (pat.kind == .NotInRange) operator.negate(b, r) else r;
         },
         .IsType, .NotIsType => {
@@ -338,7 +338,7 @@ fn loopDoWhile(b: *Builder, e: *const ast.Expr, label: ?[]const u8) Error!Reg {
 /// `break` or `continue` closes. The body is a block scope whose groups
 /// are all realized.
 fn loopBody(b: *Builder, e: *const ast.Expr, label: ?[]const u8, break_to: BlockId, continue_to: BlockId, groups: compose.LoopGroups) Error!void {
-    try b.loops.append(b.p.a, .{ .label = label, .break_to = break_to, .continue_to = continue_to, .finally_depth = b.finallys.items.len, .compose_open = b.compose_open });
+    try b.loops.append(b.sa, .{ .label = label, .break_to = break_to, .continue_to = continue_to, .finally_depth = b.finallys.items.len, .compose_open = b.compose_open });
     defer _ = b.loops.pop();
     const saved_block = b.compose_block;
     b.compose_block = .{ .end = e.span().end, .loop_body = true };
@@ -706,7 +706,7 @@ pub fn lowerLabeled(b: *Builder, e: *const ast.Expr) Error!Reg {
 /// handler's.
 pub fn lowerTry(b: *Builder, e: *const ast.Expr) Error!Reg {
     const t = e.Try;
-    const a = b.p.a;
+    const a = b.sa;
     // Nothing inside a `try` is remembered, as the Compose compiler has it.
     const saved_remember = b.compose_remember;
     b.compose_remember = false;
@@ -907,7 +907,7 @@ fn findLoop(b: *Builder, label: ?[]const u8) ?builder.Loop {
 /// innermost first: its handler frame pops as the jump leaves it, then its
 /// `finally` runs, outside that frame but inside the ones still enclosing.
 pub fn jumpOut(b: *Builder, finally_depth: usize, to: BlockId) Error!void {
-    const a = b.p.a;
+    const a = b.sa;
     var i = b.finallys.items.len;
     while (i > finally_depth) {
         i -= 1;
@@ -939,7 +939,7 @@ pub fn jumpOut(b: *Builder, finally_depth: usize, to: BlockId) Error!void {
 /// exits by `Goto`.
 fn popOnExit(b: *Builder, blk: BlockId, frame: BlockId) Error!void {
     const h = &b.blocks.items[blk.int()].handlers;
-    const merged = try b.p.a.alloc(BlockId, h.pop_on_exit.len + 1);
+    const merged = try b.sa.alloc(BlockId, h.pop_on_exit.len + 1);
     @memcpy(merged[0..h.pop_on_exit.len], h.pop_on_exit);
     merged[h.pop_on_exit.len] = frame;
     h.pop_on_exit = merged;

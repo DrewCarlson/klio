@@ -412,7 +412,7 @@ fn withSpan(b: *Builder, ops: Operands) Operands {
 }
 
 fn operandsOf(b: *Builder, written: []const ast.Expr) Error!Operands {
-    const a = b.p.a;
+    const a = b.sa;
     const exprs = try a.alloc(?*const ast.Expr, written.len);
     for (written, exprs) |*x, *o| o.* = x;
     const regs = try a.alloc(?Reg, written.len);
@@ -431,7 +431,7 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
         .plain, .super_, .value_invoke, .ctor, .sam_ctor => {},
     }
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     // `remember` is lowered as the Compose compiler has it.
     if (b.env.composer != null and compose.isRemember(s, rec.callee)) {
         if (try compose.lowerRemember(b, rec, ops)) |r| return r;
@@ -568,7 +568,7 @@ fn operandType(b: *Builder, ops: Operands, k: usize) TypeId {
 fn inlineGroups(b: *Builder, rec: *const CallRec, ops: Operands, in_place: []const bool, params: []const Sym) Error!compose.InlineGroups {
     if (b.env.composer == null) return .{};
     const s = b.p.s;
-    const literals = try b.p.a.alloc(?*const ast.Expr, in_place.len);
+    const literals = try b.sa.alloc(?*const ast.Expr, in_place.len);
     for (literals, in_place, 0..) |*l, ip, k| l.* = if (ip and k < ops.exprs.len) (if (ops.exprs[k]) |e| literal(e) else null) else null;
     var inline_params: usize = 0;
     for (params) |p| {
@@ -582,7 +582,7 @@ fn keyValues(b: *Builder, rec: *const CallRec, vals: []const ?Reg) Error![]const
     var out: std.ArrayList(Reg) = .empty;
     for (rec.args) |src| switch (src) {
         .vararg => |parts| for (parts) |part| {
-            if (part.arg < vals.len) if (vals[part.arg]) |r| try out.append(b.p.a, r);
+            if (part.arg < vals.len) if (vals[part.arg]) |r| try out.append(b.sa, r);
         },
         else => {},
     };
@@ -630,7 +630,7 @@ fn finish(b: *Builder, rec: *const CallRec, how: How, run: *const Run, from: loc
                 if (t.companion) |comp| try b.emit(.{ .LoadObject = .{ .dst = b.newReg(), .class = comp } });
                 return run.regs.items[0];
             };
-            const regs = try b.p.a.alloc(Reg, run.regs.items.len + 1);
+            const regs = try b.sa.alloc(Reg, run.regs.items.len + 1);
             regs[0] = try b.unit();
             @memcpy(regs[1..], run.regs.items);
             const first = try locals.runFrom(b, from, regs);
@@ -790,7 +790,7 @@ fn ownDefaults(s: *sema.Sema, args: []const ArgSource, params: []const Sym, has_
 /// parameter order, after every written argument, seeing the new values of
 /// the parameters before it, as the defaults bridge evaluates them.
 fn tailDefaults(b: *Builder, rec: *const CallRec, params: []const Sym, values: []Reg, has_default: []const bool, sp: span.Span) Error!void {
-    const a = b.p.a;
+    const a = b.sa;
     const saved = try a.alloc(?builder.Home, params.len);
     for (params, saved) |p, *h| h.* = b.locals.get(p);
     for (rec.args, 0..) |src, i| {
@@ -859,7 +859,7 @@ fn receiverFor(b: *Builder, r: sema.records.Receiver, expr: ?Reg, sp: span.Span)
 fn unmemoizedOperands(b: *Builder, rec: *const CallRec, ops: Operands, params: []const Sym) Error![]const bool {
     if (!b.compose_remember) return &.{};
     const s = b.p.s;
-    const out = try b.p.a.alloc(bool, ops.count());
+    const out = try b.sa.alloc(bool, ops.count());
     @memset(out, false);
     const inline_callee = rec.callee != .none and s.syms.kind(rec.callee) == .function and s.syms.flags(rec.callee).inline_;
     for (rec.args, 0..) |src, i| {
@@ -877,7 +877,7 @@ fn unmemoizedOperands(b: *Builder, rec: *const CallRec, ops: Operands, params: [
 }
 
 fn evalOperands(b: *Builder, ops: Operands, in_place: []const bool, unmemoized: []const bool) Error![]?Reg {
-    const out = try b.p.a.alloc(?Reg, ops.count());
+    const out = try b.sa.alloc(?Reg, ops.count());
     for (out, 0..) |*o, k| {
         if (k < ops.regs.len) {
             if (ops.regs[k]) |r| {
@@ -904,7 +904,7 @@ fn evalOperands(b: *Builder, ops: Operands, in_place: []const bool, unmemoized: 
 /// nullable and not converted.
 fn inPlaceLambdas(b: *Builder, rec: *const CallRec, ops: Operands, params: []const Sym) Error![]bool {
     const s = b.p.s;
-    const out = try b.p.a.alloc(bool, ops.count());
+    const out = try b.sa.alloc(bool, ops.count());
     @memset(out, false);
     for (rec.args, 0..) |src, i| {
         const k = switch (src) {
@@ -944,7 +944,7 @@ fn inlinable(s: *sema.Sema, p: Sym) bool {
 
 fn pushValues(b: *Builder, run: *Run, rec: *const CallRec, ops: Operands, vals: []const ?Reg, params: []const Sym) Error!void {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     for (rec.args, 0..) |src, i| {
         const conv: Conv = if (i < rec.conv.len) rec.conv[i] else .none;
         switch (src) {
@@ -1009,7 +1009,7 @@ fn convert(b: *Builder, r: Reg, conv: Conv) Error!Reg {
 /// spread's copied, so the callee never shares the caller's array.
 fn packVararg(b: *Builder, param: Sym, parts: []const VarargPart, vals: []const ?Reg, ops: Operands, sp: span.Span) Error!Reg {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     // An array holds a scalar class's values boxed.
     const boxed = try a.alloc(Reg, parts.len);
     for (parts, boxed) |pt, *r| r.* = if (pt.spread) vals[pt.arg].? else try coerce.convert(b, vals[pt.arg].?, try coerce.scalarOf(b, operandType(b, ops, pt.arg)), null);
@@ -1081,7 +1081,7 @@ fn pushReified(b: *Builder, run: *Run, rec: *const CallRec, sp: span.Span) Error
         if (i >= rec.type_args.len or s.types.isErr(rec.type_args[i])) {
             return b.fail(sp, "reified `{s}` of `{s}` has no type argument", .{ s.str(s.syms.name(tp)), calleeName(s, rec.callee) });
         }
-        try run.push(b.p.a, try types_mod.typeValue(b, rec.type_args[i]));
+        try run.push(b.sa, try types_mod.typeValue(b, rec.type_args[i]));
     }
 }
 
@@ -1096,7 +1096,7 @@ const CtorMode = enum { new, this_delegation, super_delegation };
 /// and `ordinal`, and captures what a local superclass captures.
 fn pushCtorHidden(b: *Builder, run: *Run, rec: *const CallRec, ops: Operands, mode: CtorMode) Error!void {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const cls = s.syms.owner(rec.callee);
     if (mode == .this_delegation) {
         var i: u16 = 0;
@@ -1141,7 +1141,7 @@ fn loadParam(b: *Builder, idx: u16) Error!Reg {
 pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     const ops = withSpan(b, ops_in);
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const mode: CtorMode = switch (rec.form) {
         .this_delegation => .this_delegation,
         .super_delegation => .super_delegation,
@@ -1176,7 +1176,7 @@ pub fn lowerDelegation(b: *Builder, rec: *const CallRec, ops_in: Operands) Error
 
 fn hostSuper(b: *Builder, rec: *const CallRec, ops: Operands, vals: []const ?Reg, params: []const Sym, masks: []const u32, ctor: FuncId) Error!void {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const br = b.p.br;
     const sup = br.classOfOpt(s.syms.owner(rec.callee)) orelse
         return b.fail(ops.sp, "the superclass of `{s}` has no class id", .{calleeName(s, rec.callee)});
@@ -1203,7 +1203,7 @@ pub const CtorArgs = struct { func: FuncId, run: Reg, n: u32 };
 pub fn ctorArgs(b: *Builder, rec: *const CallRec, ops_in: Operands, head: []const Reg) Error!CtorArgs {
     const ops = withSpan(b, ops_in);
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     var func = dispatch.funcIdOf(b.p.br, rec.callee) orelse
         return b.fail(ops.sp, "constructor `{s}` has no identity", .{calleeName(s, rec.callee)});
     const params = valueParams(s, rec);
@@ -1232,7 +1232,7 @@ pub fn ctorArgs(b: *Builder, rec: *const CallRec, ops_in: Operands, head: []cons
 /// constructor).
 pub fn lowerDefaultsBridge(b: *Builder, target: Sym) Error!void {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const sp = declSpan(s, target);
     // A frame of the bridge stands at the declaration, as kotlinc's
     // `$default` method's line table puts it.

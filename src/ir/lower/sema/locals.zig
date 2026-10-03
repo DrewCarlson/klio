@@ -70,7 +70,7 @@ pub const Hazard = struct {
 /// is lowered under writes it before the value is used.
 pub fn mustCopy(b: *Builder, name: []const u8) Allocator.Error!bool {
     const h = b.hazard orelse return false;
-    return h.writes(b.p.a, name);
+    return h.writes(b.sa, name);
 }
 
 /// The names of the locals an expression or statement assigns, increments
@@ -376,7 +376,7 @@ const RunCount = struct {
 /// read nowhere, named once in `regs`) is computed straight into its slot
 /// by the instruction that defines it; any other is moved in.
 pub fn runFrom(b: *Builder, from: Mark, regs: []const Reg) builder.Error!Reg {
-    const a = b.p.a;
+    const a = b.sa;
     const first = b.next_reg;
     b.next_reg += @intCast(regs.len);
     const cand = try a.alloc(Reg, regs.len);

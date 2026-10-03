@@ -207,7 +207,7 @@ const Fx = struct {
             else => .{ .decl = owner },
         });
         const b = try fx.a.create(lower.Builder);
-        b.* = try lower.Builder.init(fx.p, fx.s.syms.get(owner).file, owner, f, kind);
+        b.* = try lower.Builder.init(fx.p, fx.p.a, fx.s.syms.get(owner).file, owner, f, kind);
         try lower.env.enter(b);
         return b;
     }
@@ -646,7 +646,7 @@ test "a captured var lives in a cell the closure reads and writes" {
     const rec = try b.lambda(lam.id);
     const lf = try fx.func(.{ .lambda = rec.func });
     fx.captures_of[lf.int()] = &.{.{ .local = c }};
-    var lb = try lower.Builder.init(fx.p, Fx.prog_file, rec.func, lf, .lambda);
+    var lb = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, rec.func, lf, .lambda);
     try lower.env.enter(&lb);
     _ = try lower.body.lowerStmts(&lb, lam.body.stmts);
     try std.testing.expectEqualStrings(
@@ -675,7 +675,7 @@ test "a lambda's receiver and parameters are its closure's parameters" {
         const b0 = try fx.builderFor(fx.top(fname), .function);
         const rec = try b0.lambda(lam.id);
         const lf = try fx.func(.{ .lambda = rec.func });
-        var lb = try lower.Builder.init(fx.p, Fx.prog_file, rec.func, lf, .lambda);
+        var lb = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, rec.func, lf, .lambda);
         try lower.env.enter(&lb);
         const v = try lower.body.lowerBlock(&lb, &lam.body);
         try std.testing.expectEqualStrings(
@@ -735,7 +735,7 @@ test "a closure reads a captured this, and a local function takes its captures f
         \\  return r0
         \\
     , try fx.finishWith(b0, caps[0]));
-    var lb = try lower.Builder.init(fx.p, Fx.prog_file, rec.func, lf, .lambda);
+    var lb = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, rec.func, lf, .lambda);
     try lower.env.enter(&lb);
     const v = (try lower.body.lowerStmts(&lb, lam.body.stmts)).?;
     try std.testing.expectEqualStrings(
@@ -748,11 +748,11 @@ test "a closure reads a captured this, and a local function takes its captures f
     const g = fx.top("g");
     const p = fx.s.syms.functionInfo(g).params[0];
     const loc_decl = fx.s.syms.get(g).decl.function.?.body.?.Block.stmts[0].Decl;
-    var bg = try lower.Builder.init(fx.p, Fx.prog_file, g, try fx.func(.{ .decl = g }), .function);
+    var bg = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, g, try fx.func(.{ .decl = g }), .function);
     const loc = try bg.decl(loc_decl.Function.id);
     const lfn = try fx.func(.{ .lambda = loc });
     fx.captures_of[lfn.int()] = &.{.{ .local = p }};
-    var lb2 = try lower.Builder.init(fx.p, Fx.prog_file, loc, lfn, .local_fun);
+    var lb2 = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, loc, lfn, .local_fun);
     try lower.env.enter(&lb2);
     try lower.body.lowerFunctionBody(&lb2, &loc_decl.Function.body.?);
     try std.testing.expectEqualStrings(
@@ -974,7 +974,7 @@ test "a member extension called in a with block takes the block's receiver as it
     // `n` is the enclosing function's parameter, captured.
     const n = fx.s.syms.functionInfo(fx.top("w")).params[1];
     fx.captures_of[lf.int()] = &.{.{ .local = n }};
-    var lb = try lower.Builder.init(fx.p, Fx.prog_file, rec.func, lf, .lambda);
+    var lb = try lower.Builder.init(fx.p, fx.p.a, Fx.prog_file, rec.func, lf, .lambda);
     try lower.env.enter(&lb);
     const v = (try lower.body.lowerStmts(&lb, lam.body.stmts)).?;
     try std.testing.expectEqualStrings(

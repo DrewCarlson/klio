@@ -50,6 +50,43 @@ pub const Program = struct {
     scalar_classes: std.AutoHashMapUnmanaged(Sym, ?coerce_mod.Scalar) = .empty,
     /// By member: the roots of its override family (`coerce`).
     family_roots: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,
+    /// Scratch for the bodies being lowered, one level per builder open: a
+    /// lambda's or an inline callee's body lowers inside its caller's
+    /// (`pushScratch`). `depth` of them are in use.
+    levels: std.ArrayList(*sema.Scratch) = .empty,
+    depth: u32 = 0,
+
+    /// Opens a scratch level for a body about to be lowered: what its
+    /// builder works in, emptied by `popScratch` once `Builder.finish` has
+    /// copied the body out.
+    pub fn pushScratch(p: *Program) Allocator.Error!Allocator {
+        if (p.levels.items.len == p.depth) {
+            const level = try std.heap.page_allocator.create(sema.Scratch);
+            level.* = .{};
+            p.levels.append(std.heap.page_allocator, level) catch |e| {
+                std.heap.page_allocator.destroy(level);
+                return e;
+            };
+        }
+        p.depth += 1;
+        return p.levels.items[p.depth - 1].allocator();
+    }
+
+    pub fn popScratch(p: *Program) void {
+        p.depth -= 1;
+        p.levels.items[p.depth].reset(4 * 1024 * 1024);
+    }
+
+    /// Frees the scratch levels, once every body is lowered.
+    pub fn freeScratch(p: *Program) void {
+        for (p.levels.items) |level| {
+            level.deinit();
+            std.heap.page_allocator.destroy(level);
+        }
+        p.levels.deinit(std.heap.page_allocator);
+        p.levels = .empty;
+        p.depth = 0;
+    }
 
     pub fn isLowered(p: *const Program, f: FuncId) bool {
         return f.int() < p.lowered.bit_length and p.lowered.isSet(f.int());
@@ -118,6 +155,10 @@ pub const zero_span: span.Span = .{ .file = span.FileId.from(0), .start = 0, .en
 
 pub const Builder = struct {
     p: *Program,
+    /// What the body's lowering works in: its blocks and their
+    /// instructions, its tables of locals, its passes' counts. `finish`
+    /// copies the body out to `p.a`.
+    sa: Allocator,
     recs: *const sema.output.FileRecords,
     file: u32,
     /// The function, constructor, property or lambda symbol whose body this is.
@@ -198,10 +239,11 @@ pub const Builder = struct {
     compose_marker: ?Reg = null,
 
     /// A builder for `func`'s body over `file`'s records, with its entry block.
-    pub fn init(p: *Program, file: u32, owner: Sym, func: FuncId, kind: BodyKind) Error!Builder {
+    pub fn init(p: *Program, sa: Allocator, file: u32, owner: Sym, func: FuncId, kind: BodyKind) Error!Builder {
         const br = p.br;
         var b: Builder = .{
             .p = p,
+            .sa = sa,
             .recs = recordsOf(br, file),
             .file = file,
             .owner = owner,
@@ -228,7 +270,7 @@ pub const Builder = struct {
 
     pub fn newBlock(b: *Builder) Error!BlockId {
         const id = BlockId.from(@intCast(b.blocks.items.len));
-        try b.blocks.append(b.p.a, .{});
+        try b.blocks.append(b.sa, .{});
         return id;
     }
 
@@ -245,14 +287,14 @@ pub const Builder = struct {
         if (out == .CallStatic and out.CallStatic.init == ir.NO_UNIT) {
             if (b.p.br.m.resolved) |r| out.CallStatic.init = ir.resolved.facadeEntry(r, b.func, out.CallStatic.func);
         }
-        try b.blocks.items[b.cur.int()].insts.append(b.p.a, out);
+        try b.blocks.items[b.cur.int()].insts.append(b.sa, out);
     }
 
     /// Appends to the entry block, which dominates every use: a load with
     /// no effect the body reads anywhere (a parameter, a capture, `this`).
     pub fn emitEntry(b: *Builder, inst: Inst) Error!void {
         const entry = &b.blocks.items[0].insts;
-        try entry.append(b.p.a, inst);
+        try entry.append(b.sa, inst);
         b.entry_last = entry.items.len - 1;
     }
 
@@ -328,36 +370,41 @@ pub const Builder = struct {
     /// Writes blocks, entry and n_locals into `p.m.funcs[func]`. A block
     /// nothing terminated is dead code and ends in `Unreachable`.
     pub fn finish(b: *Builder) Error!void {
-        const a = b.p.a;
+        const sa = b.sa;
+        // A pass runs only on a body holding the instructions it acts on.
+        var kinds = instKinds(b.blocks.items);
         try b.pruneDeadTypeValues();
-        try b.foldConversions();
-        try b.foldNegatedTests();
-        try b.decellLocals();
+        if (kinds.contains(.UnOp)) try b.foldConversions();
+        if (kinds.contains(.Not)) try b.foldNegatedTests();
+        if (kinds.contains(.MakeCell)) {
+            try b.decellLocals();
+            kinds.insert(.Move);
+        }
         threadJumps(b.blocks.items);
-        try mergeBlocks(b.p.a, b.blocks.items);
-        try forwardCopies(b.p.a, b.blocks.items, b.next_reg);
-        try b.coalesceCopies();
-        try b.aliasRuns();
-        const f = &b.p.m.funcs.items[b.func.int()];
-        const blocks = try a.alloc(ir.Block, b.blocks.items.len);
-        for (b.blocks.items, blocks, 0..) |*buf, *out, i| {
+        try mergeBlocks(sa, b.blocks.items);
+        if (kinds.contains(.Move)) {
+            try forwardCopies(sa, b.blocks.items, b.next_reg);
+            try b.coalesceCopies();
+            try b.aliasRuns();
+        }
+        const work = try sa.alloc(ir.Block, b.blocks.items.len);
+        for (b.blocks.items, work, 0..) |*buf, *out, i| {
             out.* = .{
                 .id = BlockId.from(@intCast(i)),
-                .insts = try buf.insts.toOwnedSlice(a),
+                .insts = buf.insts.items,
                 .terminator = buf.terminator orelse .Unreachable,
+                .handlers = if (buf.handlers.any()) &buf.handlers else null,
             };
-            if (buf.handlers.any()) {
-                const h = try out.handlersMut(a);
-                h.* = buf.handlers;
-            }
         }
-        f.blocks = blocks;
-        f.entry = BlockId.from(0);
         // A body calls copy in keeps its registers: a copy reads which parameter a register
         // holds from the register (`inline.instantiate`).
-        f.n_locals = if (b.copiedIn()) b.next_reg else try ir.regs.compact(a, blocks, b.next_reg);
+        const n_locals = if (b.copiedIn()) b.next_reg else try ir.regs.compact(sa, work, b.next_reg);
+        const f = &b.p.m.funcs.items[b.func.int()];
+        f.blocks = try copyOut(b.p.a, work);
+        f.entry = BlockId.from(0);
+        f.n_locals = n_locals;
         const lw = &b.p.lowered;
-        if (b.func.int() >= lw.bit_length) try lw.resize(a, @max(b.func.int() + 1, b.p.m.funcs.items.len), false);
+        if (b.func.int() >= lw.bit_length) try lw.resize(b.p.a, @max(b.func.int() + 1, b.p.m.funcs.items.len), false);
         lw.set(b.func.int());
     }
 
@@ -383,28 +430,38 @@ pub const Builder = struct {
     fn pruneDeadTypeValues(b: *Builder) Error!void {
         const builders = types_mod.typeBuilders(b);
         if (builders[0] == null) return;
-        const reads = try b.p.a.alloc(u32, b.next_reg);
+        const reads = try b.sa.alloc(u32, b.next_reg);
         const Count = struct {
             reads: []u32,
             fn cb(c: @This(), r: Reg, is_def: bool) void {
                 if (!is_def and r.int() < c.reads.len) c.reads[r.int()] += 1;
             }
-        };
-        while (true) {
-            @memset(reads, 0);
-            for (b.blocks.items) |*blk| {
-                for (blk.insts.items) |*inst| ir.visitInstRegs(inst, Count{ .reads = reads }, Count.cb);
-                if (blk.terminator) |*t| ir.visitTerminatorRegs(t, Count{ .reads = reads }, Count.cb);
+            fn uncount(c: @This(), r: Reg, is_def: bool) void {
+                if (!is_def and r.int() < c.reads.len) c.reads[r.int()] -= 1;
             }
+        };
+        @memset(reads, 0);
+        for (b.blocks.items) |*blk| {
+            for (blk.insts.items) |*inst| ir.visitInstRegs(inst, Count{ .reads = reads }, Count.cb);
+            if (blk.terminator) |*t| ir.visitTerminatorRegs(t, Count{ .reads = reads }, Count.cb);
+        }
+        // A dropped instruction's reads stop counting, which may leave what
+        // it read unread: until a sweep drops nothing. Nothing dropped comes
+        // back, so the order they go in leaves the same body.
+        while (true) {
             var removed = false;
             for (b.blocks.items) |*blk| {
-                var i: usize = 0;
-                while (i < blk.insts.items.len) {
-                    if (deadTypePart(&blk.insts.items[i], builders, reads)) {
-                        _ = blk.insts.orderedRemove(i);
+                var kept: usize = 0;
+                for (blk.insts.items) |*inst| {
+                    if (deadTypePart(inst, builders, reads)) {
+                        ir.visitInstRegs(inst, Count{ .reads = reads }, Count.uncount);
                         removed = true;
-                    } else i += 1;
+                        continue;
+                    }
+                    blk.insts.items[kept] = inst.*;
+                    kept += 1;
                 }
+                blk.insts.shrinkRetainingCapacity(kept);
             }
             if (!removed) return;
         }
@@ -414,7 +471,7 @@ pub const Builder = struct {
     /// drops the constant when only such conversions read it: `l * 31`
     /// multiplies by the `Long` 31 rather than converting 31 each time.
     fn foldConversions(b: *Builder) Error!void {
-        const a = b.p.a;
+        const a = b.sa;
         const n = b.next_reg;
         const defs = try a.alloc(u32, n);
         defer a.free(defs);
@@ -457,18 +514,18 @@ pub const Builder = struct {
             const cid = consts[x.operand.int()] orelse continue;
             const v = numericValue(b.p.m.consts.items[cid.int()]) orelse continue;
             const out = runtime.numconv.convert(to, v) orelse continue;
-            inst.* = .{ .Const = .{ .dst = x.dst, .value = try b.p.m.internConst(a, numericConst(out)) } };
+            inst.* = .{ .Const = .{ .dst = x.dst, .value = try b.p.m.internConst(b.p.a, numericConst(out)) } };
             reads[x.operand.int()] -= 1;
             folded[x.operand.int()] = true;
         };
         for (b.blocks.items) |*blk| {
-            var i: usize = 0;
-            while (i < blk.insts.items.len) {
-                const inst = blk.insts.items[i];
-                if (inst == .Const and folded[inst.Const.dst.int()] and reads[inst.Const.dst.int()] == 0) {
-                    _ = blk.insts.orderedRemove(i);
-                } else i += 1;
+            var kept: usize = 0;
+            for (blk.insts.items) |inst| {
+                if (inst == .Const and folded[inst.Const.dst.int()] and reads[inst.Const.dst.int()] == 0) continue;
+                blk.insts.items[kept] = inst;
+                kept += 1;
             }
+            blk.insts.shrinkRetainingCapacity(kept);
         }
     }
 
@@ -480,7 +537,7 @@ pub const Builder = struct {
     /// ways. The test and the `!` are in one block with nothing between them
     /// touching the `!`'s register, which the test now writes earlier.
     fn foldNegatedTests(b: *Builder) Error!void {
-        const a = b.p.a;
+        const a = b.sa;
         const n = b.next_reg;
         const defs = try a.alloc(u32, n);
         defer a.free(defs);
@@ -558,7 +615,7 @@ pub const Builder = struct {
     /// lambda is spliced into its caller by an inline call; a cell nothing
     /// passes on, stores or captures is only this frame's own storage.
     fn decellLocals(b: *Builder) Error!void {
-        try decellBlocks(b.p.a, b.blocks.items, b.next_reg);
+        try decellBlocks(b.sa, b.blocks.items, b.next_reg);
     }
 
     /// Drops a copy of a register only it reads into a register only it
@@ -567,7 +624,7 @@ pub const Builder = struct {
     /// instruction writes the destination itself. An argument run and a
     /// `val` copy a fresh temporary this way.
     fn coalesceCopies(b: *Builder) Error!void {
-        try coalesceBlockCopies(b.p.a, b.blocks.items, b.next_reg);
+        try coalesceBlockCopies(b.sa, b.blocks.items, b.next_reg);
     }
 
     /// Gives a call the registers its argument run copies as its run, when
@@ -576,7 +633,7 @@ pub const Builder = struct {
     /// reads its parameters from the caller's registers, which the caller
     /// does not write while the call runs.
     fn aliasRuns(b: *Builder) Error!void {
-        try aliasBlockRuns(b.p.a, b.blocks.items, b.next_reg);
+        try aliasBlockRuns(b.sa, b.blocks.items, b.next_reg);
     }
 
     pub const call = records.call;
@@ -620,7 +677,7 @@ fn deadTypePart(inst: *const ir.Inst, builders: [3]?ir.FuncId, reads: []const u3
 
 /// The index in `insts` of the instruction writing `y`, when no
 /// instruction after it touches `x`.
-fn copySource(insts: []const ir.Inst, x: Reg, y: Reg) ?usize {
+fn copySource(insts: []const ir.Inst, dropped: []const bool, x: Reg, y: Reg) ?usize {
     const Touch = struct {
         x: Reg,
         y: Reg,
@@ -634,6 +691,7 @@ fn copySource(insts: []const ir.Inst, x: Reg, y: Reg) ?usize {
     var i = insts.len;
     while (i > 0) {
         i -= 1;
+        if (dropped[i]) continue;
         var hit_x = false;
         var def_y = false;
         ir.visitInstRegs(&insts[i], Touch{ .x = x, .y = y, .hit_x = &hit_x, .def_y = &def_y }, Touch.cb);
@@ -673,6 +731,57 @@ fn takesDst(inst: *const ir.Inst, x: Reg, has_handlers: bool, x_single: bool) bo
 /// jumps: the `else` a lone `if` leaves, a join passed through. A block
 /// with handlers, whose edges the try machinery keys on, is neither passed
 /// through nor retargeted from.
+const InstKinds = std.EnumSet(std.meta.Tag(Inst));
+
+/// Which kinds of instruction the blocks hold.
+fn instKinds(blocks: []const BlockBuf) InstKinds {
+    var out: InstKinds = .initEmpty();
+    for (blocks) |*blk| for (blk.insts.items) |inst| out.insert(inst);
+    return out;
+}
+
+/// A finished body's blocks, as `work` holds them in scratch, in `a`: each
+/// block's instructions and handlers, and the registers a closure captures.
+/// The instructions of every block share one array, the captures another.
+fn copyOut(a: Allocator, work: []const ir.Block) Allocator.Error![]ir.Block {
+    var n_insts: usize = 0;
+    var n_caps: usize = 0;
+    for (work) |w| {
+        n_insts += w.insts.len;
+        for (w.insts) |inst| switch (inst) {
+            .MakeClosure => |mc| n_caps += mc.captures.len,
+            else => {},
+        };
+    }
+    const blocks = try a.alloc(ir.Block, work.len);
+    const insts = try a.alloc(Inst, n_insts);
+    const caps = try a.alloc(Reg, n_caps);
+    var at: usize = 0;
+    var cap_at: usize = 0;
+    for (work, blocks) |w, *out| {
+        const mine = insts[at..][0..w.insts.len];
+        at += w.insts.len;
+        @memcpy(mine, w.insts);
+        out.* = .{ .id = w.id, .insts = mine, .terminator = w.terminator };
+        for (mine) |*inst| switch (inst.*) {
+            .MakeClosure => |*mc| {
+                const c = caps[cap_at..][0..mc.captures.len];
+                cap_at += c.len;
+                @memcpy(c, mc.captures);
+                mc.captures = c;
+            },
+            else => {},
+        };
+        if (w.handlers) |wh| {
+            const h = try out.handlersMut(a);
+            h.* = wh.*;
+            h.catches = try a.dupe(ir.CatchHandler, wh.catches);
+            h.pop_on_exit = try a.dupe(BlockId, wh.pop_on_exit);
+        }
+    }
+    return blocks;
+}
+
 fn threadJumps(blocks: []BlockBuf) void {
     const Hop = struct {
         fn through(bs: []BlockBuf, target: BlockId) BlockId {
@@ -789,7 +898,15 @@ fn forwardCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
         if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
         for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
     }
+    var longest: usize = 0;
+    for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
+    // Copies forwarded, dropped once the block is walked: the walk reads
+    // only what follows a copy, which none dropped is.
+    const dropped = try a.alloc(bool, longest);
+    defer a.free(dropped);
     for (blocks) |*blk| {
+        @memset(dropped[0..blk.insts.items.len], false);
+        var any_dropped = false;
         var j: usize = 0;
         while (j < blk.insts.items.len) {
             const mv = switch (blk.insts.items[j]) {
@@ -819,11 +936,12 @@ fn forwardCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
                 break :blk replaceTerminatorRead(t, x, y);
             };
             if (!done) continue;
-            j -= 1;
-            _ = blk.insts.orderedRemove(j);
+            dropped[j - 1] = true;
+            any_dropped = true;
             defs[x.int()] = 0;
             reads[x.int()] = 0;
         }
+        if (any_dropped) dropMarked(blk, dropped);
     }
 }
 
@@ -1011,8 +1129,16 @@ fn coalesceBlockCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
         // A caught exception is written into its register by the unwinder.
         for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
     }
+    var longest: usize = 0;
+    for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
+    // Copies coalesced, dropped once the block is walked; the walk back to
+    // a copy's source passes over them.
+    const dropped = try a.alloc(bool, longest);
+    defer a.free(dropped);
     for (blocks) |*blk| {
         const has_handlers = blk.handlers.any();
+        @memset(dropped[0..blk.insts.items.len], false);
+        var any_dropped = false;
         var j: usize = 0;
         while (j < blk.insts.items.len) : (j += 1) {
             const mv = switch (blk.insts.items[j]) {
@@ -1023,16 +1149,28 @@ fn coalesceBlockCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
             const x = mv.dst;
             if (x == y or y.int() >= n or x.int() >= n) continue;
             if (defs[y.int()] != 1 or reads[y.int()] != 1) continue;
-            const i = copySource(blk.insts.items[0..j], x, y) orelse continue;
+            const i = copySource(blk.insts.items[0..j], dropped[0..j], x, y) orelse continue;
             const src = &blk.insts.items[i];
             if (!takesDst(src, x, has_handlers, defs[x.int()] == 1)) continue;
             setDst(src, x);
-            _ = blk.insts.orderedRemove(j);
+            dropped[j] = true;
+            any_dropped = true;
             defs[y.int()] = 0;
             reads[y.int()] = 0;
-            j -= 1;
         }
+        if (any_dropped) dropMarked(blk, dropped);
     }
+}
+
+/// Drops the instructions of `blk` that `dropped` marks, keeping the rest in order.
+fn dropMarked(blk: *BlockBuf, dropped: []const bool) void {
+    var kept: usize = 0;
+    for (blk.insts.items, 0..) |inst, i| {
+        if (dropped[i]) continue;
+        blk.insts.items[kept] = inst;
+        kept += 1;
+    }
+    blk.insts.shrinkRetainingCapacity(kept);
 }
 
 fn aliasBlockRuns(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
@@ -1052,35 +1190,59 @@ fn aliasBlockRuns(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
         }
     };
     const counts: Count = .{ .reads = reads, .defs = defs };
+    var longest: usize = 0;
     for (blocks) |*blk| {
         for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
         if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
         for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
+        longest = @max(longest, blk.insts.items.len);
     }
-    var copies: std.ArrayList(usize) = .empty;
-    defer copies.deinit(a);
-    for (blocks) |*blk| {
-        var c: usize = 0;
-        while (c < blk.insts.items.len) : (c += 1) {
-            const arg_run = argRunOf(&blk.insts.items[c]) orelse continue;
+    // By register, the last instruction of the block being walked that
+    // writes it, up to the one the walk is at: `at` holds the index, and
+    // `in` the block's number plus one, so no clearing between blocks.
+    const at = try a.alloc(u32, n);
+    defer a.free(at);
+    const in = try a.alloc(u32, n);
+    defer a.free(in);
+    @memset(in, 0);
+    // Copies dropped from the block being walked, compacted out once it is done.
+    const dropped = try a.alloc(bool, longest);
+    defer a.free(dropped);
+    const Defs = struct {
+        at: []u32,
+        in: []u32,
+        blk: u32,
+        i: u32,
+        fn cb(d: @This(), r: Reg, is_def: bool) void {
+            if (!is_def or r.int() >= d.at.len) return;
+            d.at[r.int()] = d.i;
+            d.in[r.int()] = d.blk;
+        }
+    };
+    for (blocks, 1..) |*blk, bn| {
+        const insts = blk.insts.items;
+        const here: u32 = @intCast(bn);
+        @memset(dropped[0..insts.len], false);
+        var any_dropped = false;
+        for (insts, 0..) |*inst, c| {
+            defer ir.visitInstRegs(inst, Defs{ .at = at, .in = in, .blk = here, .i = @intCast(c) }, Defs.cb);
+            const arg_run = argRunOf(inst) orelse continue;
             if (arg_run.n == 0 or arg_run.first.int() + arg_run.n > n) continue;
-            copies.clearRetainingCapacity();
-            const src0 = (try runSources(blk.insts.items[0..c], arg_run, defs, reads, &copies, a)) orelse continue;
-            if (blk.insts.items[c] == .RNewInstance) {
-                const d = blk.insts.items[c].RNewInstance.dst.int();
+            const src0 = runSources(insts, arg_run, defs, reads, at, in, here) orelse continue;
+            if (inst.* == .RNewInstance) {
+                const d = inst.RNewInstance.dst.int();
                 if (d >= src0.int() and d < src0.int() + arg_run.n) continue;
             }
-            setArgs(&blk.insts.items[c], src0);
+            setArgs(inst, src0);
             for (0..arg_run.n) |k| {
                 const r = arg_run.first.int() + @as(u32, @intCast(k));
+                dropped[at[r]] = true;
                 defs[r] = 0;
                 reads[r] = 0;
             }
-            // Highest index first, so the others stay where they are.
-            std.mem.sort(usize, copies.items, {}, std.sort.desc(usize));
-            for (copies.items) |m| _ = blk.insts.orderedRemove(m);
-            c -= copies.items.len;
+            any_dropped = true;
         }
+        if (any_dropped) dropMarked(blk, dropped);
     }
 }
 
@@ -1108,16 +1270,17 @@ fn setArgs(inst: *ir.Inst, r: Reg) void {
     }
 }
 
-/// When each register of `run` is written once, by a copy in `insts`, and
-/// read only by the run, and the copies' sources are consecutive and not
-/// written again before the call: the first source, with the copies'
-/// indices in `copies`.
-fn runSources(insts: []const ir.Inst, run: ArgRun, defs: []const u32, reads: []const u32, copies: *std.ArrayList(usize), a: Allocator) Error!?Reg {
+/// When each register of `run` is written once, by a copy earlier in the
+/// block, and read only by the run, and the copies' sources are consecutive
+/// and not written again before the call: the first source. `at` and `in`
+/// say where in the block each register was last written before the call.
+fn runSources(insts: []const ir.Inst, run: ArgRun, defs: []const u32, reads: []const u32, at: []const u32, in: []const u32, here: u32) ?Reg {
     var src0: ?Reg = null;
     for (0..run.n) |k| {
         const r = Reg.from(run.first.int() + @as(u32, @intCast(k)));
         if (defs[r.int()] != 1 or reads[r.int()] != 1) return null;
-        const m = findDef(insts, r) orelse return null;
+        if (in[r.int()] != here) return null;
+        const m = at[r.int()];
         const src = switch (insts[m]) {
             .Move => |mv| mv.src,
             else => return null,
@@ -1125,41 +1288,10 @@ fn runSources(insts: []const ir.Inst, run: ArgRun, defs: []const u32, reads: []c
         if (k == 0) {
             src0 = src;
         } else if (src.int() != src0.?.int() + @as(u32, @intCast(k))) return null;
-        if (writtenAfter(insts[m + 1 ..], src)) return null;
-        try copies.append(a, m);
+        // Written again between the copy and the call.
+        if (src.int() < in.len and in[src.int()] == here and at[src.int()] > m) return null;
     }
     return src0;
-}
-
-fn findDef(insts: []const ir.Inst, r: Reg) ?usize {
-    const Def = struct {
-        r: Reg,
-        found: *bool,
-        fn cb(c: @This(), reg: Reg, is_def: bool) void {
-            if (is_def and reg == c.r) c.found.* = true;
-        }
-    };
-    var i = insts.len;
-    while (i > 0) {
-        i -= 1;
-        var found = false;
-        ir.visitInstRegs(&insts[i], Def{ .r = r, .found = &found }, Def.cb);
-        if (found) return i;
-    }
-    return null;
-}
-
-fn writtenAfter(insts: []const ir.Inst, r: Reg) bool {
-    const Def = struct {
-        r: Reg,
-        found: *bool,
-        fn cb(c: @This(), reg: Reg, is_def: bool) void {
-            if (is_def and reg == c.r) c.found.* = true;
-        }
-    };
-    var found = false;
-    for (insts) |*inst| ir.visitInstRegs(inst, Def{ .r = r, .found = &found }, Def.cb);
-    return found;
 }
 
 /// Sets the register `inst` writes.
@@ -1406,3 +1538,71 @@ test "an edge to an empty block that only jumps goes where it jumps" {
     blocks[2].handlers.catches = &.{};
 }
 
+
+test "two calls in one block each pass the registers they copied, and the copies go" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .Move = .{ .dst = r(5), .src = r(0) } },
+        .{ .Move = .{ .dst = r(6), .src = r(1) } },
+        .{ .CallStatic = .{ .dst = r(7), .func = FuncId.from(0), .args = r(5), .n_args = 2 } },
+        .{ .Move = .{ .dst = r(8), .src = r(2) } },
+        .{ .Move = .{ .dst = r(9), .src = r(3) } },
+        .{ .CallStatic = .{ .dst = r(10), .func = FuncId.from(0), .args = r(8), .n_args = 2 } },
+        .{ .BinOp = .{ .dst = r(11), .op = .Add, .lhs = r(7), .rhs = r(10) } },
+    }, .{ .Return = r(11) })};
+    defer blocks[0].insts.deinit(a);
+    try aliasBlockRuns(a, &blocks, 12);
+    const insts = blocks[0].insts.items;
+    try std.testing.expectEqual(@as(usize, 3), insts.len);
+    try std.testing.expectEqual(r(0), insts[0].CallStatic.args);
+    try std.testing.expectEqual(r(2), insts[1].CallStatic.args);
+    try std.testing.expectEqual(r(11), insts[2].BinOp.dst);
+}
+
+test "a copy coalesces past one dropped before it" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    // The second copy's walk back to its source passes where the first one
+    // was, which wrote the register the second one writes: gone, it is no
+    // touch of it.
+    var blocks = [_]BlockBuf{try testBlock(a, &.{
+        .{ .BinOp = .{ .dst = r(2), .op = .Add, .lhs = r(0), .rhs = r(0) } },
+        .{ .Const = .{ .dst = r(1), .value = ir.ConstId.from(0) } },
+        .{ .Move = .{ .dst = r(3), .src = r(2) } },
+        .{ .Move = .{ .dst = r(3), .src = r(1) } },
+    }, .{ .Return = r(3) })};
+    defer blocks[0].insts.deinit(a);
+    try coalesceBlockCopies(a, &blocks, 4);
+    const insts = blocks[0].insts.items;
+    try std.testing.expectEqual(@as(usize, 2), insts.len);
+    try std.testing.expectEqual(r(3), insts[0].BinOp.dst);
+    try std.testing.expectEqual(r(3), insts[1].Const.dst);
+}
+
+test "a finished body is copied out of its builder's scratch whole" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const r = Reg.from;
+    var caps = [_]Reg{ r(1), r(2) };
+    var insts = [_]Inst{
+        .{ .MakeClosure = .{ .dst = r(0), .func = FuncId.from(3), .captures = &caps } },
+    };
+    var catches = [_]ir.CatchHandler{.{ .class = ir.ClassId.from(0), .handler = BlockId.from(1), .exception_reg = r(4) }};
+    var handlers: ir.BlockHandlers = .{ .catches = &catches };
+    const work = [_]ir.Block{
+        .{ .id = BlockId.from(0), .insts = &insts, .terminator = .{ .Return = r(0) }, .handlers = &handlers },
+        .{ .id = BlockId.from(1), .insts = &.{}, .terminator = .Unreachable },
+    };
+    const out = try copyOut(a, &work);
+    // What scratch held is gone over; the copy keeps the body.
+    caps[0] = r(9);
+    insts[0].MakeClosure.dst = r(9);
+    catches[0].exception_reg = r(9);
+    try std.testing.expectEqual(r(0), out[0].insts[0].MakeClosure.dst);
+    try std.testing.expectEqualSlices(Reg, &.{ r(1), r(2) }, out[0].insts[0].MakeClosure.captures);
+    try std.testing.expectEqual(r(4), out[0].h().catches[0].exception_reg);
+    try std.testing.expect(out[1].handlers == null);
+    try std.testing.expectEqual(@as(usize, 0), out[1].insts.len);
+}

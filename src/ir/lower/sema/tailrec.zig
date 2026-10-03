@@ -60,7 +60,7 @@ pub fn markReturn(b: *Builder, e: *const ast.Expr) Error!void {
 fn markTail(b: *Builder, e: *const ast.Expr) Error!void {
     var cur = e;
     while (true) {
-        try b.tails.put(b.p.a, cur, {});
+        try b.tails.put(b.sa, cur, {});
         switch (cur.*) {
             .If => |x| {
                 try markBranch(b, x.then_branch);
@@ -136,7 +136,7 @@ pub fn jump(b: *Builder, run: []const Reg) Error!Reg {
     if (run.len != b.tail_params.len) return b.fail(b.cur_span, "a tail call's arguments do not match the parameters", .{});
     // Every argument first, so a parameter one of them reads is still the
     // old value (`f(b, a)`).
-    const temps = try b.p.a.alloc(Reg, run.len);
+    const temps = try b.sa.alloc(Reg, run.len);
     for (run, temps) |r, *t| {
         t.* = b.newReg();
         try b.emit(.{ .Move = .{ .dst = t.*, .src = r } });

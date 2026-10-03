@@ -93,8 +93,8 @@ fn reference(b: *Builder, e: *const ast.Expr, rr: *const RefRec) Error!Reg {
         return dst;
     }
     var regs: std.ArrayList(Reg) = .empty;
-    if (bound) |r| try regs.append(b.p.a, r);
-    try regs.appendSlice(b.p.a, try env.materializeCaptures(b, caps));
+    if (bound) |r| try regs.append(b.sa, r);
+    try regs.appendSlice(b.sa, try env.materializeCaptures(b, caps));
     try b.emit(.{ .MakeClosure = .{ .dst = dst, .func = adapter, .captures = regs.items } });
     return dst;
 }
@@ -130,7 +130,7 @@ fn boundValue(b: *Builder, e: *const ast.Expr, rr: *const RefRec) Error!?Reg {
 pub fn lowerAdapter(b: *Builder, adapter: u32) Error!void {
     const s = b.p.s;
     const br = b.p.br;
-    const a = b.p.a;
+    const a = b.sa;
     const ad = br.adapters[adapter];
     const target = ad.target;
     const lay = call.layoutOf(b.p, target);

@@ -535,9 +535,9 @@ fn callOnTyped(b: *Builder, rec: *const CallRec, recv: Reg, operands: []const Re
         try emitPrimRegs(b, op, dst, regs[0 .. operands.len + 1]);
         return coerce.coerce(b, dst, .none, types.result);
     }
-    const exprs = try b.p.a.alloc(?*const ast.Expr, operands.len);
+    const exprs = try b.sa.alloc(?*const ast.Expr, operands.len);
     @memset(exprs, null);
-    const regs = try b.p.a.alloc(?Reg, operands.len);
+    const regs = try b.sa.alloc(?Reg, operands.len);
     for (operands, regs) |o, *r| r.* = o;
     return call.emitCall(b, rec, .{ .exprs = exprs, .regs = regs, .receiver = recv, .from = from, .types = types.operands, .receiver_ty = types.recv, .result_ty = types.result });
 }
@@ -572,7 +572,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             const container = try body.lowerExpr(b, x.rhs);
             const elem = try body.lowerExpr(b, x.lhs);
             const rec = try b.call(e.id());
-            const r = try callOnTyped(b, &rec, container, &.{elem}, from, .{ .recv = b.exprType(x.rhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.lhs.id())}) });
+            const r = try callOnTyped(b, &rec, container, &.{elem}, from, .{ .recv = b.exprType(x.rhs.id()), .operands = try b.sa.dupe(TypeId, &.{b.exprType(x.lhs.id())}) });
             return if (x.op == .NotIn) negate(b, r) else r;
         },
         .Lt, .Le, .Gt, .Ge => {
@@ -593,7 +593,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
                 return dst;
             };
             // `compareTo`'s result against zero.
-            const order = try callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.rhs.id())}) });
+            const order = try callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.sa.dupe(TypeId, &.{b.exprType(x.rhs.id())}) });
             const zero = try b.emitConst(.{ .Int = 0 });
             try b.emit(.{ .BinOp = .{ .dst = dst, .op = cmp, .lhs = order, .rhs = zero } });
             return dst;
@@ -606,7 +606,7 @@ pub fn lowerBinary(b: *Builder, e: *const ast.Expr) Error!Reg {
             const l = try body.lowerExpr(b, x.lhs);
             const r = try body.lowerExpr(b, x.rhs);
             const rec = try b.call(e.id());
-            return callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.p.a.dupe(TypeId, &.{b.exprType(x.rhs.id())}), .result = b.exprType(e.id()) });
+            return callOnTyped(b, &rec, l, &.{r}, from, .{ .recv = b.exprType(x.lhs.id()), .operands = try b.sa.dupe(TypeId, &.{b.exprType(x.rhs.id())}), .result = b.exprType(e.id()) });
         },
         // A statement, never an expression the parser leaves here.
         .Assign => return b.fail(e.span(), "an assignment used as a value", .{}),
@@ -639,7 +639,7 @@ pub fn equality(b: *Builder, l: Reg, lt: TypeId, r: Reg, rt: TypeId, rec: CallRe
         return dst;
     }
     const numeric_left = lp != null and lp.? != .string;
-    const tys: Types = .{ .recv = lt, .operands = try b.p.a.dupe(TypeId, &.{rt}) };
+    const tys: Types = .{ .recv = lt, .operands = try b.sa.dupe(TypeId, &.{rt}) };
     if (!mayBeNull(s, lt)) return if (numeric_left) primEquals(b, l, lt, r, rec, tys) else callTyped(b, &rec, l, &.{r}, tys);
     const result = b.newReg();
     const on_null = try b.newBlock();
@@ -885,7 +885,7 @@ pub fn lowerIndex(b: *Builder, e: *const ast.Expr) Error!Reg {
 
 /// The static types of `exprs`, then of `last` when given.
 fn typesOf(b: *Builder, exprs: []const ast.Expr, last: ?*const ast.Expr) Error![]const TypeId {
-    const out = try b.p.a.alloc(TypeId, exprs.len + @intFromBool(last != null));
+    const out = try b.sa.alloc(TypeId, exprs.len + @intFromBool(last != null));
     for (exprs, 0..) |*x, i| out[i] = b.exprType(x.id());
     if (last) |l| out[exprs.len] = b.exprType(l.id());
     return out;
@@ -896,14 +896,14 @@ pub fn lowerIndexSet(b: *Builder, target: *const ast.Expr, value: *const ast.Exp
     const ix = target.Index;
     const recv = try body.lowerExpr(b, ix.receiver);
     const rec = try b.call(node);
-    const regs = try b.p.a.alloc(Reg, ix.args.len + 1);
+    const regs = try b.sa.alloc(Reg, ix.args.len + 1);
     for (ix.args, regs[0..ix.args.len]) |*arg, *r| r.* = try body.lowerExpr(b, arg);
     regs[ix.args.len] = try body.lowerExpr(b, value);
     _ = try callTyped(b, &rec, recv, regs, .{ .recv = b.exprType(ix.receiver.id()), .operands = try typesOf(b, ix.args, value) });
 }
 
 fn lowerAll(b: *Builder, exprs: []const ast.Expr) Error![]Reg {
-    const regs = try b.p.a.alloc(Reg, exprs.len);
+    const regs = try b.sa.alloc(Reg, exprs.len);
     for (exprs, regs) |*x, *r| r.* = try body.lowerExpr(b, x);
     return regs;
 }
@@ -998,7 +998,7 @@ fn writeTargetFrom(b: *Builder, t: Target, c: *const records.Compound, value: Re
     switch (t) {
         .index => |ix| {
             const set = c.set orelse return error.Unrecorded;
-            const regs = try b.p.a.alloc(Reg, ix.args.len + 1);
+            const regs = try b.sa.alloc(Reg, ix.args.len + 1);
             @memcpy(regs[0..ix.args.len], ix.args);
             regs[ix.args.len] = value;
             _ = try callOn(b, &set, ix.recv, regs);

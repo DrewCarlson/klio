@@ -28,6 +28,8 @@ pub const output = @import("output.zig");
 pub const members = @import("members.zig");
 pub const infer = @import("infer.zig");
 const scratch_mod = @import("scratch.zig");
+/// The bump allocator resolution works in, which lowering uses for its bodies too.
+pub const Scratch = scratch_mod.Scratch;
 pub const diagnose = @import("diagnose.zig");
 pub const exhaustive = @import("exhaustive.zig");
 pub const suppress = @import("suppress.zig");

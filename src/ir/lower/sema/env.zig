@@ -117,7 +117,7 @@ pub fn enter(b: *Builder) Error!void {
 }
 
 fn setSlot(b: *Builder, key: u64, slot: Slot) Error!void {
-    try b.env.slots.put(b.p.a, key, slot);
+    try b.env.slots.put(b.sa, key, slot);
 }
 
 /// Whether `f` (a function, constructor or property) is called with an
@@ -208,7 +208,7 @@ fn enterFunction(b: *Builder, f: Sym, captured: ?[]const CaptureKey) Error!void 
         if (!s.syms.flags(tp).reified) continue;
         const r = b.newReg();
         try b.emitEntry(.{ .LoadParam = .{ .dst = r, .idx = idx } });
-        try b.locals.put(b.p.a, tp, .{ .reg = r });
+        try b.locals.put(b.sa, tp, .{ .reg = r });
         idx += 1;
     }
 }
@@ -277,7 +277,7 @@ fn enterAccessor(b: *Builder) Error!void {
 fn enterComposer(b: *Builder, idx: u16, ints: u16) Error!void {
     const c = b.newReg();
     try b.emitEntry(.{ .LoadParam = .{ .dst = c, .idx = idx } });
-    const changed = try b.p.a.alloc(Reg, ints);
+    const changed = try b.sa.alloc(Reg, ints);
     for (changed, 0..) |*r, k| {
         r.* = b.newReg();
         try b.emitEntry(.{ .LoadParam = .{ .dst = r.*, .idx = idx + 1 + @as(u16, @intCast(k)) } });
@@ -377,13 +377,13 @@ pub fn receiverOf(b: *Builder, r: Receiver, expr_reg: ?Reg) Error!?Reg {
 /// composable filling its own defaults gives a defaulted parameter the
 /// register it fills.
 pub fn rebindParam(b: *Builder, p: Sym, reg: Reg) Error!void {
-    try b.env.loaded.put(b.p.a, symKey(p), reg);
+    try b.env.loaded.put(b.sa, symKey(p), reg);
 }
 
 /// Makes `reg` the receiver `{kind, owner}` from here on: a lambda
 /// lowered in place binds its receiver to the argument's register.
 pub fn bindReceiver(b: *Builder, kind: ImplicitKind, owner: Sym, reg: Reg) Error!void {
-    try b.env.loaded.put(b.p.a, recvKey(kind, owner), reg);
+    try b.env.loaded.put(b.sa, recvKey(kind, owner), reg);
 }
 
 /// The singleton of object or companion `cls`, loaded where it is used:
@@ -405,7 +405,7 @@ pub fn paramRegs(b: *Builder) Error![]?Reg {
         .capture => {},
     };
     const n = b.p.m.funcs.items[b.func.int()].params.len;
-    const out = try b.p.a.alloc(?Reg, n);
+    const out = try b.sa.alloc(?Reg, n);
     @memset(out, null);
     for (b.blocks.items[0].insts.items) |inst| switch (inst) {
         .LoadParam => |x| if (x.idx < n) {
@@ -418,7 +418,7 @@ pub fn paramRegs(b: *Builder) Error![]?Reg {
 
 fn known(b: *Builder, key: u64) Error!?Reg {
     // A composable's skip gate compares only what its body reads.
-    if (b.env.composer != null) try b.env.reads.put(b.p.a, key, {});
+    if (b.env.composer != null) try b.env.reads.put(b.sa, key, {});
     if (b.env.loaded.get(key)) |r| return r;
     const slot = b.env.slots.get(key) orelse return null;
     const dst = b.newReg();
@@ -432,11 +432,11 @@ fn known(b: *Builder, key: u64) Error!?Reg {
     if (cls != .none and key == recvKey(thisKind(b.p.s, cls), cls)) if (try coerce.scalarClass(b, cls)) |sc| {
         const number = b.newReg();
         try b.emitEntry(.{ .UnboxValue = .{ .dst = number, .src = dst, .class = sc.class, .slot = sc.slot } });
-        try b.unboxed.put(b.p.a, number, sc.class);
-        try b.env.loaded.put(b.p.a, key, number);
+        try b.unboxed.put(b.sa, number, sc.class);
+        try b.env.loaded.put(b.sa, key, number);
         return number;
     };
-    try b.env.loaded.put(b.p.a, key, dst);
+    try b.env.loaded.put(b.sa, key, dst);
     return dst;
 }
 
@@ -458,7 +458,7 @@ fn fromClass(b: *Builder, key: u64) Error!?Reg {
                 if (base == bridge.NONE) return b.fail(b.cur_span, "a class with captures has no capture slots", .{});
                 const dst = b.newReg();
                 try b.emitEntry(.{ .GetFieldSlot = .{ .dst = dst, .obj = reg, .slot = base + @as(u32, @intCast(i)) } });
-                try b.env.loaded.put(b.p.a, key, dst);
+                try b.env.loaded.put(b.sa, key, dst);
                 return dst;
             }
         }
@@ -470,7 +470,7 @@ fn fromClass(b: *Builder, key: u64) Error!?Reg {
             if (slot == bridge.NONE) return b.fail(b.cur_span, "an inner class has no outer slot", .{});
             const dst = b.newReg();
             try b.emitEntry(.{ .GetFieldSlot = .{ .dst = dst, .obj = reg, .slot = slot } });
-            try b.env.loaded.put(b.p.a, okey, dst);
+            try b.env.loaded.put(b.sa, okey, dst);
             break :blk dst;
         };
         if (okey == key) return reg;
@@ -520,10 +520,10 @@ pub fn bindLocalFrom(b: *Builder, s: Sym, value: Reg, from: ?locals.Mark) Error!
     } else if (b.p.s.syms.flags(s).mutable) blk: {
         const adopt = if (from) |m| locals.adoptable(b, m, value) else false;
         const dst = if (adopt) value else try moved(b, value);
-        try b.var_homes.put(b.p.a, dst, {});
+        try b.var_homes.put(b.sa, dst, {});
         break :blk .{ .reg = dst };
     } else if (b.var_homes.contains(value)) .{ .reg = try moved(b, value) } else .{ .reg = value };
-    try b.locals.put(b.p.a, s, home);
+    try b.locals.put(b.sa, s, home);
 }
 
 /// `value` in a register of its own.
@@ -541,11 +541,11 @@ pub fn declareLocal(b: *Builder, s: Sym) Error!void {
     const dst = b.newReg();
     if (b.p.br.isCell(s)) {
         try b.emit(.{ .MakeCell = .{ .dst = dst, .src = nul } });
-        try b.locals.put(b.p.a, s, .{ .cell = dst });
+        try b.locals.put(b.sa, s, .{ .cell = dst });
     } else {
         try b.emit(.{ .Move = .{ .dst = dst, .src = nul } });
-        try b.locals.put(b.p.a, s, .{ .reg = dst });
-        if (b.p.s.syms.flags(s).mutable) try b.var_homes.put(b.p.a, dst, {});
+        try b.locals.put(b.sa, s, .{ .reg = dst });
+        if (b.p.s.syms.flags(s).mutable) try b.var_homes.put(b.sa, dst, {});
     }
 }
 
@@ -626,7 +626,7 @@ fn lateinitLocal(s: *sema.Sema, sym: Sym) ?*const ast.Property {
 /// The registers holding `keys` in this body, in order: a home, a receiver,
 /// or this body's own capture (a cell stays a cell).
 pub fn materializeCaptures(b: *Builder, keys: []const CaptureKey) Error![]Reg {
-    const out = try b.p.a.alloc(Reg, keys.len);
+    const out = try b.sa.alloc(Reg, keys.len);
     for (keys, out) |k, *o| o.* = switch (k) {
         .local => |s| switch ((try homeOf(b, s)) orelse return unreachable_(b, s)) {
             .reg, .cell => |r| r,

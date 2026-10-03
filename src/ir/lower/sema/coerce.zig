@@ -269,6 +269,6 @@ pub fn unbox(b: *Builder, r: Reg, sc: Scalar) Error!Reg {
     if (b.unboxed.get(r)) |c| if (c == sc.class) return r;
     const dst = b.newReg();
     try b.emit(.{ .UnboxValue = .{ .dst = dst, .src = r, .class = sc.class, .slot = sc.slot } });
-    try b.unboxed.put(b.p.a, dst, sc.class);
+    try b.unboxed.put(b.sa, dst, sc.class);
     return dst;
 }

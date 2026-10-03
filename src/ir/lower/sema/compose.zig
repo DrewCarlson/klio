@@ -90,7 +90,7 @@ const Meta = struct {
 /// `invoke` of a composable function value, whose last slot is the value.
 pub fn callChanged(b: *Builder, rec: *const records.CallRec, value: bool, ops: call.Operands) Error![]const Reg {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     var metas: std.ArrayList(Meta) = .empty;
     const written: ?*const ast.Expr = if (ops.call) |e| (if (e.* == .Call) e else null) else null;
     const recv_expr: ?*const ast.Expr = if (written) |e| switch (e.Call.callee.*) {
@@ -117,7 +117,7 @@ fn convOf(rec: *const records.CallRec, i: usize) sema.records.Conv {
 /// The `$changed` a composable getter call passes: its receivers' bits.
 pub fn getterChanged(b: *Builder, rec: *const records.NameRec, p: Sym) Error![]const Reg {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     var metas: std.ArrayList(Meta) = .empty;
     for (rec.contexts) |c| try metas.append(a, try receiverMeta(b, c, null));
     if (s.syms.propertyInfo(p).receiver != .none) try metas.append(a, try receiverMeta(b, rec.extension, null));
@@ -201,7 +201,7 @@ fn trackedSlot(b: *Builder, key: u64) ?usize {
 /// The ints over `metas`, ten slots each: the static and unstable bits a
 /// constant, each forwarded slot's bits moved from the caller's.
 fn changedInts(b: *Builder, metas: []const Meta) Error![]const Reg {
-    const out = try b.p.a.alloc(Reg, bridge.changedInts(metas.len));
+    const out = try b.sa.alloc(Reg, bridge.changedInts(metas.len));
     for (out, 0..) |*r, k| {
         const start = k * 10;
         const end = @min(start + 10, metas.len);
@@ -508,7 +508,7 @@ const Defaults = struct {
     fn enter(b: *Builder, f: Sym) Error!?Defaults {
         const at = b.env.defaults_at orelse return null;
         const s = b.p.s;
-        const a = b.p.a;
+        const a = b.sa;
         const params = s.syms.functionInfo(f).params;
         const lay = call.layoutOf(b.p, f);
         const d: Defaults = .{
@@ -640,7 +640,7 @@ const Gate = struct {
     /// Leaves the current block for the gate's, and starts the body.
     fn open(b: *Builder, tracked: []const Tracked) Error!Gate {
         _ = tracked;
-        const dirty = try b.p.a.alloc(Reg, b.env.changed.len);
+        const dirty = try b.sa.alloc(Reg, b.env.changed.len);
         for (dirty) |*r| r.* = b.newReg();
         const g: Gate = .{ .dirty = dirty, .block = try b.newBlock(), .run = try b.newBlock() };
         b.terminate(.{ .Goto = g.block });
@@ -655,7 +655,7 @@ const Gate = struct {
         const changed = b.env.changed;
         b.switchTo(g.block);
         for (g.dirty, changed) |d, c| try b.emit(.{ .Move = .{ .dst = d, .src = c } });
-        const used = try b.p.a.alloc(bool, tracked.len);
+        const used = try b.sa.alloc(bool, tracked.len);
         for (tracked, used) |t, *u| u.* = isUsed(b, t);
         for (tracked, used, 0..) |t, u, slot| {
             if (t.self or t.vararg or !u) continue;
@@ -727,7 +727,7 @@ fn isUsed(b: *Builder, t: Tracked) bool {
 /// A composable function's tracked parameters.
 fn functionTracked(b: *Builder, f: Sym) Error![]const Tracked {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const info = s.syms.functionInfo(f);
     const lay = call.layoutOf(b.p, f);
     const own_defaults = bridge.composableDefaults(s, f);
@@ -759,7 +759,7 @@ fn functionTracked(b: *Builder, f: Sym) Error![]const Tracked {
 /// values, then the lambda itself.
 fn lambdaTracked(b: *Builder, f: Sym, rec: *const records.LambdaRec) Error![]const Tracked {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const args = s.types.argsOf(rec.fn_type);
     var out: std.ArrayList(Tracked) = .empty;
     var idx: u16 = 0;
@@ -1058,7 +1058,7 @@ fn endRestartGroup(b: *Builder, f: Sym, changed: []const Reg, defaults: ?*const 
     const lay = call.layoutOf(b.p, f);
     const n = lay.valueStart() + lay.values;
     const masks: []const Reg = if (defaults) |d| d.masks else &.{};
-    const caps = try b.p.a.alloc(Reg, n + changed.len + masks.len);
+    const caps = try b.sa.alloc(Reg, n + changed.len + masks.len);
     for (caps[0..n], 0..) |*r, i| {
         // A defaulted parameter recomposes with the value it was filled with.
         const home: ?Reg = if (defaults) |d| (if (i >= lay.valueStart()) d.homes[i - lay.valueStart()] else null) else null;
@@ -1086,9 +1086,9 @@ pub fn lowerRestart(b: *Builder, f: Sym) Error!void {
     while (i < n) : (i += 1) {
         const r = b.newReg();
         try b.emit(.{ .LoadCapture = .{ .dst = r, .idx = i } });
-        try run.append(b.p.a, r);
+        try run.append(b.sa, r);
     }
-    try run.append(b.p.a, try loadParam(b, 0));
+    try run.append(b.sa, try loadParam(b, 0));
     const update = runtimeFunction(b, "androidx.compose.runtime", "updateChangedFlags") orelse
         return b.fail(b.cur_span, "the compose runtime declares no `updateChangedFlags`", .{});
     var k: u16 = 0;
@@ -1098,13 +1098,13 @@ pub fn lowerRestart(b: *Builder, f: Sym) Error!void {
         if (k == 0) changed = try orRegs(b, changed, try b.emitConst(.{ .Int = 1 }));
         const flags = b.newReg();
         try b.emit(.{ .CallStatic = .{ .dst = flags, .func = update, .args = try b.run(&.{changed}), .n_args = 1 } });
-        try run.append(b.p.a, flags);
+        try run.append(b.sa, flags);
     }
     k = 0;
     while (k < lay.defaults) : (k += 1) {
         const mask = b.newReg();
         try b.emit(.{ .LoadCapture = .{ .dst = mask, .idx = n + lay.changed + k } });
-        try run.append(b.p.a, mask);
+        try run.append(b.sa, mask);
     }
     const target = br.funcOfOpt(f) orelse return b.fail(b.cur_span, "`{s}` has no id", .{s.str(s.syms.name(f))});
     try b.emit(.{ .CallStatic = .{ .dst = b.newReg(), .func = target, .args = try b.run(run.items), .n_args = @intCast(run.items.len) } });
@@ -1368,13 +1368,13 @@ pub fn wrapLambda(b: *Builder, closure: Reg, sp: span.Span, f: Sym) Error!Reg {
     else
         runtimeFunction(b, "androidx.compose.runtime.internal", "composableLambdaInstance")) orelse return closure;
     var args: std.ArrayList(Reg) = .empty;
-    try args.append(b.p.a, try b.emitConst(.{ .Int = positionalKey(sp) }));
-    try args.append(b.p.a, try b.emitConst(.{ .Bool = true }));
-    try args.append(b.p.a, closure);
+    try args.append(b.sa, try b.emitConst(.{ .Int = positionalKey(sp) }));
+    try args.append(b.sa, try b.emitConst(.{ .Bool = true }));
+    try args.append(b.sa, closure);
     if (in_scope) {
         // The key and `tracked` are constants: static to it.
-        try args.append(b.p.a, try composer(b));
-        try args.appendSlice(b.p.a, try changedInts(b, &.{ .{ .state = .static }, .{ .state = .static }, .{} }));
+        try args.append(b.sa, try composer(b));
+        try args.appendSlice(b.sa, try changedInts(b, &.{ .{ .state = .static }, .{ .state = .static }, .{} }));
     }
     const dst = b.newReg();
     try b.emit(.{ .CallStatic = .{ .dst = dst, .func = factory, .args = try b.run(args.items), .n_args = @intCast(args.items.len) } });
@@ -1669,7 +1669,7 @@ fn captureKeys(b: *Builder, f: Sym) Error![]const Key {
     const id = br.funcOfOpt(f) orelse return b.fail(b.cur_span, "a literal without an id", .{});
     const caps = br.capturesOf(id);
     const vals = try env.materializeCaptures(b, caps);
-    const keys = try b.p.a.alloc(Key, caps.len);
+    const keys = try b.sa.alloc(Key, caps.len);
     for (caps, vals, keys) |c, v, *k| k.* = switch (c) {
         .local => |l| .{
             .value = v,
@@ -1704,7 +1704,7 @@ pub fn isRemember(s: *sema.Sema, f: Sym) bool {
 /// the calculation is no literal, which the runtime's own `remember` does.
 pub fn lowerRemember(b: *Builder, rec: *const records.CallRec, ops: call.Operands) Error!?Reg {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const params = s.syms.functionInfo(rec.callee).params;
     var calc: ?*const ast.Expr = null;
     var exprs: std.ArrayList(*const ast.Expr) = .empty;
@@ -2021,8 +2021,8 @@ fn interfaceCallOf(b: *Builder, comptime iface_fqn: []const u8, name: []const u8
     const f = br.funcOfOpt(m) orelse return b.fail(b.cur_span, "`{s}.{s}` has no id", .{ iface_fqn, name });
     const slot = br.slotOf(f) orelse return b.fail(b.cur_span, "`{s}.{s}` has no slot", .{ iface_fqn, name });
     var run: std.ArrayList(Reg) = .empty;
-    try run.append(b.p.a, recv);
-    try run.appendSlice(b.p.a, args);
+    try run.append(b.sa, recv);
+    try run.appendSlice(b.sa, args);
     const dst = b.newReg();
     try b.emit(.{ .CallInterface = .{ .dst = dst, .iface = br.classOf(cls), .slot = slot, .args = try b.run(run.items), .n_args = @intCast(run.items.len) } });
     return dst;

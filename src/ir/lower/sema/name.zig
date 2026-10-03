@@ -426,13 +426,13 @@ fn readProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.Type
         }
     }
     var args: std.ArrayList(Reg) = .empty;
-    if (disp) |d| try args.append(b.p.a, d);
-    for (rec.contexts) |c| try args.append(b.p.a, try contextArg(b, c));
-    if (ext) |x| try args.append(b.p.a, x);
+    if (disp) |d| try args.append(b.sa, d);
+    for (rec.contexts) |c| try args.append(b.sa, try contextArg(b, c));
+    if (ext) |x| try args.append(b.sa, x);
     // A composable getter takes the composer and its change bits.
     if (compose.composableGetter(s, p)) {
-        try args.append(b.p.a, try compose.composer(b));
-        try args.appendSlice(b.p.a, try compose.getterChanged(b, rec, p));
+        try args.append(b.sa, try compose.composer(b));
+        try args.appendSlice(b.sa, try compose.getterChanged(b, rec, p));
     }
     return accessorCall(b, p, getterOf(br, p) orelse return noAccessor(b, p, "getter"), false, args.items, member and !via_super, via_super, from);
 }
@@ -467,10 +467,10 @@ fn writeProperty(b: *Builder, rec: *const NameRec, recv: ?Reg, recv_ty: sema.Typ
     }
     const value = try coerce.convert(b, value_in, from, try coerce.returnHeld(b, p));
     var args: std.ArrayList(Reg) = .empty;
-    if (disp) |d| try args.append(b.p.a, d);
-    for (rec.contexts) |c| try args.append(b.p.a, try contextArg(b, c));
-    if (ext) |x| try args.append(b.p.a, x);
-    try args.append(b.p.a, value);
+    if (disp) |d| try args.append(b.sa, d);
+    for (rec.contexts) |c| try args.append(b.sa, try contextArg(b, c));
+    if (ext) |x| try args.append(b.sa, x);
+    try args.append(b.sa, value);
     const setter = br.setterOf(p) orelse return noAccessor(b, p, "setter");
     _ = try accessorCall(b, p, setter, true, args.items, member and !via_super, via_super, null);
 }
@@ -533,7 +533,7 @@ fn accessorCall(b: *Builder, p: Sym, f: FuncId, setter: bool, args: []const Reg,
     // native implements it.
     if (inlineAccessor(s, p, setter) and !b.p.isNative(f)) {
         const rec: records.CallRec = .{ .callee = p, .form = .plain };
-        const lambdas = try b.p.a.alloc(?*const ast.Expr, args.len);
+        const lambdas = try b.sa.alloc(?*const ast.Expr, args.len);
         @memset(lambdas, null);
         return inline_mod.instantiate(b, &rec, f, args, lambdas);
     }

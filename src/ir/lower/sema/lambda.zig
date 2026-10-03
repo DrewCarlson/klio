@@ -125,7 +125,7 @@ fn returnsUnit(s: *sema.Sema, fn_type: sema.TypeId) bool {
 /// region's end; the returned register holds the literal's value.
 pub fn lowerInPlace(b: *Builder, literal: *const ast.Expr, args: []const Reg) Error!Reg {
     const s = b.p.s;
-    const a = b.p.a;
+    const a = b.sa;
     const lit = strip(literal);
     const id = lit.id();
     const rec = try b.lambda(id);

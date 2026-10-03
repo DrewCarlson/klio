@@ -3,8 +3,13 @@
 //! declaration up to a limit, so a declaration does not fault fresh pages
 //! in. Freeing or resizing in place works for the latest allocation only.
 //! Not thread safe: an analysis resolves its bodies on one thread.
+//!
+//! `KLIO_ARENA_GUARD=1` keeps an emptied chunk mapped with no access and
+//! never reuses it, so a read through a pointer that outlived a reset
+//! faults at once.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
@@ -18,6 +23,8 @@ pub const Scratch = struct {
     used: usize = 0,
     /// The most bytes in use when it was emptied.
     high: usize = 0,
+    /// Chunks `KLIO_ARENA_GUARD` keeps unreadable, unmapped by `deinit`.
+    guarded: std.ArrayList([]u8) = .empty,
 
     const min_chunk: usize = 256 * 1024;
     const chunk_align: Alignment = .fromByteUnits(std.heap.page_size_min);
@@ -38,6 +45,18 @@ pub const Scratch = struct {
     /// `keep` bytes.
     pub fn reset(self: *Scratch, keep: usize) void {
         self.high = @max(self.high, self.inUse());
+        if (can_guard and guarding()) {
+            // A fresh mapping without access in its place: the pages go
+            // back to the system and the addresses stay taken.
+            for (self.chunks.items) |c| {
+                self.guarded.append(std.heap.page_allocator, c) catch {};
+                _ = std.c.mmap(@ptrCast(@alignCast(c.ptr)), c.len, .{}, .{ .TYPE = .PRIVATE, .FIXED = true, .ANONYMOUS = true }, -1, 0);
+            }
+            self.chunks.clearRetainingCapacity();
+            self.cur = 0;
+            self.used = 0;
+            return;
+        }
         var total: usize = 0;
         var kept: usize = 0;
         for (self.chunks.items) |c| {
@@ -57,7 +76,22 @@ pub const Scratch = struct {
     pub fn deinit(self: *Scratch) void {
         self.reset(0);
         self.chunks.deinit(std.heap.page_allocator);
+        for (self.guarded.items) |c| std.heap.page_allocator.rawFree(c, chunk_align, @returnAddress());
+        self.guarded.deinit(std.heap.page_allocator);
         self.* = .{ .high = self.high };
+    }
+
+    var guard_state: std.atomic.Value(u8) = .init(0);
+
+    const can_guard = builtin.os.tag != .windows and builtin.link_libc;
+
+    fn guarding() bool {
+        var st = guard_state.load(.monotonic);
+        if (st == 0) {
+            st = if (std.c.getenv("KLIO_ARENA_GUARD") != null) 2 else 1;
+            guard_state.store(st, .monotonic);
+        }
+        return st == 2;
     }
 
     fn startIn(c: []u8, used: usize, alignment: Alignment) usize {

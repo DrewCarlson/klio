@@ -228,7 +228,7 @@ fn secondaryCtor(b: *Builder, cls: Sym, sc: *const ast.SecondaryCtor, this: Reg)
 }
 
 fn exprList(b: *Builder, args: []const ast.Expr) Error![]const ?*const ast.Expr {
-    const out = try b.p.a.alloc(?*const ast.Expr, args.len);
+    const out = try b.sa.alloc(?*const ast.Expr, args.len);
     for (args, out) |*x, *o| o.* = x;
     return out;
 }
@@ -271,7 +271,7 @@ fn superInit(b: *Builder, cls: Sym, cd: ClassDecl) Error!void {
     }
     const recs = try b.supers(cd.node);
     var written: std.ArrayList(usize) = .empty;
-    for (cd.supertype_args, 0..) |args, i| if (args != null) try written.append(b.p.a, i);
+    for (cd.supertype_args, 0..) |args, i| if (args != null) try written.append(b.sa, i);
     if (recs.len != written.items.len) {
         return b.fail(b.cur_span, "`{s}` has {d} supertype calls and {d} records", .{ s.str(s.syms.name(cls)), written.items.len, recs.len });
     }
@@ -330,14 +330,14 @@ fn implicitSuper(b: *Builder, cls: Sym, this: Reg, sp: @import("span").Span) Err
     const bridge_f = b.p.br.defaultsOf(ctor) orelse return b.fail(sp, "`{s}` has no defaults bridge", .{s.str(s.syms.name(sup))});
     const n = s.syms.functionInfo(ctor).params.len;
     var regs: std.ArrayList(Reg) = .empty;
-    try regs.append(b.p.a, this);
-    for (0..n) |_| try regs.append(b.p.a, try b.emitConst(.Unit));
+    try regs.append(b.sa, this);
+    for (0..n) |_| try regs.append(b.sa, try b.emitConst(.Unit));
     // Every parameter takes its default.
     var left = n;
     while (left > 0) {
         const bits = @min(left, 32);
         const word: u32 = if (bits == 32) std.math.maxInt(u32) else (@as(u32, 1) << @intCast(bits)) - 1;
-        try regs.append(b.p.a, try b.emitConst(.{ .Int = @bitCast(word) }));
+        try regs.append(b.sa, try b.emitConst(.{ .Int = @bitCast(word) }));
         left -= bits;
     }
     try b.emit(.{ .CallStatic = .{ .dst = b.newReg(), .func = bridge_f, .args = try b.run(regs.items), .n_args = @intCast(regs.items.len) } });
@@ -808,9 +808,9 @@ fn forwardAccessor(b: *Builder, prop: Sym, setter: bool) Error!void {
     const q = info.forwards;
     const target = if (setter) br.setterOf(q) orelse return b.fail(b.cur_span, "a forwarded setter of a `val`", .{}) else br.getterOf(q);
     var args: std.ArrayList(Reg) = .empty;
-    try args.append(b.p.a, delegate);
+    try args.append(b.sa, delegate);
     var idx: u16 = 1;
-    while (idx < paramCount(b)) : (idx += 1) try args.append(b.p.a, try loadParam(b, idx));
+    while (idx < paramCount(b)) : (idx += 1) try args.append(b.sa, try loadParam(b, idx));
     const v = try forwardCall(b, s.syms.owner(q), target, args.items);
     b.terminate(.{ .Return = if (setter) try b.unit() else v });
 }
@@ -871,7 +871,7 @@ pub fn lowerSynthetic(b: *Builder, f: Sym) Error!void {
         .annotation_hash_code => return annotationHashCode(b, cls),
         // An annotation instance names its class by its qualified name, as
         // kotlinc's generated `toString` does: `@test.One()`.
-        .annotation_to_string => return propertiesToString(b, cls, try std.fmt.allocPrint(b.p.a, "@{s}", .{s.str(s.syms.classInfo(cls).fqn)})),
+        .annotation_to_string => return propertiesToString(b, cls, try std.fmt.allocPrint(b.sa, "@{s}", .{s.str(s.syms.classInfo(cls).fqn)})),
         .none => {},
     }
     return b.fail(b.cur_span, "synthetic `{s}` has no lowering", .{n});
@@ -889,9 +889,9 @@ fn forwardFunction(b: *Builder, f: Sym) Error!void {
     const q = info.forwards;
     const target = br.funcOfOpt(q) orelse return b.fail(b.cur_span, "a forwarded member without an id", .{});
     var args: std.ArrayList(Reg) = .empty;
-    try args.append(b.p.a, delegate);
+    try args.append(b.sa, delegate);
     var idx: u16 = 1;
-    while (idx < paramCount(b)) : (idx += 1) try args.append(b.p.a, try loadParam(b, idx));
+    while (idx < paramCount(b)) : (idx += 1) try args.append(b.sa, try loadParam(b, idx));
     b.terminate(.{ .Return = try forwardCall(b, s.syms.owner(q), target, args.items) });
 }
 
@@ -911,9 +911,9 @@ fn samMethod(b: *Builder, iface: Sym) Error!void {
     const fv = b.newReg();
     try b.emit(.{ .GetFieldSlot = .{ .dst = fv, .obj = this, .slot = 0 } });
     var regs: std.ArrayList(Reg) = .empty;
-    try regs.append(b.p.a, fv);
+    try regs.append(b.sa, fv);
     var idx: u16 = 1;
-    while (idx < paramCount(b)) : (idx += 1) try regs.append(b.p.a, try loadParam(b, idx));
+    while (idx < paramCount(b)) : (idx += 1) try regs.append(b.sa, try loadParam(b, idx));
     const run = try b.run(regs.items);
     const dst = b.newReg();
     try b.emit(.{ .RCallValue = .{ .dst = dst, .callee = run, .args = Reg.from(run.int() + 1), .n_args = @intCast(regs.items.len - 1) } });
@@ -969,7 +969,7 @@ fn dataProperties(b: *Builder, cls: Sym) Error![]const Sym {
     };
     for (c.primary_params) |*cp| {
         if (cp.property == null) continue;
-        if (ctorProperty(s, cls, cp)) |p| try out.append(b.p.a, p);
+        if (ctorProperty(s, cls, cp)) |p| try out.append(b.sa, p);
     }
     return out.items;
 }
@@ -995,9 +995,9 @@ fn dataCopy(b: *Builder, cls: Sym, f: Sym) Error!void {
     const c = br.classOfOpt(cls) orelse return b.fail(b.cur_span, "a data class without an id", .{});
     const ctor = br.funcOfOpt(s.syms.classInfo(cls).primary_ctor) orelse return b.fail(b.cur_span, "a data class without a constructor", .{});
     var args: std.ArrayList(Reg) = .empty;
-    if (env.outerOf(s, cls)) |outer| try args.append(b.p.a, try env.receiver(b, env.thisKind(s, outer), outer));
-    try args.appendSlice(b.p.a, try env.materializeCaptures(b, br.class_captures[c.int()]));
-    for (s.syms.functionInfo(f).params) |p| try args.append(b.p.a, try env.readLocal(b, p));
+    if (env.outerOf(s, cls)) |outer| try args.append(b.sa, try env.receiver(b, env.thisKind(s, outer), outer));
+    try args.appendSlice(b.sa, try env.materializeCaptures(b, br.class_captures[c.int()]));
+    for (s.syms.functionInfo(f).params) |p| try args.append(b.sa, try env.readLocal(b, p));
     const dst = b.newReg();
     try b.emit(.{ .RNewInstance = .{ .dst = dst, .class = c, .ctor = ctor, .args = try b.run(args.items), .n_args = @intCast(args.items.len) } });
     b.terminate(.{ .Return = dst });
@@ -1021,9 +1021,9 @@ fn propertiesToString(b: *Builder, cls: Sym, head: []const u8) Error!void {
     const this = try env.thisOf(b, cls);
     const any_string = try anyMember(b, sema.wk.toString);
     const props = try dataProperties(b, cls);
-    var acc = try b.emitConst(.{ .String = try std.fmt.allocPrint(b.p.a, "{s}(", .{head}) });
+    var acc = try b.emitConst(.{ .String = try std.fmt.allocPrint(b.sa, "{s}(", .{head}) });
     for (props, 0..) |p, i| {
-        const label = try std.fmt.allocPrint(b.p.a, "{s}{s}=", .{ if (i == 0) "" else ", ", s.str(s.syms.name(p)) });
+        const label = try std.fmt.allocPrint(b.sa, "{s}{s}=", .{ if (i == 0) "" else ", ", s.str(s.syms.name(p)) });
         acc = try concat(b, acc, try b.emitConst(.{ .String = label }));
         // A scalar class's value renders by its own `toString`, boxed.
         const v = try coerce.coerce(b, try readProp(b, p, this), try sema.headers.propertyType(s, p), .none);
@@ -1320,7 +1320,7 @@ fn entriesArray(b: *Builder, cls: Sym) Error!Reg {
         const st = br.staticOf(e) orelse return b.fail(b.cur_span, "an entry without a static", .{});
         const r = b.newReg();
         try b.emit(.{ .LoadStatic = .{ .dst = r, .static = st } });
-        try regs.append(b.p.a, r);
+        try regs.append(b.sa, r);
     }
     const arr = dispatch.classIdOf(br, s.builtins.array) orelse return b.fail(b.cur_span, "the base declares no `kotlin.Array`", .{});
     const dst = b.newReg();
@@ -1350,7 +1350,7 @@ fn enumValueOf(b: *Builder, cls: Sym) Error!void {
         b.terminate(.{ .Return = r });
         b.switchTo(miss);
     }
-    const prefix = try std.fmt.allocPrint(b.p.a, "No enum constant {s}.", .{s.str(s.syms.classInfo(cls).fqn)});
+    const prefix = try std.fmt.allocPrint(b.sa, "No enum constant {s}.", .{s.str(s.syms.classInfo(cls).fqn)});
     const msg = try concat(b, try b.emitConst(.{ .String = prefix }), value);
     b.terminate(.{ .Throw = try newThrowable(b, "kotlin.IllegalArgumentException", msg) });
 }

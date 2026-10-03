@@ -424,7 +424,7 @@ const Emitted = struct {
 };
 
 fn bodyBuilder(fx: *Fixture) !lower.Builder {
-    return lower.Builder.init(&fx.p, 0, .none, ir.FuncId.from(0), .function);
+    return lower.Builder.init(&fx.p, fx.p.a, 0, .none, ir.FuncId.from(0), .function);
 }
 
 test "operands move into declaration order and an omitted one goes through the defaults bridge" {
@@ -628,7 +628,7 @@ const Lowered = struct {
 
     fn ofSym(fx: *Fixture, f: Sym) !Lowered {
         const fd = fx.s.syms.get(f).decl.function.?;
-        var b = try lower.Builder.init(&fx.p, fx.s.syms.get(f).file, f, ir.FuncId.from(f.int()), .function);
+        var b = try lower.Builder.init(&fx.p, fx.p.a, fx.s.syms.get(f).file, f, ir.FuncId.from(f.int()), .function);
         try lower.env.enter(&b);
         lower.body.lowerFunctionBody(&b, &fd.body.?) catch |err| {
             for (fx.p.errors.items) |le| std.debug.print("lowering error: {s}\n", .{le.msg});
@@ -853,7 +853,7 @@ test "a defaults bridge gives an omitted parameter its default over the paramete
     );
     defer fx.deinit();
     const f = try fx.top("dflt");
-    var b = try lower.Builder.init(&fx.p, fx.s.syms.get(f).file, f, ir.FuncId.from(9000), .defaults);
+    var b = try lower.Builder.init(&fx.p, fx.p.a, fx.s.syms.get(f).file, f, ir.FuncId.from(9000), .defaults);
     try lower.env.enter(&b);
     try call.lowerDefaultsBridge(&b, f);
     const l: Lowered = .{ .b = b, .fx = fx };

@@ -108,7 +108,7 @@ pub const FinallyReplay = struct { inst: *const Instance, frame: Frame };
 pub fn instantiate(b: *Builder, rec: *const CallRec, callee: FuncId, run: []const Reg, lambdas: []const ?*const ast.Expr) Error!Reg {
     _ = rec;
     const p = b.p;
-    const a = p.a;
+    const a = b.sa;
     try ensureLowered(b, callee);
     const f = &p.m.funcs.items[callee.int()];
     const nregs = f.n_locals;
@@ -439,7 +439,7 @@ const Target = struct {
 /// Copies callee block `k` into `b`, starting at its copy and continuing
 /// wherever a literal lowered in place leaves off.
 fn copyBlock(b: *Builder, inst: *const Instance, k: u32, tg: Target) Error!void {
-    const a = b.p.a;
+    const a = b.sa;
     const blk = &inst.callee.blocks[k];
     const h = blk.h();
     const first = tg.map[k];
@@ -585,7 +585,7 @@ fn enumIntrinsic(b: *Builder, inst: *const Instance, cs: anytype) Error!bool {
         .decl => |d| d,
         .sam => return false,
     };
-    const args = try b.p.a.alloc(Reg, cs.n_args - 1);
+    const args = try b.sa.alloc(Reg, cs.n_args - 1);
     for (args, 0..) |*r, j| r.* = mapReg(inst, Reg.from(cs.args.int() + @as(u32, @intCast(j))));
     const v = try call.enumIntrinsicCall(b, which, cls_sym, args);
     try b.emit(.{ .Move = .{ .dst = mapReg(inst, cs.dst), .src = v } });
@@ -641,7 +641,7 @@ fn lastDef(b: *Builder, r: Reg) ?Inst {
 /// arguments. The frames armed at the call are left through their copied
 /// finallys by a jump out of the literal.
 fn inPlace(b: *Builder, inst: *const Instance, k: u32, tg: Target, i: u16, cv: anytype) Error!void {
-    const a = b.p.a;
+    const a = b.sa;
     const args = try a.alloc(Reg, cv.n_args);
     for (args, 0..) |*r, j| r.* = Reg.from(cv.args.int() + inst.base + @as(u32, @intCast(j)));
     const depth = b.finallys.items.len;
@@ -704,7 +704,7 @@ fn computedLast(b: *Builder, v: Reg, dst: Reg) bool {
 
 fn popOnExit(b: *Builder, entry: BlockId) Error!void {
     const h = &b.blocks.items[b.cur.int()].handlers;
-    const merged = try b.p.a.alloc(BlockId, h.pop_on_exit.len + 1);
+    const merged = try b.sa.alloc(BlockId, h.pop_on_exit.len + 1);
     @memcpy(merged[0..h.pop_on_exit.len], h.pop_on_exit);
     merged[h.pop_on_exit.len] = entry;
     h.pop_on_exit = merged;
@@ -714,7 +714,7 @@ fn popOnExit(b: *Builder, entry: BlockId) Error!void {
 /// into fresh blocks starting at the current one; control continues in a
 /// fresh block after it.
 fn replayRegion(b: *Builder, inst: *const Instance, fr: Frame) Error!void {
-    const a = b.p.a;
+    const a = b.sa;
     const f = inst.callee;
     const fin = fr.fin orelse return;
     // The finally's blocks: reachable from its entry without its sentinel.
@@ -795,7 +795,7 @@ fn mapValue(comptime T: type, b: *Builder, inst: *const Instance, tg: Target, v:
         .pointer => |p| switch (p.size) {
             .slice => {
                 if (comptime !holdsIds(p.child)) return v;
-                const out = try b.p.a.alloc(p.child, v.len);
+                const out = try b.sa.alloc(p.child, v.len);
                 for (v, out) |e, *o| o.* = try mapValue(p.child, b, inst, tg, e);
                 return out;
             },

@@ -145,7 +145,7 @@ pub fn typeValue(b: *Builder, t: TypeId) Error!Reg {
                 .star => 3,
             };
             const inner = if (!known) try b.nullValue() else try typeValue(b, arg.ty);
-            try projections.append(b.p.a, try callStatic(b, project, &.{ try b.emitConst(.{ .Int = variance }), inner }));
+            try projections.append(b.sa, try callStatic(b, project, &.{ try b.emitConst(.{ .Int = variance }), inner }));
         }
         const arr = b.p.br.classOfOpt(s.builtins.array) orelse return error.Unsupported;
         const args = b.newReg();

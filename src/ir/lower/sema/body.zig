@@ -53,7 +53,9 @@ pub fn lowerBody(p: *Program, f: FuncId) Error!void {
     // Once only: an instantiation may have lowered its callee already.
     if (!try p.markAttempted(f)) return;
     const errors_before = p.errors.items.len;
-    var b = try Builder.init(p, plan.file, plan.owner, f, plan.kind);
+    const sa = try p.pushScratch();
+    defer p.popScratch();
+    var b = try Builder.init(p, sa, plan.file, plan.owner, f, plan.kind);
     b.site = bodySite(p, origin, plan);
     lowerOrigin(&b, origin) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;

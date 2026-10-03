@@ -511,11 +511,18 @@ fn censusResize(ptr: usize, new_len: usize) void {
 /// run instead of bytes still live, for the sites that turn memory over.
 pub var census_by_churn: bool = false;
 
+/// Prints the census so far. The report sorts a copy: a cell names its site
+/// by index, so a report in the middle of a run (`KLIO_SLAB_CENSUS_AT`)
+/// leaves the census counting on.
 pub fn censusReport() void {
     if (!census_enabled) return;
     censusLock();
-    const sites = census_sites.items;
+    const sites = std.heap.page_allocator.dupe(CensusSite, census_sites.items) catch {
+        censusUnlock();
+        return;
+    };
     censusUnlock();
+    defer std.heap.page_allocator.free(sites);
     std.sort.pdq(CensusSite, sites, {}, struct {
         fn lt(_: void, x: CensusSite, y: CensusSite) bool {
             if (census_by_churn) return x.total_bytes > y.total_bytes;

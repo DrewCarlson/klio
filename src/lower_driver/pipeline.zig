@@ -192,6 +192,7 @@ pub const Timing = struct {
     }
 
     pub fn mark(self: *Timing, what: []const u8) void {
+        if (runtime.envOnce("KLIO_SLAB_CENSUS_AT")) |at| if (std.mem.eql(u8, at, what)) runtime.slab.censusReport();
         if (!self.on) return;
         const now = runtime.clockMonotonicNanos();
         std.debug.print("[sema-timing] {s} {d}ms (rss {d}mb)\n", .{ what, (now - self.last) / 1_000_000, (runtime.currentRssKb() orelse 0) / 1024 });

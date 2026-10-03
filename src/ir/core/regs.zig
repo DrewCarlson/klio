@@ -360,15 +360,18 @@ fn place(sa: Allocator, blocks: []const Block, n: u32, w: usize, lo: []const u32
         visitTerminatorRegs(&blk.terminator, o, Order.cb);
     }
     if (failed) return error.OutOfMemory;
-    // By candidate first register: taken by a clash. Every register placed so far is below
-    // `top`, so a unit may always start at `top`, and only bases below it are marked.
-    const taken = try sa.alloc(bool, @as(usize, n) + 1);
+    // By candidate first register: taken by a clash of the unit being placed, which marks
+    // it with its stamp. Every register placed so far is below `top`, so a unit may always
+    // start at `top`, and only bases below it are marked.
+    const taken = try sa.alloc(u32, @as(usize, n) + 1);
     defer sa.free(taken);
+    @memset(taken, 0);
+    var stamp: u32 = 0;
     var top: u32 = 0;
     for (order.items) |head| {
         var size: u32 = 1;
         while (head + size < n and lo[head + size] == head) size += 1;
-        @memset(taken[0..top], false);
+        stamp += 1;
         var k: u32 = 0;
         while (k < size) : (k += 1) {
             for (row(clash, w, head + k), 0..) |word, wi| {
@@ -379,12 +382,12 @@ fn place(sa: Allocator, blocks: []const Block, n: u32, w: usize, lo: []const u32
                     if (x >= n) continue;
                     const at = to[x];
                     if (at == NONE or at < k) continue;
-                    if (at - k < top) taken[at - k] = true;
+                    if (at - k < top) taken[at - k] = stamp;
                 }
             }
         }
         var base: u32 = 0;
-        while (base < top and taken[base]) base += 1;
+        while (base < top and taken[base] == stamp) base += 1;
         k = 0;
         while (k < size) : (k += 1) to[head + k] = base + k;
         top = @max(top, base + size);
