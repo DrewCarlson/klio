@@ -222,17 +222,14 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
     while (lit.next()) |i| try lowered_ids.append(scratch, @intCast(i));
     // Bodies go to a section of their own, each self-contained, so a run
     // decodes only the ones it calls.
-    var section: std.ArrayList(u8) = .empty;
-    defer section.deinit(gpa);
+    var section = codec.Stream.init(gpa);
+    defer section.deinit();
     const funcs = try scratch.alloc(ir.Func, m.funcs.items.len);
     for (m.funcs.items, funcs) |*f, *out| {
         out.* = f.*;
         out.deferred_offset = 0;
         if (f.blocks.len == 0) continue;
-        const bytes = try codec.encodeBytes([]ir.Block, gpa, &f.blocks);
-        defer gpa.free(bytes);
-        out.deferred_offset = @intCast(section.items.len + 1);
-        try section.appendSlice(gpa, bytes);
+        out.deferred_offset = @intCast(try section.value([]ir.Block, &f.blocks) + 1);
         out.blocks = &.{};
     }
     var dispatch: std.ArrayList(KV(u64, FuncId)) = .empty;
@@ -255,29 +252,30 @@ pub fn encode(gpa: Allocator, scratch: Allocator, s: *sema.Sema, br: *const brid
             .consts = .of(m.consts.items),
             .method_dispatch = dispatch.items,
             .class_ancestors = .of(m.class_ancestors.items),
-            .body_section = section.items,
+            .body_section = section.bytes(),
         },
     };
-    const payload = try codec.encodeBytes(Image, gpa, &img);
-    defer gpa.free(payload);
     const fr: Front = .{ .sources = try base_sema.sources(scratch, map, n_sources), .driver = driver };
-    const src_bytes = try codec.encodeBytes(Front, gpa, &fr);
-    defer gpa.free(src_bytes);
+    // The image is written once, its header filled in when the lengths are
+    // known: the body section is most of it.
+    var out = codec.Stream.init(gpa);
+    defer out.deinit();
+    try out.ensureUnusedCapacity(section.len() + section.len() / 2);
+    try out.raw(magic);
+    const hdr_at = out.len();
+    try out.raw(&@as([@sizeOf(Header)]u8, @splat(0)));
+    const front_at = try out.value(Front, &fr);
+    const payload_at = try out.value(Image, &img);
     const hdr: Header = .{
         .version = version,
         .codec = codec.FORMAT_VERSION,
         .prefix = prefix,
-        .front_len = @intCast(src_bytes.len),
+        .front_len = @intCast(payload_at - front_at),
         .digest = s.prefixDigest(prefix),
-        .len = magic.len + @sizeOf(Header) + src_bytes.len + payload.len,
+        .len = out.len(),
     };
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, magic);
-    try out.appendSlice(gpa, std.mem.asBytes(&hdr));
-    try out.appendSlice(gpa, src_bytes);
-    try out.appendSlice(gpa, payload);
-    return out.toOwnedSlice(gpa);
+    @memcpy(out.bytes()[hdr_at..][0..@sizeOf(Header)], std.mem.asBytes(&hdr));
+    return out.toOwnedSlice();
 }
 
 fn bridgeImage(a: Allocator, br: *const bridge.Bridge) !BridgeImage {

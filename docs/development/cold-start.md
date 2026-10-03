@@ -52,3 +52,18 @@ from the program's.
 The default `zig build` produces a Debug binary, whose numbers are two to three
 times a ReleaseSafe or ReleaseFast build's; time a release build for anything
 you report.
+
+## Memory
+
+A cold build of `compose_material3.kt` peaks near 670 MB, a bake near 950 MB
+(the image is encoded while the build is still held). Where it goes and how
+each step keeps its working data is in `plans/sema-memory.md` and
+`plans/lowering-memory.md`: sema and lowering work in scratch they empty per
+declaration and per body (`sema.Scratch`), a run's build memory frees its large
+allocations (`runtime.LargeArena`), and `KLIO_SLAB_CENSUS_AT=<step>` attributes
+what is live at a step.
+
+The binary's `memset` is `src/fastmem`'s. Zig's compiler-rt links a byte-at-a-time
+`memset` weakly, and every `@memset` (zeroing a table, filling each fresh
+allocation of a safe build) ran it: a third of a cold build. The module is built
+with `-fno-builtin`, or its stores would compile into a call to `memset`, itself.

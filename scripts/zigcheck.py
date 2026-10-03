@@ -28,13 +28,18 @@ import tempfile
 # them, matching what build.zig attaches to the pack module.
 ZSTD_LIB = "zig-out/lib/libzstd.a"
 
+# Modules build.zig compiles with -fno-builtin: fastmem's memset stores
+# would otherwise compile into a call to memset, itself.
+NO_BUILTIN = {"fastmem": ["-fno-builtin"]}
+
 # module -> direct (non-dev) dependencies. Mirrors build.zig mod_list.
 GRAPH = {
     "span": [],
     "names": [],
     "diagnostics": ["span"],
     "ast": ["span"],
-    "runtime": ["ast", "span", "names"],
+    "fastmem": [],
+    "runtime": ["ast", "span", "names", "fastmem"],
     "types": ["ast", "diagnostics", "span"],
     "lexer": ["diagnostics", "span"],
     "pack": ["ast", "span", "types"],
@@ -141,6 +146,7 @@ def build_cmd(root, root_override, build_only, mods, target=None):
     # root module first, named "root"
     for d in GRAPH[root]:
         cmd += ["--dep", d]
+    cmd += NO_BUILTIN.get(root, [])
     cmd += [f"-Mroot={root_override or path(root)}"]
     # every other reachable module
     for m in mods:
@@ -151,6 +157,7 @@ def build_cmd(root, root_override, build_only, mods, target=None):
             # (one in a cycle with the root) must alias the import name to
             # that module so the cycle resolves.
             cmd += ["--dep", f"{d}=root" if d == root else d]
+        cmd += NO_BUILTIN.get(m, [])
         cmd += [f"-M{m}={path(m)}"]
     if build_only:
         cmd += [f"-femit-bin={obj_sink(root, root_override, target)}"]

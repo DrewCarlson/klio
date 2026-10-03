@@ -521,12 +521,8 @@ fn fileStatics(b: *Builder, file: u32, eager: bool) Error!void {
     const s = b.p.s;
     const br = b.p.br;
     b.setFile(file);
-    var i: u32 = 1;
-    while (i < br.static_of.len) : (i += 1) {
-        const st = br.static_of[i];
-        if (st.int() == bridge.NONE) continue;
-        const p = Sym.from(i);
-        if (s.syms.kind(p) != .property or s.syms.get(p).file != file) continue;
+    for (try b.p.staticsOf(file)) |p| {
+        const st = br.static_of[p.int()];
         if (try bridge.eagerProperty(s, p) != eager) continue;
         const pd = switch (s.syms.get(p).decl) {
             .property => |pd| pd.?,

@@ -50,11 +50,49 @@ pub const Program = struct {
     scalar_classes: std.AutoHashMapUnmanaged(Sym, ?coerce_mod.Scalar) = .empty,
     /// By member: the roots of its override family (`coerce`).
     family_roots: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,
+    /// By file: its top-level properties that have a static, in symbol
+    /// order (`staticsOf`).
+    file_statics: ?[]const []const Sym = null,
     /// Scratch for the bodies being lowered, one level per builder open: a
     /// lambda's or an inline callee's body lowers inside its caller's
     /// (`pushScratch`). `depth` of them are in use.
     levels: std.ArrayList(*sema.Scratch) = .empty,
     depth: u32 = 0,
+
+    /// The top-level properties of `file` that have a static, in symbol
+    /// order: what its initialization unit stores. Bucketed for every file
+    /// the first time a unit asks, in one walk of the symbols.
+    pub fn staticsOf(p: *Program, file: u32) Allocator.Error![]const Sym {
+        const by_file = p.file_statics orelse blk: {
+            const s = p.s;
+            const counts = try p.a.alloc(u32, s.files.items.len);
+            @memset(counts, 0);
+            const Each = struct {
+                fn static(pr: *const Program, i: u32) ?u32 {
+                    if (pr.br.static_of[i].int() == bridge.NONE) return null;
+                    const sym = Sym.from(i);
+                    if (pr.s.syms.kind(sym) != .property) return null;
+                    const f = pr.s.syms.get(sym).file;
+                    return if (f < pr.s.files.items.len) f else null;
+                }
+            };
+            var i: u32 = 1;
+            while (i < p.br.static_of.len) : (i += 1) if (Each.static(p, i)) |f| {
+                counts[f] += 1;
+            };
+            const lists = try p.a.alloc([]Sym, counts.len);
+            for (lists, counts) |*l, c| l.* = try p.a.alloc(Sym, c);
+            @memset(counts, 0);
+            i = 1;
+            while (i < p.br.static_of.len) : (i += 1) if (Each.static(p, i)) |f| {
+                lists[f][counts[f]] = Sym.from(i);
+                counts[f] += 1;
+            };
+            p.file_statics = lists;
+            break :blk lists;
+        };
+        return if (file < by_file.len) by_file[file] else &.{};
+    }
 
     /// Opens a scratch level for a body about to be lowered: what its
     /// builder works in, emptied by `popScratch` once `Builder.finish` has

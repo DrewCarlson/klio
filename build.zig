@@ -27,7 +27,10 @@ const mod_list = [_]Mod{
     .{ .name = "names", .tested = true },
     .{ .name = "diagnostics", .deps = &.{"span"}, .tested = true },
     .{ .name = "ast", .deps = &.{"span"}, .tested = true },
-    .{ .name = "runtime", .deps = &.{ "ast", "span", "names" }, .tested = true },
+    // The binary's `memset` (compiler-rt's sets a byte at a time), built
+    // with -fno-builtin so its stores do not become a call to itself.
+    .{ .name = "fastmem", .tested = true },
+    .{ .name = "runtime", .deps = &.{ "ast", "span", "names", "fastmem" }, .tested = true },
     .{ .name = "types", .deps = &.{ "ast", "diagnostics", "span" }, .tested = true },
     .{ .name = "lexer", .deps = &.{ "diagnostics", "span" }, .tested = true },
     .{ .name = "pack", .deps = &.{ "ast", "span", "types" }, .tested = true },
@@ -698,6 +701,10 @@ pub fn build(b: *std.Build) void {
     // Apple systems.
     mods.get("ir").?.link_libc = true;
     mods.get("jit").?.link_libc = true;
+    // sema's scratch and runtime's build arena map guard pages through libc.
+    mods.get("runtime").?.link_libc = true;
+    mods.get("sema").?.link_libc = true;
+    mods.get("fastmem").?.no_builtin = true;
 
     // Second per-(module, optimize) universe for the harness binaries.
     // Zig modules are keyed by (root source, optimize), so the harness
@@ -730,6 +737,9 @@ pub fn build(b: *std.Build) void {
         harness_mods.get("skiko").?.link_libc = true;
         harness_mods.get("ir").?.link_libc = true;
         harness_mods.get("jit").?.link_libc = true;
+        harness_mods.get("runtime").?.link_libc = true;
+        harness_mods.get("sema").?.link_libc = true;
+        harness_mods.get("fastmem").?.no_builtin = true;
         if (apple_sdk) |sdk| {
             var it = harness_mods.valueIterator();
             while (it.next()) |m| wireAppleSdk(b, m.*, sdk);
@@ -775,6 +785,9 @@ pub fn build(b: *std.Build) void {
         host_mods.get("skiko").?.link_libc = true;
         host_mods.get("ir").?.link_libc = true;
         host_mods.get("jit").?.link_libc = true;
+        host_mods.get("runtime").?.link_libc = true;
+        host_mods.get("sema").?.link_libc = true;
+        host_mods.get("fastmem").?.no_builtin = true;
         break :blk host_mods;
     };
     const embed_gen = b.addExecutable(.{

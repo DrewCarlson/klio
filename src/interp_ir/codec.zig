@@ -579,6 +579,53 @@ const TestTag = union(enum) {
 
 /// Encodes one value of any type the codec handles, self-contained, into an
 /// owned `gpa` buffer. `decodeBytes` reads it back.
+/// Values encoded one after another into one buffer, each self-contained:
+/// the bytes `encodeBytes` gives for each, back to back, with raw bytes
+/// between them as the caller writes them. A file of several sections is
+/// written once, not encoded section by section and then copied together.
+pub const Stream = struct {
+    e: Encoder,
+
+    pub fn init(gpa: Allocator) Stream {
+        return .{ .e = Encoder.init(gpa) };
+    }
+
+    pub fn deinit(self: *Stream) void {
+        self.e.deinit();
+    }
+
+    pub fn len(self: *const Stream) usize {
+        return self.e.out.items.len;
+    }
+
+    /// The bytes so far, to patch a header written ahead of what it counts.
+    pub fn bytes(self: *Stream) []u8 {
+        return self.e.out.items;
+    }
+
+    pub fn ensureUnusedCapacity(self: *Stream, n: usize) Allocator.Error!void {
+        try self.e.out.ensureUnusedCapacity(self.e.gpa, n);
+    }
+
+    pub fn raw(self: *Stream, b: []const u8) Allocator.Error!void {
+        try self.e.bytes(b);
+    }
+
+    /// Appends `value`, self-contained, and returns where it starts.
+    pub fn value(self: *Stream, comptime T: type, v: *const T) Allocator.Error!usize {
+        self.e.resetRegistry();
+        // What `toCodec` made for the previous value is keyed by nothing now.
+        if (self.e.images) |*arena| _ = arena.reset(.retain_capacity);
+        const start = self.e.out.items.len;
+        try encodeValue(T, &self.e, v);
+        return start;
+    }
+
+    pub fn toOwnedSlice(self: *Stream) Allocator.Error![]u8 {
+        return self.e.out.toOwnedSlice(self.e.gpa);
+    }
+};
+
 pub fn encodeBytes(comptime T: type, gpa: Allocator, value: *const T) Allocator.Error![]u8 {
     var e = Encoder.init(gpa);
     defer e.deinit();
@@ -916,4 +963,28 @@ test "a growable list decodes with room to grow" {
     const before = l.items.ptr;
     try l.append(a, 1);
     try testing.expect(l.items.ptr == before);
+}
+
+test "a stream holds each value as encodeBytes encodes it, back to back" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const A = struct { ids: []const u32, name: []const u8 };
+    const shared = [_]u32{ 1, 2, 3 };
+    const x: A = .{ .ids = &shared, .name = "x" };
+    const y: A = .{ .ids = &shared, .name = "yy" };
+    var st = Stream.init(testing.allocator);
+    defer st.deinit();
+    try st.raw("hd");
+    const at_x = try st.value(A, &x);
+    const at_y = try st.value(A, &y);
+    const want_x = try encodeBytes(A, testing.allocator, &x);
+    defer testing.allocator.free(want_x);
+    const want_y = try encodeBytes(A, testing.allocator, &y);
+    defer testing.allocator.free(want_y);
+    try testing.expectEqual(@as(usize, 2), at_x);
+    try testing.expectEqualSlices(u8, want_x, st.bytes()[at_x..at_y]);
+    try testing.expectEqualSlices(u8, want_y, st.bytes()[at_y..]);
+    const back = try decodeBytes(A, arena.allocator(), st.bytes()[at_y..]);
+    try testing.expectEqualStrings("yy", back.name);
+    try testing.expectEqualSlices(u32, &shared, back.ids);
 }

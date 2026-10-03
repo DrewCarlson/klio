@@ -52,6 +52,10 @@ pub const gc = objcell.gc;
 pub const slab = @import("slab.zig");
 /// An arena that frees its large allocations: a run's build memory.
 pub const LargeArena = @import("large_arena.zig").LargeArena;
+comptime {
+    // The binary's `memset`, in place of compiler-rt's byte loop.
+    _ = @import("fastmem");
+}
 pub const leaktrack = @import("leaktrack.zig");
 pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");

@@ -45,10 +45,41 @@ All of it leaves every body's IR identical (`KLIO_LOWER_FINGERPRINT`).
 | bake compose_material3 | 965 MB | 1.24 s | 89 MB |
 | cold hello | 86 MB | 0.07 s | 9 MB |
 
+Then, from a profile whose largest single symbol turned out to be `memset`:
+
+- The binary's `memset` was Zig compiler-rt's, which stores a byte at a time
+  and is linked weakly; every `@memset` ran it (zeroing the passes' count
+  tables, filling each fresh allocation of a safe build with `0xAA`). It
+  was a third of a cold build. `src/fastmem` is a `memset` that stores wide
+  words, built with `-fno-builtin` so its stores do not compile into a call
+  to itself, and linked strongly in compiler-rt's place. Forwarding to the
+  platform's instead is not safe everywhere: glibc's `__memset_chk` is
+  folded back into a `memset` call by the optimizer, and compiler-rt's own
+  weak `__memset_chk` shadows glibc's. C passes the fill as an `int`,
+  possibly sign-extended; only its low byte is stored.
+- A file's initialization unit scanned every symbol for that file's
+  statics; they are bucketed by file once (`Program.staticsOf`).
+- The image is encoded into one buffer, its header patched in at the end
+  (`codec.Stream`), the bodies' section into another with one encoder reset
+  per body: the image bytes are identical.
+
+| | wall | `bodies` | `bridge` | `lower` |
+|---|---:|---:|---:|---:|
+| cold compose_material3, before | 3.80 s | 1.64 s | 0.22 s | 1.20 s |
+| cold compose_material3 | 2.57 s | 1.16 s | 0.15 s | 0.79 s |
+| cold compose_material3 on Linux (aarch64) | 3.88 s to 2.66 s | | | |
+| cold hello | 0.44 s to 0.28 s | | | |
+
+Execution gains too: the `collections` and `strings` memory benchmarks run
+about a fifth faster.
+
 ## Next
 
-- Register compaction is a quarter of lowering: interference and placement
-  walk every clash edge.
+- Register compaction is the largest part of lowering left: interference
+  and placement walk every clash edge.
 - The bridge adds 166 MB: 614K qualified names formatted (92 MB churn),
   headers, parameters, override roots.
-- A bake's image encoding adds 200 MB after lowering, the bake's peak.
+- A bake peaks while its image is encoded: the sema, bridge and module
+  tables are first copied into the image's shape (`base_sema.image`,
+  `bridgeImage`, `resolvedImage`), which an encoder reading the live tables
+  would not need.
