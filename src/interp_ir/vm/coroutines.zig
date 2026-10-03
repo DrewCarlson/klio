@@ -655,15 +655,17 @@ const VirtualClock = struct {
     /// do once no other live pump has a floor below `t`: that pump runs first
     /// and may preempt it. A top-level driver (`wait_unsettled`) also waits
     /// while anything unordered is in flight (a dispatched task or a timer post
-    /// not yet taken), unless it has starved. One critical section: a pump that
+    /// not yet taken). A pump that has starved waits for neither: the pump
+    /// holding it back is blocked outside its loop, on real I/O or a long
+    /// computation, as the thread holds of `holdClock` are. One critical section: a pump that
     /// takes a post registers its floor before the post settles, so a driver
     /// that sees it settled sees the floor too.
     fn tryAdvance(id: u64, t: i64, wait_unsettled: bool, starving: bool) Advanced {
         mutex.lock();
         defer mutex.unlock();
-        if (minOtherFloorLocked(id)) |other| {
+        if (!starving) if (minOtherFloorLocked(id)) |other| {
             if (other < t) return .floor_below;
-        }
+        };
         if (wait_unsettled and pool_unsettled != 0 and !starving) return .unsettled;
         if (t > now) now = t;
         return .advanced;
@@ -1646,9 +1648,11 @@ pub const CooperativeInterceptor = struct {
                     const wait_unsettled = !vmhost.scheduler.onPoolWorker();
                     switch (VirtualClock.tryAdvance(self.clock_id, t, wait_unsettled, false)) {
                         .advanced => {},
-                        .floor_below => return .blocked,
-                        // Starved: the check runs again with the valve open.
-                        .unsettled => if (!self.virtualStarvationDue() or
+                        // Held back by another pump's earlier floor, or by work in
+                        // flight that has published none, for no longer in real
+                        // time than the timer's own delay: starved, the check runs
+                        // again with the valve open.
+                        .floor_below, .unsettled => if (!self.virtualStarvationDue() or
                             VirtualClock.tryAdvance(self.clock_id, t, wait_unsettled, true) != .advanced) return .blocked,
                     }
                     self.virtual_now = t;
@@ -2492,7 +2496,8 @@ fn pumpLoop(
         }
         if (pumpDiagEnabled() and diag_loops % 2000 == 0) {
             const t = coroTop().?;
-            std.debug.print("[PUMP] loop {d}: ready={d} launched={d} parked={d} root={?}\n", .{ diag_loops, t.ready.items.len, t.launched.items.len, t.parked.count(), root_token.* });
+            std.debug.print("[PUMP] loop {d}: ready={d} launched={d} parked={d} root={?} clk={d} vnow={d}\n", .{ diag_loops, t.ready.items.len, t.launched.items.len, t.parked.count(), root_token.*, t.clock_id, t.virtual_now });
+            if (t.mode == .Virtual) VirtualClock.dumpState();
             var sit = t.slot_to_token.iterator();
             while (sit.next()) |e| std.debug.print("[PUMP]   slot {d} -> tok {d}\n", .{ e.key_ptr.*, e.value_ptr.* });
             var it = t.parked.iterator();

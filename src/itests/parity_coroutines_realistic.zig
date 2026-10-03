@@ -550,3 +550,30 @@ test "cs8_dotted_in_builder" {
 test "cs9_channels" {
     try runSmoke("cs9_channels");
 }
+
+// Under virtual time an event loop whose body waits without suspending, as a
+// blocking read does, holds the clock at its instant; another thread's timer
+// still fires once it has waited its own delay in real time.
+test "a timer fires while another event loop waits outside its loop" {
+    const src =
+        \\
+        \\import kotlin.concurrent.thread
+        \\import kotlinx.coroutines.*
+        \\object Signal {
+        \\    @Volatile var fired = false
+        \\}
+        \\fun main() = runBlocking {
+        \\    val other = thread {
+        \\        runBlocking {
+        \\            delay(50)
+        \\            Signal.fired = true
+        \\        }
+        \\    }
+        \\    while (!Signal.fired) {}
+        \\    other.join()
+        \\    println("fired")
+        \\}
+        \\
+    ;
+    try assertKlio("timer_under_held_clock", src, "fired\n");
+}
