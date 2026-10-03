@@ -366,6 +366,10 @@ fn place(sa: Allocator, blocks: []const Block, n: u32, w: usize, lo: []const u32
     const taken = try sa.alloc(u32, @as(usize, n) + 1);
     defer sa.free(taken);
     @memset(taken, 0);
+    // The registers placed so far: only their clashes can take a slot.
+    const placed = try sa.alloc(u64, w);
+    defer sa.free(placed);
+    @memset(placed, 0);
     var stamp: u32 = 0;
     var top: u32 = 0;
     for (order.items) |head| {
@@ -374,8 +378,8 @@ fn place(sa: Allocator, blocks: []const Block, n: u32, w: usize, lo: []const u32
         stamp += 1;
         var k: u32 = 0;
         while (k < size) : (k += 1) {
-            for (row(clash, w, head + k), 0..) |word, wi| {
-                var bits = word;
+            for (row(clash, w, head + k), placed, 0..) |word, done, wi| {
+                var bits = word & done;
                 while (bits != 0) {
                     const x: u32 = @intCast(wi * 64 + @ctz(bits));
                     bits &= bits - 1;
@@ -389,7 +393,10 @@ fn place(sa: Allocator, blocks: []const Block, n: u32, w: usize, lo: []const u32
         var base: u32 = 0;
         while (base < top and taken[base] == stamp) base += 1;
         k = 0;
-        while (k < size) : (k += 1) to[head + k] = base + k;
+        while (k < size) : (k += 1) {
+            to[head + k] = base + k;
+            add(placed, head + k);
+        }
         top = @max(top, base + size);
     }
     return top;

@@ -56,7 +56,7 @@ pub fn lowerBody(p: *Program, f: FuncId) Error!void {
     const sa = try p.pushScratch();
     defer p.popScratch();
     var b = try Builder.init(p, sa, plan.file, plan.owner, f, plan.kind);
-    b.site = bodySite(p, origin, plan);
+    b.site = try bodySite(p, origin, plan);
     lowerOrigin(&b, origin) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         // `fail` recorded its own error; a missing record and a construct
@@ -75,10 +75,10 @@ pub fn lowerBody(p: *Program, f: FuncId) Error!void {
 /// Where a failure of the body is reported before any expression names
 /// one: the declaration it belongs to, the file or enum class an init
 /// unit initializes, or the reference an adapter serves.
-fn bodySite(p: *Program, origin: bridge.FuncOrigin, plan: Plan) span.Span {
+fn bodySite(p: *Program, origin: bridge.FuncOrigin, plan: Plan) Error!span.Span {
     const s = p.s;
     return switch (origin) {
-        .adapter => |i| refs.referenceSite(p, i),
+        .adapter => |i| try refs.referenceSite(p, i),
         .init_unit => |u| switch (p.br.units[u]) {
             .file, .eager_file => |file| if (file < s.files.items.len) (if (s.files.items[file].ast) |f| f.span else builder.zero_span) else builder.zero_span,
             .enum_class => |cls| declSite(s, cls),

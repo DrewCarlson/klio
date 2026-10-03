@@ -211,6 +211,9 @@ pub const Sema = struct {
     suspend_function_classes: std.AutoHashMapUnmanaged(u32, Sym) = .empty,
     kfunction_classes: std.AutoHashMapUnmanaged(u32, Sym) = .empty,
     ksuspend_function_classes: std.AutoHashMapUnmanaged(u32, Sym) = .empty,
+    /// The four maps above turned around: a class to its arity and which
+    /// it is (`fnClassOf`), rebuilt when they have grown.
+    fn_class_of: std.AutoHashMapUnmanaged(Sym, FnClass) = .empty,
     /// Common type ids, filled once the builtins resolve.
     t: CommonTypes = .{},
     /// The default-import packages that exist, filled on first use.
@@ -544,6 +547,45 @@ pub const Sema = struct {
     /// `kotlin.FunctionN` (or `SuspendFunctionN`), declared on first use with
     /// `N` input type parameters, an `out R` result and an `operator fun
     /// invoke`.
+    pub const FnClass = struct { arity: u32, kind: enum { function, suspend_function, kfunction, ksuspend_function } };
+
+    /// Which of `FunctionN`, `SuspendFunctionN`, `KFunctionN` and
+    /// `KSuspendFunctionN` class `cls` is, and its `N`; null for any other.
+    pub fn fnClassOf(self: *Sema, cls: Sym) ?FnClass {
+        const n = self.function_classes.count() + self.suspend_function_classes.count() + self.kfunction_classes.count() + self.ksuspend_function_classes.count();
+        if (self.fn_class_of.count() != n) self.indexFnClasses() catch return self.fnClassScan(cls);
+        return self.fn_class_of.get(cls);
+    }
+
+    fn indexFnClasses(self: *Sema) Allocator.Error!void {
+        self.fn_class_of.clearRetainingCapacity();
+        const Each = struct { map: *const std.AutoHashMapUnmanaged(u32, Sym), kind: @FieldType(FnClass, "kind") };
+        for ([_]Each{
+            .{ .map = &self.function_classes, .kind = .function },
+            .{ .map = &self.suspend_function_classes, .kind = .suspend_function },
+            .{ .map = &self.kfunction_classes, .kind = .kfunction },
+            .{ .map = &self.ksuspend_function_classes, .kind = .ksuspend_function },
+        }) |m| {
+            var it = m.map.iterator();
+            while (it.next()) |e| try self.fn_class_of.put(self.arena, e.value_ptr.*, .{ .arity = e.key_ptr.*, .kind = m.kind });
+        }
+    }
+
+    /// `fnClassOf` by walking the maps, when indexing them ran out of memory.
+    fn fnClassScan(self: *Sema, cls: Sym) ?FnClass {
+        const Each = struct { map: *const std.AutoHashMapUnmanaged(u32, Sym), kind: @FieldType(FnClass, "kind") };
+        for ([_]Each{
+            .{ .map = &self.function_classes, .kind = .function },
+            .{ .map = &self.suspend_function_classes, .kind = .suspend_function },
+            .{ .map = &self.kfunction_classes, .kind = .kfunction },
+            .{ .map = &self.ksuspend_function_classes, .kind = .ksuspend_function },
+        }) |m| {
+            var it = m.map.iterator();
+            while (it.next()) |e| if (e.value_ptr.* == cls) return .{ .arity = e.key_ptr.*, .kind = m.kind };
+        }
+        return null;
+    }
+
     /// `KFunctionN` / `KSuspendFunctionN`; none when the base declares no
     /// `KFunction`.
     pub fn kfunctionClass(self: *Sema, arity: u32, is_suspend: bool) Allocator.Error!Sym {

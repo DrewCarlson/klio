@@ -53,11 +53,32 @@ pub const Program = struct {
     /// By file: its top-level properties that have a static, in symbol
     /// order (`staticsOf`).
     file_statics: ?[]const []const Sym = null,
+    /// By what an adapter adapts: the reference it serves (`adapterRef`).
+    adapter_refs: ?std.AutoHashMapUnmanaged(bridge.Adapter, AdapterRef) = null,
     /// Scratch for the bodies being lowered, one level per builder open: a
     /// lambda's or an inline callee's body lowers inside its caller's
     /// (`pushScratch`). `depth` of them are in use.
     levels: std.ArrayList(*sema.Scratch) = .empty,
     depth: u32 = 0,
+
+    /// The reference record adapter `ad` serves: the first of the records
+    /// that adapt what it does, in the order they are kept. All of them are
+    /// indexed the first time one is asked for, in one walk of the records.
+    pub fn adapterRef(p: *Program, ad: bridge.Adapter) Allocator.Error!?AdapterRef {
+        const by_adapter = if (p.adapter_refs) |*m| m else blk: {
+            var m: std.AutoHashMapUnmanaged(bridge.Adapter, AdapterRef) = .empty;
+            for (p.br.records) |fr| for (fr.refs) |r| switch (r.detail) {
+                .ref => |x| {
+                    const gop = try m.getOrPut(p.a, .{ .target = x.target, .ty = x.ty, .bound = std.meta.activeTag(x.bound) });
+                    if (!gop.found_existing) gop.value_ptr.* = .{ .rec = x, .anchor = r.anchor };
+                },
+                else => {},
+            };
+            p.adapter_refs = m;
+            break :blk &p.adapter_refs.?;
+        };
+        return by_adapter.get(ad);
+    }
 
     /// The top-level properties of `file` that have a static, in symbol
     /// order: what its initialization unit stores. Bucketed for every file
@@ -146,6 +167,9 @@ pub const Program = struct {
 };
 
 pub const LowerError = struct { func: FuncId, span: span.Span, msg: []const u8 };
+
+/// The reference an adapter serves, and where it is written.
+pub const AdapterRef = struct { rec: *const sema.records.RefRec, anchor: span.Span };
 
 pub const BodyKind = enum { function, ctor, getter, setter, defaults, lambda, local_fun, init_unit, sam_ctor, sam_method, sam_equals, sam_hash_code, delegated, adapter, restart };
 
@@ -485,21 +509,33 @@ pub const Builder = struct {
         }
         // A dropped instruction's reads stop counting, which may leave what
         // it read unread: until a sweep drops nothing. Nothing dropped comes
-        // back, so the order they go in leaves the same body.
+        // back, so the order they go in leaves the same body. A sweep walks
+        // each block backward, from a value's reads to its write, so a chain
+        // of copies nothing reads goes in one sweep.
+        var longest: usize = 0;
+        for (b.blocks.items) |*blk| longest = @max(longest, blk.insts.items.len);
+        const dropped = try b.sa.alloc(bool, longest);
         while (true) {
             var removed = false;
-            for (b.blocks.items) |*blk| {
-                var kept: usize = 0;
-                for (blk.insts.items) |*inst| {
-                    if (deadTypePart(inst, builders, reads)) {
-                        ir.visitInstRegs(inst, Count{ .reads = reads }, Count.uncount);
-                        removed = true;
-                        continue;
-                    }
-                    blk.insts.items[kept] = inst.*;
-                    kept += 1;
+            var bi = b.blocks.items.len;
+            while (bi > 0) {
+                bi -= 1;
+                const blk = &b.blocks.items[bi];
+                const insts = blk.insts.items;
+                @memset(dropped[0..insts.len], false);
+                var any = false;
+                var i = insts.len;
+                while (i > 0) {
+                    i -= 1;
+                    if (!deadTypePart(&insts[i], builders, reads)) continue;
+                    ir.visitInstRegs(&insts[i], Count{ .reads = reads }, Count.uncount);
+                    dropped[i] = true;
+                    any = true;
                 }
-                blk.insts.shrinkRetainingCapacity(kept);
+                if (any) {
+                    dropMarked(blk, dropped);
+                    removed = true;
+                }
             }
             if (!removed) return;
         }

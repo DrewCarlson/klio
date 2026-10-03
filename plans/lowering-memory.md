@@ -73,10 +73,27 @@ Then, from a profile whose largest single symbol turned out to be `memset`:
 Execution gains too: the `collections` and `strings` memory benchmarks run
 about a fifth faster.
 
+Then three scans and a fixpoint that ran far more often than they had to:
+
+- `calls.functionShape` found a class's `FunctionN` arity by scanning four
+  arity-to-class maps on every call, for every type asked about; sema keeps
+  them turned around (`Sema.fnClassOf`), rebuilt when they grow.
+- An adapter's reference was found by scanning every record of every file
+  (568K) per adapter; the records are indexed by what they adapt once
+  (`Program.adapterRef`).
+- Pruning dead type values removed a chain of copies one link per sweep;
+  a sweep now walks each block backward, from reads to writes.
+- Register placement intersects each clash row with the registers placed so
+  far before walking its bits.
+
+| | wall | `bodies` | `lower` |
+|---|---:|---:|---:|
+| cold compose_material3 | 2.23 s | 1.05 s | 0.60 s |
+
 ## Next
 
-- Register compaction is the largest part of lowering left: interference
-  and placement walk every clash edge.
+- Register compaction is a third of lowering now: liveness, interference
+  and placement over bitsets as wide as the register count.
 - The bridge adds 166 MB: 614K qualified names formatted (92 MB churn),
   headers, parameters, override roots.
 - A bake peaks while its image is encoded: the sema, bridge and module

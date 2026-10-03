@@ -2472,12 +2472,10 @@ fn suspendConverted(s: *Sema, t_in: TypeId) Allocator.Error!?TypeId {
         .class => |c| c,
         else => return null,
     };
-    var it = s.function_classes.iterator();
-    while (it.next()) |e| if (e.value_ptr.* == c.sym) {
-        const sus = s.suspend_function_classes.get(e.key_ptr.*) orelse return null;
-        return try s.types.classAttrs(sus, c.args, c.nullable, c.attrs);
-    };
-    return null;
+    const fc = s.fnClassOf(c.sym) orelse return null;
+    if (fc.kind != .function) return null;
+    const sus = s.suspend_function_classes.get(fc.arity) orelse return null;
+    return try s.types.classAttrs(sus, c.args, c.nullable, c.attrs);
 }
 
 /// The conversion that lets a value of type `at` be passed for `pt`, which
@@ -2556,26 +2554,21 @@ pub fn functionShape(s: *Sema, t: TypeId) ?FnShape {
         .class => |c| c,
         else => return null,
     };
-    var it = s.function_classes.iterator();
-    while (it.next()) |e| if (e.value_ptr.* == c.sym) {
-        const n = e.key_ptr.*;
-        const recv: usize = @intFromBool(c.attrs.ext_fn);
-        return .{ .params = n - recv - c.attrs.context_count, .has_receiver = c.attrs.ext_fn, .is_suspend = false, .contexts = c.attrs.context_count };
-    };
-    var sit = s.suspend_function_classes.iterator();
-    while (sit.next()) |e| if (e.value_ptr.* == c.sym) {
-        const n = e.key_ptr.*;
-        const recv: usize = @intFromBool(c.attrs.ext_fn);
-        return .{ .params = n - recv - c.attrs.context_count, .has_receiver = c.attrs.ext_fn, .is_suspend = true, .contexts = c.attrs.context_count };
-    };
-    // A function reference's `KFunctionN` has the shape of its `FunctionN`,
-    // with the extension receiver of an extension function's first.
-    const krecv: u32 = @intFromBool(c.attrs.ext_fn);
-    var kit = s.kfunction_classes.iterator();
-    while (kit.next()) |e| if (e.value_ptr.* == c.sym) return .{ .params = e.key_ptr.* - krecv, .has_receiver = c.attrs.ext_fn, .is_suspend = false };
-    var ksit = s.ksuspend_function_classes.iterator();
-    while (ksit.next()) |e| if (e.value_ptr.* == c.sym) return .{ .params = e.key_ptr.* - krecv, .has_receiver = c.attrs.ext_fn, .is_suspend = true };
-    return null;
+    const fc = s.fnClassOf(c.sym) orelse return null;
+    const n = fc.arity;
+    switch (fc.kind) {
+        .function, .suspend_function => {
+            const recv: usize = @intFromBool(c.attrs.ext_fn);
+            return .{ .params = n - recv - c.attrs.context_count, .has_receiver = c.attrs.ext_fn, .is_suspend = fc.kind == .suspend_function, .contexts = c.attrs.context_count };
+        },
+        // A function reference's `KFunctionN` has the shape of its
+        // `FunctionN`, with the extension receiver of an extension
+        // function's first.
+        .kfunction, .ksuspend_function => {
+            const krecv: u32 = @intFromBool(c.attrs.ext_fn);
+            return .{ .params = n - krecv, .has_receiver = c.attrs.ext_fn, .is_suspend = fc.kind == .ksuspend_function };
+        },
+    }
 }
 
 /// Whether every candidate is `@LowPriorityInOverloadResolution`: such a

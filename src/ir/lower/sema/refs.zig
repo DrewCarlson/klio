@@ -137,7 +137,7 @@ pub fn lowerAdapter(b: *Builder, adapter: u32) Error!void {
     const is_ctor = s.syms.kind(target) == .constructor;
     const arity: u16 = @intCast(paramCount(b));
     const n_values = lay.values;
-    const ref = refOf(b, ad);
+    const ref = try refOf(b, ad);
     const adapt = if (ref) |x| x.adapt else sema.records.RefAdapt{};
     // A vararg the reference's parameters fill element by element: the
     // values before it, its elements, and defaults for every one after.
@@ -289,21 +289,14 @@ fn noDefaults(b: *Builder, target: Sym) Error {
 /// and type arguments they all have: the first naming it.
 /// Where a failure of adapter `adapter` is reported: the first reference
 /// of its shape, whose lowering allocated it.
-pub fn referenceSite(p: *const builder.Program, adapter: u32) span.Span {
-    const ad = p.br.adapters[adapter];
-    for (p.br.records) |fr| for (fr.refs) |r| switch (r.detail) {
-        .ref => |x| if (x.target == ad.target and x.ty == ad.ty and std.meta.activeTag(x.bound) == ad.bound) return r.anchor,
-        else => {},
-    };
-    return builder.zero_span;
+pub fn referenceSite(p: *builder.Program, adapter: u32) Error!span.Span {
+    const found = try p.adapterRef(p.br.adapters[adapter]);
+    return if (found) |f| f.anchor else builder.zero_span;
 }
 
-fn refOf(b: *Builder, ad: bridge.Adapter) ?*const sema.records.RefRec {
-    for (b.p.br.records) |fr| for (fr.refs) |r| switch (r.detail) {
-        .ref => |x| if (x.target == ad.target and x.ty == ad.ty and std.meta.activeTag(x.bound) == ad.bound) return x,
-        else => {},
-    };
-    return null;
+fn refOf(b: *Builder, ad: bridge.Adapter) Error!?*const sema.records.RefRec {
+    const found = try b.p.adapterRef(ad);
+    return if (found) |f| f.rec else null;
 }
 
 fn paramCount(b: *const Builder) usize {
