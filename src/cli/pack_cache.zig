@@ -281,6 +281,10 @@ const ParseJob = struct {
     longest_piece_ns: u64 = 0,
     /// Pieces the file was cut into; zero when it parsed whole.
     pieces: usize = 0,
+    /// Whether the file's class aliases are expanded once it parses
+    /// (`ast.expandFileClassAliases`): a pack's sources are, the stdlib's
+    /// own files are not.
+    aliases: bool = true,
 
     const Result = union(enum) {
         /// An allocation failed; the file is dropped silently.
@@ -400,7 +404,7 @@ fn runParseJobIn(allocator: Allocator, scratch: ?*std.heap.ArenaAllocator, pool:
             const moved = parser.parseMoved(allocator, sa, job.fid, job.src) catch return;
             if (moved) |tree| {
                 var file_ast = tree;
-                ast.expandFileClassAliases(allocator, &file_ast);
+                if (job.aliases) ast.expandFileClassAliases(allocator, &file_ast);
                 job.parse_ns = runtime.clockMonotonicNanos() - t0;
                 if (std.c.getenv("KLIO_PARSE_CHECK") != null) checkNamesInSource(job, &file_ast);
                 job.result = .{ .ok = file_ast };
@@ -439,7 +443,7 @@ fn runParseJobIn(allocator: Allocator, scratch: ?*std.heap.ArenaAllocator, pool:
         return;
     }
     lexed.deinit(allocator);
-    ast.expandFileClassAliases(allocator, &file_ast);
+    if (job.aliases) ast.expandFileClassAliases(allocator, &file_ast);
     job.parse_ns = runtime.clockMonotonicNanos() - t1;
     if (std.c.getenv("KLIO_PARSE_CHECK") != null) checkNamesInSource(job, &file_ast);
     job.result = .{ .ok = file_ast };
@@ -460,8 +464,11 @@ pub fn allocatorIsThreadSafe(a: Allocator) bool {
 
 /// Threads for `n` parse jobs: one per CPU under the process-wide
 /// `KLIO_MAX_WORKERS` ceiling, or `KLIO_PARSE_JOBS` outright.
-fn parseWorkerCount(allocator: Allocator, n: usize) usize {
-    if (n < 2 or !allocatorIsThreadSafe(allocator)) return 1;
+fn parseWorkerCount(n: usize) usize {
+    if (n < 2) return 1;
+    // The settings are read into memory of their own: the jobs' allocator
+    // may be an arena.
+    const allocator = std.heap.page_allocator;
     var want = std.Thread.getCpuCount() catch 1;
     if (getEnvVar(allocator, "KLIO_MAX_WORKERS")) |v| {
         defer allocator.free(v);
@@ -579,18 +586,147 @@ const ParsePool = struct {
     }
 };
 
+/// A parse thread's heap over an allocator that may not serve threads, such
+/// as a run's arena: it bumps through chunks it takes from `parent` under
+/// `lock`, so what it hands out belongs to `parent` and goes with it. Freeing
+/// or resizing in place works for the latest allocation only.
+const WorkerHeap = struct {
+    parent: Allocator,
+    lock: *runtime.SpinMutex,
+    chunk: []u8 = &.{},
+    used: usize = 0,
+
+    const chunk_len: usize = 1024 * 1024;
+    const chunk_align: std.mem.Alignment = .@"16";
+
+    fn allocator(self: *WorkerHeap) Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn fromParent(self: *WorkerHeap, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        self.lock.lock();
+        defer self.lock.unlock();
+        return self.parent.rawAlloc(n, alignment, ra);
+    }
+
+    fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *WorkerHeap = @ptrCast(@alignCast(ctx));
+        // A large or over-aligned allocation is the parent's own.
+        if (n > chunk_len / 8 or alignment.compare(.gt, chunk_align)) return self.fromParent(n, alignment, ra);
+        const base = @intFromPtr(self.chunk.ptr);
+        var start = alignment.forward(base + self.used) - base;
+        if (start + n > self.chunk.len) {
+            const c = self.fromParent(chunk_len, chunk_align, ra) orelse return null;
+            self.chunk = c[0..chunk_len];
+            self.used = 0;
+            start = 0;
+        }
+        self.used = start + n;
+        return self.chunk.ptr + start;
+    }
+
+    fn isLatest(self: *const WorkerHeap, memory: []u8) bool {
+        return self.chunk.len != 0 and memory.ptr + memory.len == self.chunk.ptr + self.used;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        _ = alignment;
+        _ = ra;
+        const self: *WorkerHeap = @ptrCast(@alignCast(ctx));
+        if (!self.isLatest(memory)) return new_len <= memory.len;
+        const start = self.used - memory.len;
+        if (start + new_len > self.chunk.len) return false;
+        self.used = start + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        return if (resize(ctx, memory, alignment, new_len, ra)) memory.ptr else null;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        _ = alignment;
+        _ = ra;
+        const self: *WorkerHeap = @ptrCast(@alignCast(ctx));
+        if (self.isLatest(memory)) self.used -= memory.len;
+    }
+};
+
+/// Parse threads over an allocator that may not serve threads: each takes
+/// files largest first, parses one whole in a scratch of its own and moves
+/// its tree into a `WorkerHeap` of its own.
+const HeapPool = struct {
+    parent: Allocator,
+    lock: runtime.SpinMutex = .{},
+    jobs: []ParseJob,
+    order: []const usize,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn worker(self: *HeapPool) void {
+        defer runtime.slab.flushMagazines();
+        var heap: WorkerHeap = .{ .parent = self.parent, .lock = &self.lock };
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        while (true) {
+            const o = self.next.fetchAdd(1, .monotonic);
+            if (o >= self.order.len) return;
+            const i = self.order[o];
+            runParseJobIn(heap.allocator(), &scratch, null, i, &self.jobs[i]);
+        }
+    }
+
+    fn largerFirst(jobs: []const ParseJob, x: usize, y: usize) bool {
+        return jobs[x].src.len > jobs[y].src.len;
+    }
+};
+
+fn runParseJobsOnHeaps(allocator: Allocator, jobs: []ParseJob, want: usize) usize {
+    const order = std.heap.page_allocator.alloc(usize, jobs.len) catch {
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        for (jobs, 0..) |*job, i| runParseJobIn(allocator, &scratch, null, i, job);
+        return 1;
+    };
+    defer std.heap.page_allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, @as([]const ParseJob, jobs), HeapPool.largerFirst);
+    var pool = HeapPool{ .parent = allocator, .jobs = jobs, .order = order };
+    var threads: [max_parse_workers]runtime.platform.Thread = undefined;
+    var spawned: usize = 0;
+    while (spawned + 1 < want) : (spawned += 1) {
+        threads[spawned] = runtime.platform.Thread.spawn(
+            .{ .stack_size = parse_worker_stack },
+            HeapPool.worker,
+            .{&pool},
+        ) catch break;
+    }
+    pool.worker();
+    for (threads[0..spawned]) |t| t.join();
+    return spawned + 1;
+}
+
 /// Parses the files registered at `fids` in `map` as a pack's sources parse
-/// when the pack loads into a run's arena: lexed, parsed whole, one after
-/// another, and alias-expanded. By position, null for a file that does not
-/// parse, which the loader skips.
+/// when the pack loads into a run's arena: lexed, parsed whole and
+/// alias-expanded, on as many threads as `runParseJobs` takes. By position,
+/// null for a file that does not parse, which the loader skips.
 pub fn parsePackSources(allocator: Allocator, map: *const SourceMap, fids: []const span.FileId) Allocator.Error![]?KotlinFile {
+    return parseRegistered(allocator, map, fids, true);
+}
+
+/// `parsePackSources` for the stdlib's own files, whose class aliases are
+/// left as written.
+pub fn parseBaseSources(allocator: Allocator, map: *const SourceMap, fids: []const span.FileId) Allocator.Error![]?KotlinFile {
+    return parseRegistered(allocator, map, fids, false);
+}
+
+fn parseRegistered(allocator: Allocator, map: *const SourceMap, fids: []const span.FileId, aliases: bool) Allocator.Error![]?KotlinFile {
     var jobs: std.ArrayList(ParseJob) = .empty;
     defer jobs.deinit(allocator);
     for (fids) |fid| {
         const sf = map.get(fid);
-        try jobs.append(allocator, .{ .fid = fid, .src = sf.source, .rel_path = sf.path });
+        try jobs.append(allocator, .{ .fid = fid, .src = sf.source, .rel_path = sf.path, .aliases = aliases });
     }
-    _ = runParseJobsOn(allocator, &jobs, 1);
+    _ = runParseJobs(allocator, &jobs);
     const out = try allocator.alloc(?KotlinFile, fids.len);
     for (jobs.items[0..fids.len], out) |job, *o| o.* = switch (job.result) {
         .ok => |f| f,
@@ -599,10 +735,10 @@ pub fn parsePackSources(allocator: Allocator, map: *const SourceMap, fids: []con
     return out;
 }
 
-/// Lex and parse every job, fanning out over a pool when the allocator can
-/// serve one; the calling thread drains alongside. Returns the thread count.
+/// Lex and parse every job, fanning out over threads; the calling thread
+/// works alongside. Returns the thread count.
 fn runParseJobs(allocator: Allocator, jobs: *std.ArrayList(ParseJob)) usize {
-    return runParseJobsOn(allocator, jobs, parseWorkerCount(allocator, jobs.items.len));
+    return runParseJobsOn(allocator, jobs, parseWorkerCount(jobs.items.len));
 }
 
 /// Pieces the files at least `chunk_min_bytes` long can add to the pool.
@@ -614,8 +750,13 @@ fn pieceCapacity(jobs: []const ParseJob) usize {
     return n;
 }
 
+/// `runParseJobs` on `want` threads. An allocator that serves several
+/// threads takes a pool that cuts large files into pieces; any other gets
+/// the files parsed whole, each thread moving its trees into a heap of its
+/// own over it (`WorkerHeap`).
 fn runParseJobsOn(allocator: Allocator, jobs: *std.ArrayList(ParseJob), want: usize) usize {
     const files = jobs.items.len;
+    if (want > 1 and !allocatorIsThreadSafe(allocator)) return runParseJobsOnHeaps(allocator, jobs.items, want);
     if (want <= 1) {
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
@@ -660,6 +801,7 @@ fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *Pa
     job.pieces = info.count;
     var all_ok = true;
     var n_decls: usize = 0;
+    var n_annotated: usize = 0;
     var parse_ns: u64 = 0;
     for (jobs) |*pj| {
         const piece = pj.piece orelse continue;
@@ -667,7 +809,10 @@ fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *Pa
         parse_ns += pj.parse_ns;
         job.longest_piece_ns = @max(job.longest_piece_ns, pj.parse_ns);
         switch (pj.result) {
-            .ok => |f| n_decls += f.decls.len,
+            .ok => |f| {
+                n_decls += f.decls.len;
+                n_annotated += f.annotated_exprs.len;
+            },
             else => all_ok = false,
         }
     }
@@ -685,8 +830,13 @@ fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *Pa
         job.result = .skipped;
         return;
     };
+    const annotated = allocator.alloc(ast.AnnotatedExpr, n_annotated) catch {
+        job.result = .skipped;
+        return;
+    };
     var file_ast: ?KotlinFile = null;
     var filled: usize = 0;
+    var annotated_filled: usize = 0;
     var next_index: usize = 0;
     while (true) {
         var found = false;
@@ -698,6 +848,9 @@ fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *Pa
             @memcpy(decls[filled .. filled + f.decls.len], f.decls);
             filled += f.decls.len;
             allocator.free(f.decls);
+            @memcpy(annotated[annotated_filled .. annotated_filled + f.annotated_exprs.len], f.annotated_exprs);
+            annotated_filled += f.annotated_exprs.len;
+            allocator.free(f.annotated_exprs);
             if (f.has_composable) file_ast.?.has_composable = true;
             // The piece is spent: a caller walking every job must not see it as a file.
             pj.result = .skipped;
@@ -709,8 +862,15 @@ fn assemblePieces(allocator: Allocator, jobs: []ParseJob, index: usize, job: *Pa
     }
     var out = file_ast.?;
     out.decls = decls;
+    out.annotated_exprs = annotated;
     out.span = span.Span.init(job.fid, 0, @intCast(job.src.len));
-    ast.expandFileClassAliases(allocator, &out);
+    // Each piece numbered its nodes from 1: the file numbers them again in
+    // source order, as a whole parse does, so no two nodes share an id.
+    out.node_count = 0;
+    ast.assignIds(&out);
+    out.parsed_node_count = out.node_count;
+    ast.node_ids.assertValid(&out, "assembling pieces");
+    if (job.aliases) ast.expandFileClassAliases(allocator, &out);
     if (std.c.getenv("KLIO_PARSE_CHECK") != null) {
         checkPiecesAgainstWhole(allocator, job, &out);
         checkNamesInSource(job, &out);
@@ -2581,11 +2741,12 @@ test "a large source parses in pieces on the pool as it parses whole" {
             \\}}
             \\@Deprecated("old")
             \\fun g{d}() = f{d}(3)
+            \\val a{d} = @Suppress("x") f{d}(4)
             \\class C{d} {{
             \\    fun m() = {d}
             \\}}
             \\
-        , .{ i, i, i, i, i, i, i, i, i, i, i });
+        , .{ i, i, i, i, i, i, i, i, i, i, i, i, i });
         defer a.free(decl);
         try src.appendSlice(a, decl);
     }
@@ -2628,6 +2789,19 @@ test "a large source parses in pieces on the pool as it parses whole" {
     }
     try std.testing.expectEqualStrings("p", pf.result.ok.package.?.path[0].name);
     try std.testing.expectEqual(@as(usize, 1), pf.result.ok.imports.len);
+    // Every node has the id a whole parse gives it.
+    try std.testing.expectEqual(sf.result.ok.annotated_exprs.len, pf.result.ok.annotated_exprs.len);
+    try std.testing.expectEqual(sf.result.ok.node_count, pf.result.ok.node_count);
+    const whole_ids = try ast.node_ids.collect(a, &sf.result.ok);
+    defer a.free(whole_ids);
+    const piece_ids = try ast.node_ids.collect(a, &pf.result.ok);
+    defer a.free(piece_ids);
+    try std.testing.expectEqual(whole_ids.len, piece_ids.len);
+    for (whole_ids, piece_ids) |w, q| {
+        try std.testing.expectEqual(w.id, q.id);
+        try std.testing.expectEqual(w.span == null, q.span == null);
+        if (w.span) |ws| try std.testing.expect(ws.eql(q.span.?));
+    }
 }
 
 test "parse jobs on a pool match serial parsing and keep file order" {
@@ -2675,6 +2849,80 @@ test "parse jobs on a pool match serial parsing and keep file order" {
         }
     }
     try std.testing.expectEqual(@as(usize, 3), pooled[3].result.ok.decls.len);
+}
+
+test "parse jobs over an arena run on several threads and match serial parsing" {
+    // An arena serves one thread: each parse thread takes chunks of it.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expect(!allocatorIsThreadSafe(a));
+    var sources: [40][]const u8 = undefined;
+    for (&sources, 0..) |*src, i| {
+        src.* = switch (i % 4) {
+            0 => try std.fmt.allocPrint(a, "package p.f{d}\nfun a{d}(x: Int) = x + {d}\nclass C{d} {{ val v = \"${{1 + {d}}}\" }}\n", .{ i, i, i, i, i }),
+            1 => try std.fmt.allocPrint(a, "package p.f{d}\nval x = 'ab'\n", .{i}),
+            2 => try std.fmt.allocPrint(a, "package p.f{d}\nfun (\n", .{i}),
+            else => try std.fmt.allocPrint(a, "fun b{d}() = listOf({d}, 2).map {{ it * 2 }}\n", .{ i, i }),
+        };
+    }
+    var heap_map = SourceMap.init(a);
+    var on_heaps: [sources.len]ParseJob = undefined;
+    try registerParseJobs(&heap_map, &sources, &on_heaps);
+    try std.testing.expect(try runJobsOn(a, &on_heaps, 4) >= 2);
+
+    var serial_map = SourceMap.init(a);
+    var serial: [sources.len]ParseJob = undefined;
+    try registerParseJobs(&serial_map, &sources, &serial);
+    try std.testing.expectEqual(@as(usize, 1), try runJobsOn(a, &serial, 1));
+
+    for (&on_heaps, &serial, 0..) |*hj, *sj, i| {
+        try std.testing.expectEqual(std.meta.activeTag(sj.result), std.meta.activeTag(hj.result));
+        switch (hj.result) {
+            .ok => |hf| {
+                const sf = sj.result.ok;
+                try std.testing.expectEqual(hj.fid, hf.span.file);
+                try std.testing.expectEqual(sf.decls.len, hf.decls.len);
+                for (sf.decls, hf.decls) |*x, *y| {
+                    try std.testing.expectEqualStrings(declName(x), declName(y));
+                    try std.testing.expectEqual(declSpan(x).end, declSpan(y).end);
+                    try std.testing.expectEqual(declShape(x), declShape(y));
+                }
+            },
+            .lex_errors => |n| try std.testing.expectEqual(sj.result.lex_errors, n),
+            .parse_errors => |p| try std.testing.expectEqual(sj.result.parse_errors.diagnostics.diags().len, p.diagnostics.diags().len),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expect(hj.result != .ok or i % 4 != 2);
+    }
+}
+
+test "a worker heap bumps through its parent's chunks and hands it large allocations" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var lock: runtime.SpinMutex = .{};
+    var heap: WorkerHeap = .{ .parent = arena.allocator(), .lock = &lock };
+    const h = heap.allocator();
+    const x = try h.alloc(u8, 100);
+    const y = try h.alloc(u64, 10);
+    try std.testing.expectEqual(@intFromPtr(heap.chunk.ptr), @intFromPtr(x.ptr));
+    try std.testing.expect(std.mem.isAligned(@intFromPtr(y.ptr), @alignOf(u64)));
+    // The latest grows and frees in place; an earlier one does neither.
+    try std.testing.expect(h.resize(y, 20));
+    try std.testing.expect(!h.resize(x, 200));
+    const used = heap.used;
+    const grown: []u64 = y.ptr[0..20];
+    h.free(grown);
+    try std.testing.expectEqual(used - 160, heap.used);
+    // A large allocation comes from the parent, outside the chunk.
+    const big = try h.alloc(u8, WorkerHeap.chunk_len);
+    const in_chunk = @intFromPtr(big.ptr) >= @intFromPtr(heap.chunk.ptr) and @intFromPtr(big.ptr) < @intFromPtr(heap.chunk.ptr) + heap.chunk.len;
+    try std.testing.expect(!in_chunk);
+    // A chunk that cannot hold the next allocation is replaced.
+    const first = heap.chunk.ptr;
+    var k: usize = 0;
+    while (k < 20) : (k += 1) _ = try h.alloc(u8, WorkerHeap.chunk_len / 10);
+    try std.testing.expect(heap.chunk.ptr != first);
 }
 
 test "merged host bindings cover stdlib defaults" {

@@ -112,6 +112,23 @@ Then what a profile of `bodies` showed:
 | bake compose_material3 | 2.37 s to 2.16 s | |
 | cold hello | 0.26 s to 0.23 s | |
 
+Then the parse ahead of all of it:
+
+- A run's packs parsed one file after another: the run's arena serves one
+  thread, so the parse pool, which needs an allocator that serves several,
+  was never used. Each parse thread now parses a file in a scratch of its
+  own and moves its tree into a heap of its own over the arena, taking
+  chunks of it under a lock (`WorkerHeap`); the stdlib's own files parse
+  the same way. `load and parse` on compose_material3 without an image,
+  370 ms to 200 ms, wall 2.0 s to 1.83 s.
+- The pool cuts a large file into pieces on threads that serve several,
+  as the bake's heap does. Every piece numbered its nodes from 1 and the
+  assembled file kept the first piece's count, so two nodes of a cut file
+  could share an id, which sema keys its records by; the later pieces'
+  annotated expressions were dropped. The assembled file is numbered again
+  in source order, as a whole parse numbers it: a bake from pieces and one
+  from whole files now give the same image byte for byte.
+
 ## Next
 
 - Register compaction is a third of lowering now: liveness, interference

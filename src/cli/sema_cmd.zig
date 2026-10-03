@@ -584,10 +584,7 @@ pub fn loadSources(arena: Allocator, map: *span.SourceMap, inputs: []const []con
                 }
             }
         }
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer scratch.deinit();
-        for (stdlib_src.files) |sf| try addBaseSource(arena, &scratch, map, &files, sf.rel_path, sf.bytes);
-        for (actuals) |f| try addBaseSource(arena, &scratch, map, &files, f.path, f.text);
+        try addBaseSources(arena, map, &files, stdlib_src.files, actuals);
         n_stdlib = files.items.len;
         map_stdlib = map.files.items.len;
         if (opts.with_packs) {
@@ -678,10 +675,7 @@ fn bakeOnOwnHeap(arena: Allocator, stdlib_files: []const pack.schema.SourceFile,
         span.active_map = map;
         defer span.active_map = saved_map;
         var files: std.ArrayList(sema.SourceFile) = .empty;
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer scratch.deinit();
-        for (stdlib_files) |sf| try addBaseSource(ba, &scratch, map, &files, sf.rel_path, sf.bytes);
-        for (actuals) |f| try addBaseSource(ba, &scratch, map, &files, f.path, f.text);
+        try addBaseSources(ba, map, &files, stdlib_files, actuals);
         const n_stdlib = files.items.len;
         if (opts.with_packs) {
             const loaded = try loadPacks(ba, scanned, map, opts, .{ .asts_needed = true, .selection = null, .report = false });
@@ -1564,6 +1558,27 @@ fn ktFilesBelow(arena: Allocator, dir_path_in: []const u8) ![]const []const u8 {
 
 fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8, origin: sema.Origin) !void {
     return addSourceReporting(arena, map, files, path, bytes, origin, null, null);
+}
+
+/// `addBaseSource` for the stdlib's files and then the sema actuals, the
+/// parsing spread over threads: the files register in the same order, so
+/// they get the same ids.
+fn addBaseSources(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), stdlib_files: []const pack.schema.SourceFile, actuals: []const BaseFile) !void {
+    var ids: std.ArrayList(span.FileId) = .empty;
+    try ids.ensureTotalCapacityPrecise(arena, stdlib_files.len + actuals.len);
+    for (stdlib_files) |sf| ids.appendAssumeCapacity(try map.add(sf.rel_path, sf.bytes));
+    for (actuals) |f| ids.appendAssumeCapacity(try map.add(f.path, f.text));
+    const parsed = try pack_cache.parseBaseSources(arena, map, ids.items);
+    for (parsed, ids.items) |maybe, id| {
+        const path = map.get(id).path;
+        const tree = maybe orelse {
+            try parseAdded(arena, map, files, id, path, .base, null, null);
+            continue;
+        };
+        const file_ast = try arena.create(ast.KotlinFile);
+        file_ast.* = tree;
+        try files.append(arena, .{ .ast = file_ast, .path = path, .origin = .base });
+    }
 }
 
 /// `addSource` for a base file: parsed in `scratch`, so the run keeps only
