@@ -49,6 +49,11 @@ pub fn scalarOf(b: *Builder, t: TypeId) Error!?Scalar {
 pub fn scalarClass(b: *Builder, cls: Sym) Error!?Scalar {
     if (cls == .none) return null;
     const p = b.p;
+    // Most classes are no final value class: that is told without the memo.
+    const s = p.s;
+    if (s.syms.kind(cls) != .class) return null;
+    const fl = s.syms.flags(cls);
+    if (!fl.value or fl.modality != .final) return null;
     if (p.scalar_classes.get(cls)) |known| return known;
     const answer = try decide(b, cls);
     try p.scalar_classes.put(p.a, cls, answer);

@@ -241,11 +241,9 @@ fn nameOf(s: *Sema, r: Ref) ?records.NameRec {
         .object => false,
         else => return null,
     };
-    if (s.backing_fields.get(r.target)) |prop| {
-        return .{ .kind = .backing_field, .write = write, .target = prop };
-    }
     const kind: records.NameKind = switch (s.syms.kind(r.target)) {
-        .local => .local,
+        // An accessor's `field`, a local, stands for its property's storage.
+        .local => if (s.backing_fields.get(r.target)) |prop| return .{ .kind = .backing_field, .write = write, .target = prop } else .local,
         .value_param => .param,
         .property => .property,
         .enum_entry => .enum_entry,

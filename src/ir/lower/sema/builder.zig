@@ -495,53 +495,7 @@ pub const Builder = struct {
     fn pruneDeadTypeValues(b: *Builder) Error!void {
         const builders = types_mod.typeBuilders(b);
         if (builders[0] == null) return;
-        const reads = try b.sa.alloc(u32, b.next_reg);
-        const Count = struct {
-            reads: []u32,
-            fn cb(c: @This(), r: Reg, is_def: bool) void {
-                if (!is_def and r.int() < c.reads.len) c.reads[r.int()] += 1;
-            }
-            fn uncount(c: @This(), r: Reg, is_def: bool) void {
-                if (!is_def and r.int() < c.reads.len) c.reads[r.int()] -= 1;
-            }
-        };
-        @memset(reads, 0);
-        for (b.blocks.items) |*blk| {
-            for (blk.insts.items) |*inst| ir.visitInstRegs(inst, Count{ .reads = reads }, Count.cb);
-            if (blk.terminator) |*t| ir.visitTerminatorRegs(t, Count{ .reads = reads }, Count.cb);
-        }
-        // A dropped instruction's reads stop counting, which may leave what
-        // it read unread: until a sweep drops nothing. Nothing dropped comes
-        // back, so the order they go in leaves the same body. A sweep walks
-        // each block backward, from a value's reads to its write, so a chain
-        // of copies nothing reads goes in one sweep.
-        var longest: usize = 0;
-        for (b.blocks.items) |*blk| longest = @max(longest, blk.insts.items.len);
-        const dropped = try b.sa.alloc(bool, longest);
-        while (true) {
-            var removed = false;
-            var bi = b.blocks.items.len;
-            while (bi > 0) {
-                bi -= 1;
-                const blk = &b.blocks.items[bi];
-                const insts = blk.insts.items;
-                @memset(dropped[0..insts.len], false);
-                var any = false;
-                var i = insts.len;
-                while (i > 0) {
-                    i -= 1;
-                    if (!deadTypePart(&insts[i], builders, reads)) continue;
-                    ir.visitInstRegs(&insts[i], Count{ .reads = reads }, Count.uncount);
-                    dropped[i] = true;
-                    any = true;
-                }
-                if (any) {
-                    dropMarked(blk, dropped);
-                    removed = true;
-                }
-            }
-            if (!removed) return;
-        }
+        try pruneTypeParts(b.sa, b.blocks.items, b.next_reg, builders);
     }
 
     /// Folds a conversion of a constant into the converted constant, and
@@ -735,21 +689,90 @@ pub const Builder = struct {
     pub const supers = records.supers;
 };
 
-/// Whether `inst` builds part of a run-time type value that nothing reads
-/// (with the constants and copies that fed it).
-fn deadTypePart(inst: *const ir.Inst, builders: [3]?ir.FuncId, reads: []const u32) bool {
-    const dst: Reg = switch (inst.*) {
+/// `Builder.pruneDeadTypeValues` over `blocks`, `n` registers, with the
+/// type builders `builders` calls.
+fn pruneTypeParts(a: Allocator, blocks: []BlockBuf, n: u32, builders: [3]?ir.FuncId) Error!void {
+    const reads = try a.alloc(u32, n);
+    defer a.free(reads);
+    const Count = struct {
+        reads: []u32,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (!is_def and r.int() < c.reads.len) c.reads[r.int()] += 1;
+        }
+    };
+    @memset(reads, 0);
+    for (blocks) |*blk| {
+        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, Count{ .reads = reads }, Count.cb);
+        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, Count{ .reads = reads }, Count.cb);
+    }
+    // A dropped instruction's reads stop counting, which may leave what it
+    // read unread. Nothing dropped comes back, so the order they go in
+    // leaves the same body. A sweep walks each block backward, from a
+    // value's reads to its write, and drops what is unread when it gets
+    // there: another sweep is needed only when a drop leaves unread a value
+    // whose write the sweep had passed already (`seen`), as across a loop.
+    var longest: usize = 0;
+    for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
+    const dropped = try a.alloc(bool, longest);
+    defer a.free(dropped);
+    const seen = try a.alloc(u32, n);
+    defer a.free(seen);
+    @memset(seen, 0);
+    const Uncount = struct {
+        reads: []u32,
+        seen: []const u32,
+        sweep: u32,
+        again: *bool,
+        fn cb(c: @This(), r: Reg, is_def: bool) void {
+            if (is_def or r.int() >= c.reads.len) return;
+            c.reads[r.int()] -= 1;
+            if (c.reads[r.int()] == 0 and c.seen[r.int()] == c.sweep) c.again.* = true;
+        }
+    };
+    var sweep: u32 = 0;
+    var again = true;
+    while (again) {
+        again = false;
+        sweep += 1;
+        const un: Uncount = .{ .reads = reads, .seen = seen, .sweep = sweep, .again = &again };
+        var bi = blocks.len;
+        while (bi > 0) {
+            bi -= 1;
+            const blk = &blocks[bi];
+            const insts = blk.insts.items;
+            @memset(dropped[0..insts.len], false);
+            var any = false;
+            var i = insts.len;
+            while (i > 0) {
+                i -= 1;
+                const d = typePart(&insts[i], builders) orelse continue;
+                if (d.int() >= reads.len) continue;
+                if (reads[d.int()] != 0) {
+                    seen[d.int()] = sweep;
+                    continue;
+                }
+                ir.visitInstRegs(&insts[i], un, Uncount.cb);
+                dropped[i] = true;
+                any = true;
+            }
+            if (any) dropMarked(blk, dropped);
+        }
+    }
+}
+
+/// The register `inst` writes when it builds part of a run-time type value
+/// (or is a constant or a copy that may feed one), else null.
+fn typePart(inst: *const ir.Inst, builders: [3]?ir.FuncId) ?Reg {
+    return switch (inst.*) {
         .ClassLiteral => |x| x.dst,
         .NewArray => |x| x.dst,
         .Const => |x| x.dst,
         .Move => |x| x.dst,
-        .CallStatic => |x| blk: {
-            for (builders) |f| if (f != null and x.func == f.?) break :blk x.dst;
-            return false;
-        },
-        else => return false,
+        .CallStatic => |x| for (builders) |f| {
+            if (f != null and x.func == f.?) break x.dst;
+        } else null,
+        else => null,
     };
-    return dst.int() < reads.len and reads[dst.int()] == 0;
 }
 
 /// The index in `insts` of the instruction writing `y`, when no
@@ -1398,6 +1421,42 @@ fn testBlock(a: Allocator, insts: []const Inst, term: Terminator) Error!BlockBuf
     var blk: BlockBuf = .{ .terminator = term };
     try blk.insts.appendSlice(a, insts);
     return blk;
+}
+
+test "a type value nothing reads goes, with what fed it, across a loop's back edge too" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    const builder = FuncId.from(9);
+    // Block 0 copies r1, which the loop's body, block 1, builds; nothing
+    // reads the copy. The backward sweep passes block 1 first, so the copy
+    // dropped leaves unread a value whose write it has passed: a second
+    // sweep takes the builder's call. Block 2 returns what the loop keeps.
+    var blocks = [_]BlockBuf{
+        try testBlock(a, &.{
+            .{ .Move = .{ .dst = r(2), .src = r(1) } },
+        }, .{ .Goto = BlockId.from(1) }),
+        try testBlock(a, &.{
+            .{ .CallStatic = .{ .dst = r(1), .func = builder, .args = r(0), .n_args = 0 } },
+            .{ .Const = .{ .dst = r(4), .value = ir.ConstId.from(0) } },
+            .{ .Move = .{ .dst = r(6), .src = r(4) } },
+        }, .{ .Branch = .{ .cond = r(3), .t = BlockId.from(0), .f = BlockId.from(2) } }),
+        try testBlock(a, &.{}, .{ .Return = r(6) }),
+    };
+    defer for (&blocks) |*blk| blk.insts.deinit(a);
+    try pruneTypeParts(a, &blocks, 7, .{ builder, null, null });
+    try std.testing.expectEqual(@as(usize, 0), blocks[0].insts.items.len);
+    try std.testing.expectEqual(@as(usize, 2), blocks[1].insts.items.len);
+    try std.testing.expectEqual(r(4), blocks[1].insts.items[0].Const.dst);
+    try std.testing.expectEqual(r(6), blocks[1].insts.items[1].Move.dst);
+
+    // A value read stays, and so does what feeds it.
+    var kept = [_]BlockBuf{try testBlock(a, &.{
+        .{ .CallStatic = .{ .dst = r(1), .func = builder, .args = r(0), .n_args = 0 } },
+        .{ .Move = .{ .dst = r(2), .src = r(1) } },
+    }, .{ .Return = r(2) })};
+    defer kept[0].insts.deinit(a);
+    try pruneTypeParts(a, &kept, 3, .{ builder, null, null });
+    try std.testing.expectEqual(@as(usize, 2), kept[0].insts.items.len);
 }
 
 test "the copy passes with one count between them leave what each counting for itself leaves" {

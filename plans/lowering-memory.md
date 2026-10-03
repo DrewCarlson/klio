@@ -167,9 +167,16 @@ Then smaller costs on every path:
 
 ## Next
 
-- Register compaction is a third of lowering now: liveness, interference
-  and placement over bitsets as wide as the register count.
-- A bake peaks while its image is encoded: the sema, bridge and module
-  tables are first copied into the image's shape (`base_sema.image`,
-  `bridgeImage`, `resolvedImage`), which an encoder reading the live tables
-  would not need.
+- Register compaction is the largest part of `Builder.finish`: liveness,
+  interference and placement over bitsets as wide as the register count.
+  Placement visits each instruction in field order, which sets the
+  numbering, so a cheaper walk must keep that order.
+- A bake's build heap holds the whole analysis while the image encodes
+  (about 720 MB on compose_material3): the tables are also copied into the
+  image's shape first (`base_sema.image`, `bridgeImage`, `resolvedImage`),
+  which an encoder reading the live tables would not need.
+- `bodies` has no single hot spot left: integer-keyed hash lookups over
+  many maps are about a quarter of its time.
+- A warm run spends most of its time decoding the image (99 ms of 150 ms
+  on compose_material3, 90 MB of tables): every function's record and
+  parameters are decoded whether or not the run calls it.
