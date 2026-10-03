@@ -441,6 +441,9 @@ pub const Symbols = struct {
     /// Every package by fully qualified name.
     package_by_fqn: std.AutoHashMapUnmanaged(Name, Sym) = .empty,
     root_package: Sym = .none,
+    /// Counts the declarations indexed (`indexMember`): what a name finds
+    /// in a scope can have changed when it has.
+    index_gen: u32 = 0,
 
     pub fn init(arena: Allocator) Allocator.Error!Symbols {
         var s = Symbols{ .arena = arena };
@@ -616,6 +619,7 @@ pub const Symbols = struct {
         const gop = try index.getOrPut(self.arena, n);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.arena, member);
+        self.index_gen +%= 1;
     }
 
     /// The members `index` declares under `n`.

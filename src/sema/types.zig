@@ -215,6 +215,13 @@ pub const TypeStore = struct {
         return ts;
     }
 
+    /// Room for `extra` more types: a table regrown to them rehashes
+    /// every type it holds.
+    pub fn reserve(self: *TypeStore, extra: usize) Allocator.Error!void {
+        try self.items.ensureUnusedCapacity(self.arena, extra);
+        try self.intern_map.ensureUnusedCapacityContext(self.arena, @intCast(extra), self.interning());
+    }
+
     pub fn get(self: *const TypeStore, t: TypeId) Type {
         return self.items.items[t.int()];
     }

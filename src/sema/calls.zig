@@ -1446,22 +1446,46 @@ fn extensionFunctions(ctx: *Ctx, n: Name) Allocator.Error![]const ExtCand {
         }
         if (any) tier += 1;
     }
-    // A package can be both the file's own and a default import; each
-    // declaration is a candidate once, at its first tier.
+    // A top-level declaration is a candidate once: a function imported from
+    // an object may be a receiver's member too.
+    const near = out.items.len;
+    var last: ?u16 = null;
+    next: for (try topLevelExtensions(ctx, n)) |x| {
+        for (out.items[0..near]) |o| if (o.sym == x.sym) continue :next;
+        if (last != null and last.? != x.tier) tier += 1;
+        last = x.tier;
+        try out.append(s.scratch(), .{ .sym = x.sym, .subst = x.subst, .dispatch = x.dispatch, .tier = tier });
+    }
+    return out.items;
+}
+
+/// The extension functions the top level declares under `n`, as the file
+/// sees them. A package can be both the file's own and a default import:
+/// each declaration is listed once, at the first tier naming it.
+fn topLevelExtensions(ctx: *Ctx, n: Name) Allocator.Error![]const scope_mod.TopLevelMemo.TopExtension {
+    const s = ctx.s;
+    const memo = scope_mod.TopLevelMemo.current(s);
+    const key = scope_mod.TopLevelMemo.key(ctx.file, n);
+    if (memo) |m| if (m.extensions.get(key)) |hit| return hit;
+    const a = if (memo) |m| m.allocator() else s.scratch();
+    const gen = s.syms.index_gen;
+    // A header still being resolved has no receiver yet: an answer naming
+    // one holds for now only.
+    var settled = true;
+    var out: std.ArrayList(scope_mod.TopLevelMemo.TopExtension) = .empty;
     var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
-    for (out.items) |x| try seen.put(s.scratch(), x.sym, {});
-    for (try topLevelTiers(ctx, n)) |top| {
-        var any = false;
+    for (try topLevelTiers(ctx, n), 0..) |top, k| {
         for (top) |m| {
             if (s.syms.kind(m) != .function) continue;
             if ((try seen.getOrPut(s.scratch(), m)).found_existing) continue;
             try headers.functionHeader(s, m);
-            if (s.syms.functionInfo(m).receiver == .none) continue;
-            try out.append(s.scratch(), .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
-            any = true;
+            const info = s.syms.functionInfo(m);
+            if (info.state != .done) settled = false;
+            if (info.receiver == .none) continue;
+            try out.append(a, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = @intCast(k) });
         }
-        if (any) tier += 1;
     }
+    if (memo) |m| if (settled and s.syms.index_gen == gen) try m.extensions.put(a, key, out.items);
     return out.items;
 }
 
@@ -1511,49 +1535,62 @@ fn objectImport(ctx: *Ctx, m: Sym) ?scope_mod.ObjectImport {
 
 pub fn topLevelTiers(ctx: *Ctx, n: Name) Allocator.Error![]const []const Sym {
     const s = ctx.s;
+    const memo = scope_mod.TopLevelMemo.current(s) orelse return topLevelTiersIn(ctx, n, s.scratch());
+    const key = scope_mod.TopLevelMemo.key(ctx.file, n);
+    if (memo.tiers.get(key)) |hit| return hit;
+    const gen = s.syms.index_gen;
+    const tiers = try topLevelTiersIn(ctx, n, memo.allocator());
+    if (s.syms.index_gen == gen) try memo.tiers.put(memo.allocator(), key, tiers);
+    return tiers;
+}
+
+fn topLevelTiersIn(ctx: *Ctx, n: Name, a: Allocator) Allocator.Error![]const []const Sym {
+    const s = ctx.s;
     var tiers: std.ArrayList([]const Sym) = .empty;
     const fi = try scope_mod.fileImports(s, ctx.file);
     if (fi.explicit.getPtr(n)) |targets| {
         var list: std.ArrayList(Sym) = .empty;
         for (targets.items) |*t| {
             const on_object = try scope_mod.objectMembers(s, fi, t);
-            if (on_object) |ms| try list.appendSlice(s.scratch(), ms);
+            if (on_object) |ms| try list.appendSlice(a, ms);
             for (scope_mod.membersOf(s, t.container, t.member)) |m| {
                 if (!scope_mod.visible(s, m)) continue;
                 // An object's functions and properties came from the lookup.
                 if (on_object != null and (s.syms.kind(m) == .function or s.syms.kind(m) == .property)) continue;
-                try list.append(s.scratch(), m);
+                try list.append(a, m);
             }
         }
-        try tiers.append(s.scratch(), list.items);
+        try tiers.append(a, list.items);
     }
     const fc = s.files.items[ctx.file];
-    try tiers.append(s.scratch(), try visibleMembers(ctx, fc.package, n));
     {
         var list: std.ArrayList(Sym) = .empty;
-        for (fi.star.items) |c| try list.appendSlice(s.scratch(), try visibleMembers(ctx, c, n));
-        try tiers.append(s.scratch(), list.items);
+        try appendVisibleMembers(ctx, &list, a, fc.package, n);
+        try tiers.append(a, list.items);
+    }
+    {
+        var list: std.ArrayList(Sym) = .empty;
+        for (fi.star.items) |c| try appendVisibleMembers(ctx, &list, a, c, n);
+        try tiers.append(a, list.items);
     }
     for (try scope_mod.defaultPackages(s)) |level| {
         var list: std.ArrayList(Sym) = .empty;
-        for (level) |p| try list.appendSlice(s.scratch(), try visibleMembers(ctx, p, n));
-        try tiers.append(s.scratch(), list.items);
+        for (level) |p| try appendVisibleMembers(ctx, &list, a, p, n);
+        try tiers.append(a, list.items);
     }
     return tiers.items;
 }
 
-/// Members of a package visible from the current file: a `private`
-/// top-level declaration is visible only in its own file.
-fn visibleMembers(ctx: *Ctx, container: Sym, n: Name) Allocator.Error![]const Sym {
+/// Appends the members of a package visible from the current file: a
+/// `private` top-level declaration is visible only in its own file.
+fn appendVisibleMembers(ctx: *Ctx, out: *std.ArrayList(Sym), a: Allocator, container: Sym, n: Name) Allocator.Error!void {
     const s = ctx.s;
-    var out: std.ArrayList(Sym) = .empty;
     for (scope_mod.membersOf(s, container, n)) |m| {
         if (!scope_mod.visible(s, m)) continue;
         const sym = s.syms.get(m);
         if (sym.flags.visibility == .private and s.syms.kind(container) == .package and sym.file != ctx.file) continue;
-        try out.append(s.scratch(), m);
+        try out.append(a, m);
     }
-    return out.items;
 }
 
 // ----------------------------------------------------------- selection ----

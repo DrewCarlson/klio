@@ -600,6 +600,10 @@ const Build = struct {
     /// By FuncId, filled when a fast path fronts it.
     func_try: std.AutoHashMapUnmanaged(u32, NativeId) = .empty,
     adapters: std.ArrayList(Adapter) = .empty,
+    /// A declaration's qualified name once made (`qualName`): each member
+    /// asks for its owners', and a name is asked for again by every native
+    /// and host lookup of it.
+    qual_names: std.AutoHashMapUnmanaged(Sym, []const u8) = .empty,
     adapter_ids: std.AutoHashMapUnmanaged(Adapter, FuncId) = .empty,
     scopes: std.ArrayList(Scope) = .empty,
     scope_of: std.AutoHashMapUnmanaged(Sym, u32) = .empty,
@@ -1553,14 +1557,17 @@ const Build = struct {
         const nm = s.str(s.syms.name(sym));
         const owner = s.syms.owner(sym);
         if (owner == .none) return nm;
-        switch (s.syms.kind(owner)) {
-            .package => {
+        if (b.qual_names.get(sym)) |q| return q;
+        const q = switch (s.syms.kind(owner)) {
+            .package => blk: {
                 const pf = s.str(s.syms.packageInfo(owner).fqn);
                 if (pf.len == 0) return nm;
-                return std.fmt.allocPrint(b.a, "{s}.{s}", .{ pf, nm });
+                break :blk try std.fmt.allocPrint(b.a, "{s}.{s}", .{ pf, nm });
             },
-            else => return std.fmt.allocPrint(b.a, "{s}.{s}", .{ try b.qualName(owner), nm }),
-        }
+            else => try std.fmt.allocPrint(b.a, "{s}.{s}", .{ try b.qualName(owner), nm }),
+        };
+        try b.qual_names.put(b.a, sym, q);
+        return q;
     }
 
     // ----------------------------------------------------- captures ----

@@ -66,7 +66,7 @@ pub const Image = struct {
 /// subjects, the scopes of classes declared in bodies) or remembers of
 /// questions asked, which a run asks again of the tables.
 const not_carried = [_][]const u8{
-    "arena",            "scratch_base",       "scratch_open",    "scratch_high",    "scratch_levels",  "scratch_depth",   "fn_class_of",     "census",          "builtins_bound",  "expr_types",      "backing_fields",
+    "arena",            "scratch_base",       "scratch_open",    "scratch_high",    "scratch_levels",  "scratch_depth",   "fn_class_of",     "top_level",     "census",          "builtins_bound",  "expr_types",      "backing_fields",
     "default_packages", "var_solution",       "open_var_bounds", "reified_vars",    "operator_memo",
     "path_subjects",    "path_property",      "path_base",       "nonnull_implies", "bool_implies", "exhaustive_whens",     "local_writes",
     "sealed_inheritors", "lookup_memo",       "local_classifiers", "local_class_scopes", "pending_setters",

@@ -367,6 +367,8 @@ pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!vo
     };
     try s.refs.ensureTotalCapacityPrecise(s.arena, s.refs.items.len + nodes * 5 / 8);
     try s.expr_types.ensureTotalCapacityPrecise(s.arena, s.expr_types.items.len + nodes * 6 / 8);
+    // It interns about a type for every four.
+    try s.types.reserve(nodes / 4);
     var i: u32 = 0;
     while (i < s.files.items.len) : (i += 1) {
         if (!wantedOrigin(origins, s.files.items[i].origin)) continue;

@@ -754,6 +754,39 @@ test "a package imported twice is imported once" {
     try fx.expectTarget("= ^Other(2)", "other/Other.<init>");
 }
 
+test "a top-level answer kept while bodies resolve follows a declaration indexed after it" {
+    var fx = try fixture(&.{
+        \\package demo
+        \\fun String.shout(): String = this
+    ,
+        \\package other
+        \\fun String.shout(n: Int): String = this
+    });
+    defer fx.deinit();
+    const s = fx.s;
+    const calls = @import("calls.zig");
+    const file: u32 = for (s.files.items, 0..) |fc, i| {
+        if (std.mem.eql(u8, fc.path, "test0.kt")) break @intCast(i);
+    } else unreachable;
+    s.openScratch();
+    defer s.closeScratch();
+    var sc: sema_mod.body.Scope = .{ .parent = null, .a = s.arena, .kind = .file };
+    var ctx: sema_mod.body.Ctx = .{ .s = s, .file = file, .scope = &sc };
+    const n = s.names.lookup("shout").?;
+    // The file's own package is the first tier: it has no explicit imports.
+    const before = try calls.topLevelTiers(&ctx, n);
+    try std.testing.expectEqual(@as(usize, 1), before[0].len);
+    try std.testing.expectEqual(before.ptr, (try calls.topLevelTiers(&ctx, n)).ptr);
+    // `other`'s function indexed in `demo` too, as a declaration made on
+    // demand is: the kept answer no longer holds.
+    const other = s.syms.package_by_fqn.get(s.names.lookup("other").?).?;
+    const theirs = sema_mod.scope.membersOf(s, other, n)[0];
+    try s.syms.indexMember(&s.syms.packageInfo(s.files.items[file].package).members, n, theirs);
+    const after = try calls.topLevelTiers(&ctx, n);
+    try std.testing.expectEqual(@as(usize, 2), after[0].len);
+    try std.testing.expectEqual(theirs, after[0][1]);
+}
+
 test "this inside a class nested in a local class is the nested class" {
     var fx = try fixture(&.{
         \\package demo

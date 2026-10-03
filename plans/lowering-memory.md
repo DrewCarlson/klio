@@ -90,12 +90,32 @@ Then three scans and a fixpoint that ran far more often than they had to:
 |---|---:|---:|---:|
 | cold compose_material3 | 2.23 s | 1.05 s | 0.60 s |
 
+Then what a profile of `bodies` showed:
+
+- `calls.topLevelTiers` walked a file's explicit imports, its package, its
+  star imports and every default import for each name a body looked up:
+  about half a million calls over 60K distinct file and name pairs. Sema
+  keeps the answers, and the top-level extension functions
+  `calls.extensionFunctions` takes from them, while `resolveAll` runs
+  (`scope.TopLevelMemo`). Indexing a declaration drops them
+  (`Symbols.index_gen`); their memory is freed between declarations.
+- The type table regrew to 268K types, rehashing all of them each time:
+  `resolveAll` reserves a type for every four nodes up front.
+- Register compaction took its tables from the process heap, which maps
+  fresh pages for the large ones on every body; they come from the body's
+  scratch.
+- The bridge formats a declaration's qualified name once.
+
+| | wall | `bodies` |
+|---|---:|---:|
+| cold compose_material3 | 2.23 s to 2.01 s | 1.05 s to 0.84 s |
+| bake compose_material3 | 2.37 s to 2.16 s | |
+| cold hello | 0.26 s to 0.23 s | |
+
 ## Next
 
 - Register compaction is a third of lowering now: liveness, interference
   and placement over bitsets as wide as the register count.
-- The bridge adds 166 MB: 614K qualified names formatted (92 MB churn),
-  headers, parameters, override roots.
 - A bake peaks while its image is encoded: the sema, bridge and module
   tables are first copied into the image's shape (`base_sema.image`,
   `bridgeImage`, `resolvedImage`), which an encoder reading the live tables

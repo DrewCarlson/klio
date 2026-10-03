@@ -13,6 +13,8 @@ const names_mod = @import("names.zig");
 const headers = @import("headers.zig");
 const members = @import("members.zig");
 const types = @import("types.zig");
+const records = @import("records.zig");
+const scratch_mod = @import("scratch.zig");
 
 const Allocator = std.mem.Allocator;
 const Sema = sema_mod.Sema;
@@ -77,6 +79,73 @@ pub const FileImports = struct {
     /// The object each member imported from an object is used on.
     object_members: std.AutoHashMapUnmanaged(Sym, ObjectImport) = .empty,
     inherited: std.ArrayList(InheritedImport) = .empty,
+};
+
+/// What the top level declares under a name as a file sees it, kept while
+/// `resolveAll` runs: a body asks for the same names over and over, and
+/// each answer walks the file's imports, its package and every default
+/// import (`calls.topLevelTiers`, `calls.extensionFunctions`). The answers
+/// live in memory of their own, which `trim` frees between declarations
+/// once there are `cap` of them: a resolution reads an answer before the
+/// next declaration only. Indexing a declaration can change what a name
+/// finds, so the answers are dropped when one is (`Symbols.index_gen`).
+pub const TopLevelMemo = struct {
+    tiers: std.AutoHashMapUnmanaged(u64, []const []const Sym) = .empty,
+    extensions: std.AutoHashMapUnmanaged(u64, []const TopExtension) = .empty,
+    mem: scratch_mod.Scratch = .{},
+    /// The `Symbols.index_gen` the answers were made under.
+    gen: u32 = 0,
+    /// Answers were dropped since `trim` last freed their memory.
+    dropped: bool = false,
+
+    const cap = 16 * 1024;
+
+    /// An extension function the top level declares, with the object an
+    /// import from an object calls it on.
+    pub const TopExtension = struct {
+        sym: Sym,
+        subst: *const types.Subst,
+        dispatch: records.Receiver,
+        /// The `calls.topLevelTiers` tier it is first found in.
+        tier: u16,
+    };
+
+    pub fn key(file: u32, n: Name) u64 {
+        return @as(u64, file) << 32 | @intFromEnum(n);
+    }
+
+    /// The memo, without the answers made before a declaration was last
+    /// indexed; null while `resolveAll` is not running.
+    pub fn current(s: *Sema) ?*TopLevelMemo {
+        if (!s.scratch_open) return null;
+        const m = &s.top_level;
+        if (m.gen != s.syms.index_gen) {
+            m.tiers.clearRetainingCapacity();
+            m.extensions.clearRetainingCapacity();
+            m.gen = s.syms.index_gen;
+            m.dropped = true;
+        }
+        return m;
+    }
+
+    pub fn allocator(m: *TopLevelMemo) Allocator {
+        return m.mem.allocator();
+    }
+
+    /// Frees the answers' memory once they were dropped or number `cap`.
+    /// Only where no resolution is under way.
+    pub fn trim(m: *TopLevelMemo) void {
+        if (!m.dropped and m.tiers.count() + m.extensions.count() < cap) return;
+        m.tiers = .empty;
+        m.extensions = .empty;
+        m.mem.reset(4 * 1024 * 1024);
+        m.dropped = false;
+    }
+
+    pub fn deinit(m: *TopLevelMemo) void {
+        m.mem.deinit();
+        m.* = .{ .gen = m.gen };
+    }
 };
 
 /// Default-import packages that exist, resolved once per analysis.

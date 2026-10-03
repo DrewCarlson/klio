@@ -190,7 +190,8 @@ pub const COMPACT_MAX_REGS: u32 = 4096;
 /// or a finally reads shares with none; an instruction's result shares with none of its
 /// operands, since a constructor writes its instance before it reads its arguments; a copy's
 /// destination may share with its source, and a copy that then copies a register into itself
-/// is dropped. What the renamed blocks hold is allocated from `a`.
+/// is dropped. What the renamed blocks hold, and the tables the pass works in, are allocated
+/// from `a`, a scratch the caller empties.
 pub fn compact(a: Allocator, blocks: []Block, n: u32) Allocator.Error!u32 {
     if (n <= COMPACT_MIN_REGS) return n;
     return compactAny(a, blocks, n);
@@ -198,14 +199,13 @@ pub fn compact(a: Allocator, blocks: []Block, n: u32) Allocator.Error!u32 {
 
 fn compactAny(a: Allocator, blocks: []Block, n: u32) Allocator.Error!u32 {
     if (n > COMPACT_MAX_REGS) return n;
-    const sa = std.heap.smp_allocator;
-    var lv = (try Live.init(sa, blocks, n)) orelse return n;
-    defer lv.deinit(sa);
+    var lv = (try Live.init(a, blocks, n)) orelse return n;
+    defer lv.deinit(a);
     const w = lv.words;
     // By register: the first register of its unit, the consecutive registers argument runs
     // keep together. Units are intervals: a run links each of its registers to the next.
-    const lo = try sa.alloc(u32, n);
-    defer sa.free(lo);
+    const lo = try a.alloc(u32, n);
+    defer a.free(lo);
     for (lo, 0..) |*x, i| x.* = @intCast(i);
     for (blocks) |*blk| for (blk.insts) |*inst| {
         const run = runOf(inst) orelse continue;
@@ -214,14 +214,14 @@ fn compactAny(a: Allocator, blocks: []Block, n: u32) Allocator.Error!u32 {
         var k: u32 = 1;
         while (k < run.n) : (k += 1) link(lo, run.first + k - 1, run.first + k);
     };
-    const clash = try sa.alloc(u64, @as(usize, n) * w);
-    defer sa.free(clash);
+    const clash = try a.alloc(u64, @as(usize, n) * w);
+    defer a.free(clash);
     @memset(clash, 0);
-    try interfere(sa, blocks, &lv, clash);
-    const to = try sa.alloc(u32, n);
-    defer sa.free(to);
+    try interfere(a, blocks, &lv, clash);
+    const to = try a.alloc(u32, n);
+    defer a.free(to);
     @memset(to, NONE);
-    const m = try place(sa, blocks, n, w, lo, clash, to);
+    const m = try place(a, blocks, n, w, lo, clash, to);
     if (m >= n) return n;
     for (blocks) |*blk| try rename(a, blk, to);
     return m;

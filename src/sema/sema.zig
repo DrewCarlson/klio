@@ -214,6 +214,9 @@ pub const Sema = struct {
     /// The four maps above turned around: a class to its arity and which
     /// it is (`fnClassOf`), rebuilt when they have grown.
     fn_class_of: std.AutoHashMapUnmanaged(Sym, FnClass) = .empty,
+    /// What a name finds at the top level, by file, while `resolveAll`
+    /// runs.
+    top_level: scope.TopLevelMemo = .{},
     /// Common type ids, filled once the builtins resolve.
     t: CommonTypes = .{},
     /// The default-import packages that exist, filled on first use.
@@ -357,6 +360,7 @@ pub const Sema = struct {
         if (!self.scratch_open) return;
         self.scratch_high = @max(self.scratch_high, self.scratch_base.inUse());
         self.scratch_base.reset(16 * 1024 * 1024);
+        self.top_level.trim();
     }
 
     pub fn openScratch(self: *Sema) void {
@@ -368,6 +372,7 @@ pub const Sema = struct {
         self.scratch_high = @max(self.scratch_high, self.scratch_base.inUse());
         self.scratch_open = false;
         self.scratch_base.deinit();
+        self.top_level.deinit();
         for (self.scratch_levels.items) |level| {
             level.deinit();
             std.heap.page_allocator.destroy(level);
