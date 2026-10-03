@@ -8850,3 +8850,73 @@ test "an out projection passed where an in projection is wanted fixes the variab
         "Initializer type mismatch: expected 'String', actual 'Any?'.",
     });
 }
+
+test "a trial constraint that fails leaves the system as it was, one that holds is kept" {
+    var fx = try fixture(&.{"package app\n"});
+    defer fx.deinit();
+    try fx.resolve();
+    const s = fx.s;
+    const infer = sema_mod.infer;
+    var sys = infer.System.init(s);
+    defer sys.deinit();
+    const v = try infer.System.freshVar(s);
+    try std.testing.expect(try sys.constrain(v.ty, s.t.int));
+    try std.testing.expectEqual(@as(usize, 1), sys.vars.items.len);
+    // `String <: V <: Int` cannot hold: nothing of it stays.
+    try std.testing.expect(!try sys.tryConstrain(s.t.string, v.ty));
+    try std.testing.expectEqual(@as(usize, 0), sys.vars.items[0].lower.items.len);
+    try std.testing.expectEqual(@as(usize, 1), sys.vars.items[0].upper.items.len);
+    // A variable the failed attempt adopted is dropped with it.
+    const w = try infer.System.freshVar(s);
+    const list_w = try s.types.class(s.builtins.list, &.{.{ .variance = .inv, .ty = w.ty }}, false);
+    try std.testing.expect(!try sys.tryConstrain(list_w, s.t.int));
+    try std.testing.expectEqual(@as(usize, 1), sys.vars.items.len);
+    try std.testing.expect(sys.index.get(w.id) == null);
+    // Asking leaves no bound behind either way.
+    try std.testing.expect(try sys.wouldConstrain(s.t.int, v.ty));
+    try std.testing.expectEqual(@as(usize, 0), sys.vars.items[0].lower.items.len);
+    try std.testing.expect(try sys.tryConstrain(s.t.int, v.ty));
+    try std.testing.expectEqual(@as(usize, 1), sys.vars.items[0].lower.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sys.undo.items.len);
+}
+
+test "resolution works in scratch that is emptied after each declaration and freed after the bodies" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun f(): List<Int> = listOf(1, 2, 3)
+        \\fun g(): List<String> = listOf("a")
+    });
+    defer fx.deinit();
+    // Outside `resolveAll`, working data goes to the analysis's arena.
+    try std.testing.expect(fx.s.scratch().ptr == fx.s.arena.ptr);
+    try fx.resolve();
+    try fx.expectClean();
+    try std.testing.expect(!fx.s.scratch_open);
+    try std.testing.expect(fx.s.scratch().ptr == fx.s.arena.ptr);
+    try std.testing.expectEqual(@as(usize, 0), fx.s.scratch_arena.queryCapacity());
+    try std.testing.expect(fx.s.scratch_high > 0);
+}
+
+test "a call of many generic arguments resolves in working memory that grows with it, not its square" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(std.testing.allocator);
+    try src.appendSlice(std.testing.allocator,
+        \\package app
+        \\class Two<out A, out B>(val a: A, val b: B)
+        \\infix fun <A, B> A.to(that: B): Two<A, B> = Two(this, that)
+        \\fun <K, V> mapOfTwo(vararg pairs: Two<K, V>): Map<K, V> = TODO()
+        \\fun table(): Map<String, String> = mapOfTwo(
+    );
+    var i: usize = 0;
+    while (i < 300) : (i += 1) try src.print(std.testing.allocator, "\"k{d}\" to \"v{d}\",\n", .{ i, i });
+    try src.appendSlice(std.testing.allocator, ")\n");
+    var fx = try fixture(&.{src.items});
+    defer fx.deinit();
+    const before = fx.arena.queryCapacity();
+    try fx.resolve();
+    try fx.expectClean();
+    // Each argument's two variables join the call's system: a trial that
+    // copied the system per argument took hundreds of megabytes here.
+    try std.testing.expect(fx.s.scratch_high < 8 * 1024 * 1024);
+    try std.testing.expect(fx.arena.queryCapacity() - before < 16 * 1024 * 1024);
+}

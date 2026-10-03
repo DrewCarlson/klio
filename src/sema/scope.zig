@@ -373,7 +373,7 @@ pub fn nestedClassifier(s: *Sema, cls: Sym, n: Name) Allocator.Error!Sym {
 }
 
 fn nestedClassifierWalk(s: *Sema, cls: Sym, n: Name, seen: *std.AutoHashMapUnmanaged(Sym, void)) Allocator.Error!Sym {
-    if ((try seen.getOrPut(s.arena, cls)).found_existing) return .none;
+    if ((try seen.getOrPut(s.scratch(), cls)).found_existing) return .none;
     const own = classifierIn(s, cls, n);
     if (own != .none) return own;
     const comp = s.syms.classInfo(cls).companion;

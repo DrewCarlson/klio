@@ -339,14 +339,19 @@ pub const Ctx = struct {
 // ---------------------------------------------------------------- driver --
 
 pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!void {
+    s.openScratch();
+    defer s.closeScratch();
+    // A body makes under five records and six expression types per eight
+    // nodes: the logs take that room up front rather than regrow to it.
+    var nodes: usize = 0;
+    for (s.files.items) |fc| if (wantedOrigin(origins, fc.origin)) {
+        if (fc.ast) |f| nodes += f.node_count;
+    };
+    try s.refs.ensureTotalCapacityPrecise(s.arena, s.refs.items.len + nodes * 5 / 8);
+    try s.expr_types.ensureTotalCapacityPrecise(s.arena, s.expr_types.items.len + nodes * 6 / 8);
     var i: u32 = 0;
     while (i < s.files.items.len) : (i += 1) {
-        const fc = s.files.items[i];
-        var wanted = false;
-        for (origins) |o| if (o == fc.origin) {
-            wanted = true;
-        };
-        if (!wanted) continue;
+        if (!wantedOrigin(origins, s.files.items[i].origin)) continue;
         try resolveFile(s, i);
     }
     try resumePendingSetters(s);
@@ -357,6 +362,10 @@ pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!vo
         try @import("optin.zig").checkProgram(s);
         try @import("flowcheck.zig").checkProgram(s);
     };
+}
+
+fn wantedOrigin(origins: []const sema_mod.Origin, o: sema_mod.Origin) bool {
+    return std.mem.indexOfScalar(sema_mod.Origin, origins, o) != null;
 }
 
 /// Resolves every setter a typing pass deferred that no ordinary pass took
@@ -388,6 +397,7 @@ fn resumePendingSetters(s: *Sema) Allocator.Error!void {
         try resolveSetter(&ctx, p, st);
         ctx.pop(sc);
         ctx.leaveNode(saved_node);
+        s.resetScratch();
     }
     s.pending_setters.clearRetainingCapacity();
 }
@@ -420,6 +430,8 @@ pub fn resolveFile(s: *Sema, file: u32) Allocator.Error!void {
     for (fc.ast.?.decls) |*d| {
         const sym = declSym(s, fc.package, d) orelse continue;
         try resolveMemberDecl(&ctx, sym);
+        // No call is being resolved between top-level declarations.
+        s.resetScratch();
     }
 }
 
@@ -4449,7 +4461,7 @@ pub fn implicitReceivers(ctx: *Ctx) Allocator.Error![]const Recv {
     var out: std.ArrayList(Recv) = .empty;
     var sc: ?*Scope = ctx.scope;
     while (sc) |c| : (sc = c.parent) {
-        for (c.receivers.items) |r| try out.append(ctx.arena(), r);
+        for (c.receivers.items) |r| try out.append(ctx.s.scratch(), r);
     }
     return out.items;
 }
@@ -4865,7 +4877,7 @@ pub fn memberAccess(ctx: *Ctx, e: *const Expr, recv: *const Expr, name: ast.Iden
 pub fn asQualifier(ctx: *Ctx, e: *const Expr) Allocator.Error!?Head {
     var segs: std.ArrayList(ast.Ident) = .empty;
     switch (e.*) {
-        .Path => |p| try segs.appendSlice(ctx.arena(), p.segments),
+        .Path => |p| try segs.appendSlice(ctx.s.scratch(), p.segments),
         // `a.b.C` parsed as members: flatten.
         .Member => if (!try flattenPath(ctx, e, &segs)) return null,
         else => return null,
@@ -4892,13 +4904,13 @@ pub fn lastNameSpan(e: *const Expr) Span {
 fn flattenPath(ctx: *Ctx, e: *const Expr, out: *std.ArrayList(ast.Ident)) Allocator.Error!bool {
     switch (e.*) {
         .Path => |p| {
-            try out.appendSlice(ctx.arena(), p.segments);
+            try out.appendSlice(ctx.s.scratch(), p.segments);
             return true;
         },
         .Member => |m| {
             if (m.safe) return false;
             if (!try flattenPath(ctx, m.receiver, out)) return false;
-            try out.append(ctx.arena(), m.name);
+            try out.append(ctx.s.scratch(), m.name);
             return true;
         },
         else => return false,

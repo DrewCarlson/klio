@@ -66,7 +66,7 @@ pub fn build(a: Allocator, src: Sources, binding: Binding) !Built {
     t.mark("headers");
     try s.resolveBodies(&.{ .base, .pack, .program });
     t.mark("bodies");
-    const out = try sema.output.build(s);
+    const out = try records(s);
     t.mark("records");
     const layers = try a.dupe(bridge.Layer, &.{ base_layer, program_layer });
     const saved_perm = runtime.gc.allocPerm();
@@ -94,7 +94,7 @@ pub fn bakeBase(a: Allocator, gpa: Allocator, base: []const sema.SourceFile, bin
     t.mark("bake: headers");
     try s.resolveBodies(&.{ .base, .pack });
     t.mark("bake: bodies");
-    const out = try sema.output.build(s);
+    const out = try records(s);
     t.mark("bake: records");
     const saved_perm = runtime.gc.allocPerm();
     runtime.gc.setAllocPerm(true);
@@ -137,7 +137,7 @@ pub fn buildOnImage(a: Allocator, program: []const sema.SourceFile, binding: Bin
     t.mark("collect program");
     try s.resolveBodies(&.{.program});
     t.mark("bodies");
-    const out = try sema.output.build(s);
+    const out = try records(s);
     t.mark("records");
     const layers = try a.dupe(bridge.Layer, &.{ base_layer, program_layer });
     const br = try bridge.buildOver(a, s, loaded.br, .{ .natives = binding.natives, .host_symbol = binding.host_symbol, .host_members = binding.host_members, .spread_varargs = binding.spread_varargs, .constructors = binding.constructors, .host_fns = binding.host_fns, .host_tries = binding.host_tries, .records = out.files, .layers = layers });
@@ -171,6 +171,15 @@ pub fn analyze(a: Allocator, src: Sources) !*sema.Sema {
     return s;
 }
 
+
+/// The analysis's records indexed by file and node, its logs of them freed:
+/// lowering reads the index. `KLIO_SEMA_TABLES` prints the tables first.
+fn records(s: *sema.Sema) !sema.output.Output {
+    const out = try sema.output.build(s);
+    if (std.c.getenv("KLIO_SEMA_TABLES") != null) sema.printTables(s);
+    sema.output.releaseLogs(s);
+    return out;
+}
 
 /// `KLIO_SEMA_TIMING`: the milliseconds each step of `build` took, and the
 /// resident memory after it.

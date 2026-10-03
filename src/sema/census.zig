@@ -415,6 +415,7 @@ pub const Census = struct {
     }
 
     pub fn reportFmt(self: *Census, reason: Reason, file: u32, sp: span.Span, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        if (self.muted != 0) return;
         const detail = try std.fmt.allocPrint(self.arena, fmt, args);
         return self.report(reason, file, sp, detail);
     }

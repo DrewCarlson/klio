@@ -50,6 +50,8 @@ pub const AllocChoice = perf.AllocChoice;
 pub const allocChoice = perf.allocChoice;
 pub const gc = objcell.gc;
 pub const slab = @import("slab.zig");
+/// An arena that frees its large allocations: a run's build memory.
+pub const LargeArena = @import("large_arena.zig").LargeArena;
 pub const leaktrack = @import("leaktrack.zig");
 pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");
@@ -319,6 +321,7 @@ pub const SortOrder = sort_mod.Order;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("large_arena.zig");
     _ = objcell;
     _ = gc.region;
     _ = value_mod;

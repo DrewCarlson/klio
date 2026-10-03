@@ -164,6 +164,33 @@ fn typeEql(a: Type, b: Type) bool {
     };
 }
 
+/// Room for the parts of a type about to be interned, which copies them:
+/// on the stack for up to 16, else from `fallback`. One `get`, one `free`.
+pub fn PartsBuf(comptime T: type) type {
+    return struct {
+        stack: [16]T = undefined,
+        fallback: Allocator,
+
+        const Self = @This();
+
+        pub fn init(fallback: Allocator) Self {
+            return .{ .fallback = fallback };
+        }
+
+        pub fn get(self: *Self, n: usize) Allocator.Error![]T {
+            if (n <= self.stack.len) return self.stack[0..n];
+            return self.fallback.alloc(T, n);
+        }
+
+        pub fn free(self: *Self, xs: []T) void {
+            if (xs.len > self.stack.len) self.fallback.free(xs);
+        }
+    };
+}
+
+pub const ArgBuf = PartsBuf(Arg);
+pub const TypeBuf = PartsBuf(TypeId);
+
 pub const TypeStore = struct {
     arena: Allocator,
     items: std.ArrayList(Type) = .empty,
@@ -296,7 +323,9 @@ pub const TypeStore = struct {
             .class => |c| {
                 if (c.args.len == 0) return t;
                 var changed = false;
-                const out = try self.arena.alloc(Arg, c.args.len);
+                var buf: ArgBuf = .init(std.heap.smp_allocator);
+                const out = try buf.get(c.args.len);
+                defer buf.free(out);
                 for (c.args, out) |arg, *o| {
                     o.* = arg;
                     if (arg.variance == .star) continue;
@@ -308,7 +337,9 @@ pub const TypeStore = struct {
             },
             .intersection => |parts| {
                 var changed = false;
-                const out = try self.arena.alloc(TypeId, parts.len);
+                var buf: TypeBuf = .init(std.heap.smp_allocator);
+                const out = try buf.get(parts.len);
+                defer buf.free(out);
                 for (parts, out) |p, *o| {
                     o.* = try self.substitute(p, s);
                     if (o.* != p) changed = true;

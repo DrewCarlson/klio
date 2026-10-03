@@ -21,6 +21,8 @@ const Sym = symbols.Sym;
 const TypeId = types.TypeId;
 const Name = names_mod.Name;
 
+const empty_subst: types.Subst = .empty;
+
 pub const Member = struct {
     sym: Sym,
     /// The declaring class's type parameters mapped to the receiver's
@@ -104,18 +106,18 @@ pub fn lookupOverridable(s: *Sema, recv: TypeId, n: Name, want: Want) Allocator.
                 .class => |c| c,
                 else => continue,
             };
-            if ((try seen.getOrPut(s.arena, c.sym)).found_existing) continue;
-            const subst = try s.arena.create(types.Subst);
-            subst.* = try subtyping.classSubst(s, t);
+            if ((try seen.getOrPut(s.scratch(), c.sym)).found_existing) continue;
+            const subst = try subtyping.classSubstIn(s, s.scratch(), t);
+            var kept: ?*const types.Subst = null;
             for (scope.membersOf(s, c.sym, n)) |m| {
                 if (!wanted(s, m, want)) continue;
                 const f = s.syms.flags(m);
                 if (f.superseded) continue;
                 if (depth > 0 and f.visibility == .private) continue;
-                try out.append(s.arena, .{ .sym = m, .subst = subst, .depth = depth });
+                try out.append(s.arena, .{ .sym = m, .subst = try keptSubst(s, &kept, &subst), .depth = depth });
             }
             for (try headers.supertypes(s, c.sym)) |st| {
-                try next.append(s.arena, try s.types.substitute(st, subst));
+                try next.append(s.scratch(), try s.types.substitute(st, &subst));
             }
         }
         frontier = next;
@@ -138,9 +140,9 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with
                 .class => |c| c,
                 else => continue,
             };
-            if ((try seen.getOrPut(s.arena, c.sym)).found_existing) continue;
-            const subst = try s.arena.create(types.Subst);
-            subst.* = try subtyping.classSubst(s, t);
+            if ((try seen.getOrPut(s.scratch(), c.sym)).found_existing) continue;
+            const subst = try subtyping.classSubstIn(s, s.scratch(), t);
+            var kept: ?*const types.Subst = null;
             for (scope.membersOf(s, c.sym, n)) |m| {
                 if (!wanted(s, m, want)) continue;
                 if (!scope.visible(s, m)) continue;
@@ -150,12 +152,12 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with
                 // extending the class it is written in reads the outer
                 // instance's `n`).
                 if (depth > 0 and !with_private and s.syms.flags(m).visibility == .private) continue;
-                if (!every) if (try sameDepthConflict(s, out.items, m, subst, depth)) |i| {
+                if (!every) if (try sameDepthConflict(s, out.items, m, &subst, depth)) |i| {
                     // Two supertypes at the same distance declare the
                     // member: the one with the more specific result is
                     // the one the class inherits (`MutableCollection`'s
                     // `iterator()` over `List`'s).
-                    const cand: Member = .{ .sym = m, .subst = subst, .depth = depth };
+                    const cand: Member = .{ .sym = m, .subst = try keptSubst(s, &kept, &subst), .depth = depth };
                     const other = out.items[i];
                     // Of two where one overrides the other (the parts of
                     // an intersection, one a smart cast narrowed to its
@@ -168,14 +170,14 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with
                     try takeDefaults(s, &out.items[i], if (out.items[i].sym == m) other.sym else m);
                     continue;
                 };
-                if (try hiddenBy(s, out.items, m, subst, if (every) depth else null)) |i| {
+                if (try hiddenBy(s, out.items, m, &subst, if (every) depth else null)) |i| {
                     try takeDefaults(s, &out.items[i], m);
                     continue;
                 }
-                try out.append(s.arena, .{ .sym = m, .subst = subst, .depth = depth });
+                try out.append(s.arena, .{ .sym = m, .subst = try keptSubst(s, &kept, &subst), .depth = depth });
             }
             for (try headers.supertypes(s, c.sym)) |st| {
-                try next.append(s.arena, try s.types.substitute(st, subst));
+                try next.append(s.scratch(), try s.types.substitute(st, &subst));
             }
         }
         frontier = next;
@@ -199,9 +201,19 @@ fn lookupUncached(s: *Sema, recv: TypeId, n: Name, want: Want, every: bool, with
     return out.items;
 }
 
+/// `subst` copied into the analysis's arena for a member the lookup keeps,
+/// once per class however many members it keeps.
+fn keptSubst(s: *Sema, kept: *?*const types.Subst, subst: *const types.Subst) Allocator.Error!*const types.Subst {
+    if (kept.*) |k| return k;
+    const out = try s.arena.create(types.Subst);
+    out.* = try subst.clone(s.arena);
+    kept.* = out;
+    return out;
+}
+
 fn pushRoots(s: *Sema, frontier: *std.ArrayList(TypeId), t: TypeId) Allocator.Error!void {
     switch (s.types.get(t)) {
-        .class => try frontier.append(s.arena, try s.types.makeNotNull(t)),
+        .class => try frontier.append(s.scratch(), try s.types.makeNotNull(t)),
         .param => |p| {
             for (try headers.typeParamBounds(s, p.sym)) |b| try pushRoots(s, frontier, b);
         },
@@ -409,10 +421,9 @@ pub fn overridden(s: *Sema, m: Sym) Allocator.Error![]const Sym {
     const cls = s.syms.owner(m);
     if (cls != .none and s.syms.kind(cls) == .class and !s.syms.flags(m).static) {
         const want: Want = if (k == .function) .function else .property;
-        const none_subst = try s.arena.create(types.Subst);
-        none_subst.* = .empty;
+        const none_subst: *const types.Subst = &empty_subst;
         const self_t = try headers.selfType(s, cls);
-        const self_subst = try subtyping.classSubst(s, self_t);
+        const self_subst = try subtyping.classSubstIn(s, s.scratch(), self_t);
         for (try headers.supertypes(s, cls)) |st_decl| {
             const st = try s.types.substitute(st_decl, &self_subst);
             // Through each supertype, the nearest member of the signature;
@@ -424,7 +435,7 @@ pub fn overridden(s: *Sema, m: Sym) Allocator.Error![]const Sym {
                 if (k == .function and !try sameSignature(s, m, none_subst, cand.sym, cand.subst)) continue;
                 if (k == .property and !try sameExtensionReceiver(s, m, cand.sym, cand.subst)) continue;
                 visible_found = true;
-                if (std.mem.indexOfScalar(Sym, out.items, cand.sym) == null) try out.append(s.arena, cand.sym);
+                if (std.mem.indexOfScalar(Sym, out.items, cand.sym) == null) try out.append(s.scratch(), cand.sym);
             }
             if (visible_found) continue;
             for (try lookupOverridable(s, st, s.syms.name(m), want)) |cand| {
@@ -432,12 +443,13 @@ pub fn overridden(s: *Sema, m: Sym) Allocator.Error![]const Sym {
                 if (s.syms.flags(cand.sym).static) continue;
                 if (k == .function and !try sameSignature(s, m, none_subst, cand.sym, cand.subst)) continue;
                 if (k == .property and !try sameExtensionReceiver(s, m, cand.sym, cand.subst)) continue;
-                if (std.mem.indexOfScalar(Sym, out.items, cand.sym) == null) try out.append(s.arena, cand.sym);
+                if (std.mem.indexOfScalar(Sym, out.items, cand.sym) == null) try out.append(s.scratch(), cand.sym);
             }
         }
     }
-    if (k == .function) s.syms.functionInfo(m).overrides = out.items else s.syms.propertyInfo(m).overrides = out.items;
-    return out.items;
+    const kept = try s.arena.dupe(Sym, out.items);
+    if (k == .function) s.syms.functionInfo(m).overrides = kept else s.syms.propertyInfo(m).overrides = kept;
+    return kept;
 }
 
 /// The member of a supertype that `m`, a member function or property
@@ -452,9 +464,8 @@ pub fn hiddenSupertypeMember(s: *Sema, m: Sym) Allocator.Error!Sym {
     if (k != .function and k != .property) return .none;
     if (cls == .none or s.syms.kind(cls) != .class) return .none;
     const want: Want = if (k == .function) .function else .property;
-    const none_subst = try s.arena.create(types.Subst);
-    none_subst.* = .empty;
-    const self_subst = try subtyping.classSubst(s, try headers.selfType(s, cls));
+    const none_subst: *const types.Subst = &empty_subst;
+    const self_subst = try subtyping.classSubstIn(s, s.scratch(), try headers.selfType(s, cls));
     for (try headers.supertypes(s, cls)) |st_decl| {
         const st = try s.types.substitute(st_decl, &self_subst);
         for (try lookupEvery(s, st, s.syms.name(m), want)) |cand| {

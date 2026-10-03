@@ -1569,14 +1569,17 @@ fn addSource(arena: Allocator, map: *span.SourceMap, files: *std.ArrayList(sema.
 /// `addSource` for a base file: parsed in `scratch`, so the run keeps only
 /// its tree (`parser.parseMoved`); one that does not parse is added as
 /// `addSource` adds it.
+/// The file keeps the map's copies of `path` and `bytes`: the stdlib's
+/// sources are freed once they are added.
 fn addBaseSource(arena: Allocator, scratch: *std.heap.ArenaAllocator, map: *span.SourceMap, files: *std.ArrayList(sema.SourceFile), path: []const u8, bytes: []const u8) !void {
     const id = try map.add(path, bytes);
     const src = map.get(id).source;
+    const owned_path = map.get(id).path;
     const tree = try parser.parseMoved(arena, scratch, id, src) orelse
-        return parseAdded(arena, map, files, id, path, .base, null, null);
+        return parseAdded(arena, map, files, id, owned_path, .base, null, null);
     const file_ast = try arena.create(ast.KotlinFile);
     file_ast.* = tree;
-    try files.append(arena, .{ .ast = file_ast, .path = path, .origin = .base });
+    try files.append(arena, .{ .ast = file_ast, .path = owned_path, .origin = .base });
 }
 
 /// `addSource`, rendering the file's diagnostics into `syntax` when it has

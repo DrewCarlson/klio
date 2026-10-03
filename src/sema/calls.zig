@@ -463,7 +463,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
             if (l.name != n) continue;
             switch (s.syms.kind(l.sym)) {
                 .function => if (s.syms.functionInfo(l.sym).receiver == .none) {
-                    try local_level.append(s.arena, .{ .sym = l.sym, .subst = &empty_subst });
+                    try local_level.append(s.scratch(), .{ .sym = l.sym, .subst = &empty_subst });
                 },
                 .local, .value_param => {
                     const vt = try body.narrowedType(ctx, l.sym, try body.symbolType(ctx, l.sym));
@@ -473,7 +473,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                 else => {},
             }
         }
-        if (local_level.items.len != 0) try levels.append(s.arena, local_level);
+        if (local_level.items.len != 0) try levels.append(s.scratch(), local_level);
         // A local of extension-function type invoked bare takes an implicit
         // receiver as its receiver, innermost first.
         var j = c.locals.items.len;
@@ -487,7 +487,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
             for (try body.implicitReceivers(ctx)) |r| {
                 var rl = newLevel();
                 try appendReceiverInvokes(ctx, &rl, vt, l.sym, .none, try body.narrowedReceiver(ctx, r), .{ .implicit = .{ .kind = r.kind, .owner = r.owner } });
-                if (rl.items.len != 0) try levels.append(s.arena, rl);
+                if (rl.items.len != 0) try levels.append(s.scratch(), rl);
             }
             break;
         }
@@ -510,13 +510,13 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                     .function => {
                         try headers.functionHeader(s, m.sym);
                         if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                        try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
+                        try member_level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
                     },
                     .property => {
                         const pt = try body.implicitPropertyType(ctx, r, rt, m);
                         try appendInvokes(ctx, &member_level, pt, m.sym, recv);
-                        try ext_props.append(s.arena, pt);
-                        try ext_syms.append(s.arena, m.sym);
+                        try ext_props.append(s.scratch(), pt);
+                        try ext_syms.append(s.scratch(), m.sym);
                     },
                     else => {},
                 }
@@ -529,14 +529,14 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                     try appendCtorsVia(ctx, &member_level, nested, .{ .dispatch = recv }, rt);
                 }
             }
-            if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+            if (member_level.items.len != 0) try levels.append(s.scratch(), member_level);
             // A property of extension-function type invoked bare takes an
             // implicit receiver as its receiver, innermost first.
             for (ext_props.items, ext_syms.items) |pt, ps| {
                 for (try body.implicitReceivers(ctx)) |r2| {
                     var rl = newLevel();
                     try appendReceiverInvokes(ctx, &rl, pt, ps, recv, try body.narrowedReceiver(ctx, r2), .{ .implicit = .{ .kind = r2.kind, .owner = r2.owner } });
-                    if (rl.items.len != 0) try levels.append(s.arena, rl);
+                    if (rl.items.len != 0) try levels.append(s.scratch(), rl);
                 }
             }
             try appendExtensionLevels(ctx, &levels, n, recv, rt, false);
@@ -549,9 +549,9 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
             var statics = newLevel();
             for (scope_mod.membersOf(s, c.owner, n)) |m| {
                 if (s.syms.kind(m) != .function or !s.syms.flags(m).static) continue;
-                try statics.append(s.arena, .{ .sym = m, .subst = &empty_subst });
+                try statics.append(s.scratch(), .{ .sym = m, .subst = &empty_subst });
             }
-            if (statics.items.len != 0) try levels.append(s.arena, statics);
+            if (statics.items.len != 0) try levels.append(s.scratch(), statics);
             const nested = try scope_mod.nestedClassifier(s, c.owner, n);
             if (nested != .none) {
                 var level = newLevel();
@@ -560,7 +560,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                     .type_alias => try appendAliasCtors(ctx, &level, nested),
                     else => {},
                 }
-                if (level.items.len != 0) try levels.append(s.arena, level);
+                if (level.items.len != 0) try levels.append(s.scratch(), level);
             }
         }
     }
@@ -571,7 +571,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
     if (try body.staticScopeValueSym(ctx, n)) |v| {
         var level = newLevel();
         try appendValueInvokes(ctx, &level, v);
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
     }
     for (try topLevelTiers(ctx, n)) |tier| {
         var level = newLevel();
@@ -583,7 +583,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                 .function => {
                     try headers.functionHeader(s, m);
                     if (s.syms.functionInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m) });
+                    try level.append(s.scratch(), .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m) });
                 },
                 .property => {
                     try headers.propertyHeader(s, m);
@@ -599,8 +599,8 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                 else => {},
             }
         }
-        if (level.items.len != 0) try levels.append(s.arena, level);
-        if (value_level.items.len != 0) try levels.append(s.arena, value_level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
+        if (value_level.items.len != 0) try levels.append(s.scratch(), value_level);
     }
     // Classifiers in the enclosing declarations' scope (nested classes and
     // type aliases).
@@ -608,15 +608,15 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
     if (cls != .none and s.syms.kind(cls) == .type_alias) {
         var level = newLevel();
         try appendAliasCtors(ctx, &level, cls);
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
     }
     if (cls != .none and s.syms.kind(cls) == .class) {
         var level = newLevel();
         try appendCallableCtors(ctx, &level, cls, .none);
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
         var value_level = newLevel();
         try appendValueInvokes(ctx, &value_level, cls);
-        if (value_level.items.len != 0) try levels.append(s.arena, value_level);
+        if (value_level.items.len != 0) try levels.append(s.scratch(), value_level);
     }
     // An implicit receiver that may be null (`this` in `fun K?.f()`) has
     // its non-null type's members only unsafely: kotlinc takes one when
@@ -643,7 +643,7 @@ fn implicitUnsafe(ctx: *Ctx, n: Name) Allocator.Error!?struct { level: Level, rt
                 .function => {
                     try headers.functionHeader(s, m.sym);
                     if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
+                    try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
                 },
                 .property => try appendInvokes(ctx, &level, try members.memberType(s, m), m.sym, recv),
                 else => {},
@@ -704,7 +704,7 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
             for (level.items) |c| {
                 if (c.via != .none or c.on_value or s.syms.kind(c.sym) != .function) continue;
                 if (!try members.isInfix(s, c.sym)) {
-                    try not_infix.append(s.arena, c);
+                    try not_infix.append(s.scratch(), c);
                     continue;
                 }
                 level.items[kept] = c;
@@ -732,7 +732,7 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
         for (try members.lookupWithPrivate(s, rt, n, .function)) |m| {
             try headers.functionHeader(s, m.sym);
             if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-            try hidden.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .defaults = m.defaults });
+            try hidden.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .defaults = m.defaults });
         }
         if (hidden.items.len != 0) {
             // Where the member's class could see it, the call's own check
@@ -767,7 +767,7 @@ fn receiverLevels(ctx: *Ctx, rt: TypeId, recv_src: Receiver, n: Name) Allocator.
             .function => {
                 try headers.functionHeader(s, m.sym);
                 if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .composable_value = comp_invoke, .defaults = m.defaults });
+                try member_level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .composable_value = comp_invoke, .defaults = m.defaults });
             },
             .property => try appendInvokes(ctx, &member_level, try members.memberType(s, m), m.sym, recv_src),
             else => {},
@@ -798,11 +798,11 @@ fn receiverLevels(ctx: *Ctx, rt: TypeId, recv_src: Receiver, n: Name) Allocator.
             }
         }
     }
-    if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+    if (member_level.items.len != 0) try levels.append(s.scratch(), member_level);
     // A value of extension-function type named `n`, with the receiver as
     // its receiver: `recv.block()`.
     const rinv = try receiverInvokeLevel(ctx, n, rt, recv_src);
-    if (rinv.items.len != 0) try levels.append(s.arena, rinv);
+    if (rinv.items.len != 0) try levels.append(s.scratch(), rinv);
     try appendExtensionLevels(ctx, &levels, n, recv_src, rt, false);
     try appendExtPropInvokeLevel(ctx, &levels, n, rt, recv_src);
     return levels;
@@ -983,15 +983,15 @@ fn staticCall(ctx: *Ctx, cls: Sym, qual: Span, id: ast.Ident, args: []Arg, trail
                 try appendValueInvokes(ctx, &value_level, m);
             },
             .function => if (s.syms.flags(m).static) {
-                try level.append(s.arena, .{ .sym = m, .subst = &empty_subst });
+                try level.append(s.scratch(), .{ .sym = m, .subst = &empty_subst });
             },
             // `Op.ADD(2, 3)`: the entry's `invoke`.
             .enum_entry => try appendValueInvokes(ctx, &value_level, m),
             else => {},
         }
     }
-    if (level.items.len != 0) try levels.append(s.arena, level);
-    if (value_level.items.len != 0) try levels.append(s.arena, value_level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
+    if (value_level.items.len != 0) try levels.append(s.scratch(), value_level);
     const info = s.syms.classInfo(cls);
     const holder: Sym = if (info.kind == .object or info.kind == .companion) cls else info.companion;
     // Nested constructors, static functions and entry invokes first; when
@@ -1015,17 +1015,17 @@ fn staticCall(ctx: *Ctx, cls: Sym, qual: Span, id: ast.Ident, args: []Arg, trail
                 .function => {
                     try headers.functionHeader(s, m.sym);
                     if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                    try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr });
+                    try member_level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr });
                 },
                 .property => try appendInvokes(ctx, &member_level, try members.memberType(s, m), m.sym, .expr),
                 else => {},
             }
         }
-        if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+        if (member_level.items.len != 0) try levels.append(s.scratch(), member_level);
         try appendExtensionLevels(ctx, &levels, n, .expr, ht, false);
         // `Obj.content()` for a value `content: Obj.() -> Unit` in scope.
         const rl = try receiverInvokeLevel(ctx, n, ht, .expr);
-        if (rl.items.len != 0) try levels.append(s.arena, rl);
+        if (rl.items.len != 0) try levels.append(s.scratch(), rl);
         try appendExtPropInvokeLevel(ctx, &levels, n, ht, .expr);
     }
     return resolveLevels(ctx, levels.items, id, args, trailing, type_args, expected);
@@ -1042,7 +1042,7 @@ fn packageCall(ctx: *Ctx, pkg: Sym, id: ast.Ident, args: []Arg, trailing: bool, 
             .function => {
                 try headers.functionHeader(s, m);
                 if (s.syms.functionInfo(m).receiver != .none) continue;
-                try level.append(s.arena, .{ .sym = m, .subst = &empty_subst });
+                try level.append(s.scratch(), .{ .sym = m, .subst = &empty_subst });
             },
             .class => try appendCallableCtors(ctx, &level, m, .none),
             .type_alias => try appendAliasCtors(ctx, &level, m),
@@ -1157,9 +1157,9 @@ fn collectionLiteral(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Erro
                 if (!try members.isOperator(s, m.sym)) continue;
                 try headers.functionHeader(s, m.sym);
                 if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv });
+                try member_level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv });
             }
-            if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+            if (member_level.items.len != 0) try levels.append(s.scratch(), member_level);
             try appendExtensionLevels(ctx, &levels, n, recv, ct, true);
             return resolveLevels(ctx, levels.items, id, args, false, &.{}, expected);
         },
@@ -1226,7 +1226,7 @@ fn appendCtorsVia(ctx: *Ctx, level: *Level, cls: Sym, via_in: CtorVia, outer_ty:
     // through a type alias, the alias's parameters are what it infers.
     if (info.kind == .interface and s.syms.flags(cls).fun_iface) {
         const ctor = try samConstructor(ctx, cls);
-        if (ctor != .none) try level.append(s.arena, .{ .sym = ctor, .subst = via_in.subst, .form = .sam_ctor, .ctor_result = via_in.result, .alias = via_in.alias });
+        if (ctor != .none) try level.append(s.scratch(), .{ .sym = ctor, .subst = via_in.subst, .form = .sam_ctor, .ctor_result = via_in.result, .alias = via_in.alias });
         return;
     }
     if (info.kind == .interface or info.kind == .object or info.kind == .companion) return;
@@ -1251,17 +1251,17 @@ fn appendCtorsVia(ctx: *Ctx, level: *Level, cls: Sym, via_in: CtorVia, outer_ty:
                     outer_arg = st;
                     outer_want = try s.types.substitute(try headers.selfType(s, outer), via.subst);
                 }
-                const sub = try s.arena.create(types.Subst);
-                sub.* = try subtyping.classSubst(s, st);
+                const sub = try s.scratch().create(types.Subst);
+                sub.* = try subtyping.classSubstIn(s, s.scratch(), st);
                 var it = via.subst.iterator();
-                while (it.next()) |e| try sub.put(s.arena, e.key_ptr.*, e.value_ptr.*);
+                while (it.next()) |e| try sub.put(s.scratch(), e.key_ptr.*, e.value_ptr.*);
                 via.subst = sub;
             }
         }
     }
     for (symbols.Symbols.members(&info.members, wk.init)) |ctor| {
         if (s.syms.kind(ctor) != .constructor) continue;
-        try level.append(s.arena, .{ .sym = ctor, .subst = via.subst, .dispatch = via.dispatch, .ctor_result = via.result, .alias = via.alias, .outer_arg = outer_arg, .outer_want = outer_want });
+        try level.append(s.scratch(), .{ .sym = ctor, .subst = via.subst, .dispatch = via.dispatch, .ctor_result = via.result, .alias = via.alias, .outer_arg = outer_arg, .outer_want = outer_want });
     }
 }
 
@@ -1277,8 +1277,8 @@ fn appendAliasCtorsOn(ctx: *Ctx, level: *Level, alias: Sym, dispatch: Receiver, 
     const target = try s.types.makeNotNull(try headers.aliasTarget(s, alias));
     const cls = s.types.classSym(target);
     if (cls == .none or s.syms.kind(cls) != .class) return;
-    const sub = try s.arena.create(types.Subst);
-    sub.* = try subtyping.classSubst(s, target);
+    const sub = try s.scratch().create(types.Subst);
+    sub.* = try subtyping.classSubstIn(s, s.scratch(), target);
     try appendCtorsVia(ctx, level, cls, .{ .dispatch = dispatch, .subst = sub, .result = target, .alias = alias }, outer_ty);
 }
 
@@ -1313,14 +1313,14 @@ fn appendInvokesVia(ctx: *Ctx, level: *Level, vt: TypeId, via: Sym, via_dispatch
     const nullable: TypeId = if (try subtyping.admitsNull(s, vt)) vt else .none;
     for (try members.lookup(s, vt, wk.invoke, .function)) |m| {
         if (!try members.isOperator(s, m.sym)) continue;
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true, .composable_value = comp, .nullable_value = nullable });
+        try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true, .composable_value = comp, .nullable_value = nullable });
         // A contextual function value is also invoked with its contexts
         // taken from the scope.
-        if (k != 0) try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .ctx_scope = k, .on_value = true, .composable_value = comp, .nullable_value = nullable });
+        if (k != 0) try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .ctx_scope = k, .on_value = true, .composable_value = comp, .nullable_value = nullable });
     }
     for (try extensionFunctions(ctx, wk.invoke)) |x| {
         if (!try members.isOperator(s, x.sym)) continue;
-        try level.append(s.arena, .{ .sym = x.sym, .subst = x.subst, .dispatch = x.dispatch, .extension = .expr, .ext_ty = vt, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true });
+        try level.append(s.scratch(), .{ .sym = x.sym, .subst = x.subst, .dispatch = x.dispatch, .extension = .expr, .ext_ty = vt, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true });
     }
 }
 
@@ -1331,7 +1331,7 @@ fn appendExtPropInvokeLevel(ctx: *Ctx, levels: *std.ArrayList(Level), n: Name, r
     const ep = (try extensionProperty(ctx, rt, n)) orelse return;
     var level = newLevel();
     try appendInvokesVia(ctx, &level, ep.ty, ep.sym, ep.dispatch, recv_src);
-    if (level.items.len != 0) try levels.append(s.arena, level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
 }
 
 /// `invoke` on a value of extension-function type `R.(A) -> B` with the
@@ -1346,7 +1346,7 @@ fn appendReceiverInvokes(ctx: *Ctx, level: *Level, vt: TypeId, via: Sym, via_dis
     const comp = try composableFunctionType(s, nn);
     const nullable: TypeId = if (nn != vt and try subtyping.admitsNull(s, vt)) vt else .none;
     for (try members.lookup(s, nn, wk.invoke, .function)) |m| {
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .recv_arg_ty = recv_ty, .recv_arg_src = recv_src, .ctx_scope = @intCast(shape.contexts), .on_value = true, .composable_value = comp, .nullable_value = nullable });
+        try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .recv_arg_ty = recv_ty, .recv_arg_src = recv_src, .ctx_scope = @intCast(shape.contexts), .on_value = true, .composable_value = comp, .nullable_value = nullable });
     }
 }
 
@@ -1383,13 +1383,13 @@ fn invokeValue(ctx: *Ctx, vt: TypeId, anchor: Span, via: Sym, via_dispatch: Rece
     var levels: std.ArrayList(Level) = .empty;
     var level = newLevel();
     try appendInvokes(ctx, &level, vt, via, via_dispatch);
-    if (level.items.len != 0) try levels.append(s.arena, level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
     // A value of extension-function type takes an implicit receiver as its
     // receiver, innermost first: `block!!()` inside `scope.apply { }`.
     for (try body.implicitReceivers(ctx)) |r| {
         var rl = newLevel();
         try appendReceiverInvokes(ctx, &rl, vt, via, via_dispatch, try body.narrowedReceiver(ctx, r), .{ .implicit = .{ .kind = r.kind, .owner = r.owner } });
-        if (rl.items.len != 0) try levels.append(s.arena, rl);
+        if (rl.items.len != 0) try levels.append(s.scratch(), rl);
     }
     const id = ast.Ident{ .name = "invoke", .span = anchor };
     if (levels.items.len == 0) {
@@ -1429,7 +1429,7 @@ fn extensionFunctions(ctx: *Ctx, n: Name) Allocator.Error![]const ExtCand {
             if (l.name != n or s.syms.kind(l.sym) != .function) continue;
             try headers.functionHeader(s, l.sym);
             if (s.syms.functionInfo(l.sym).receiver == .none) continue;
-            try out.append(s.arena, .{ .sym = l.sym, .subst = &empty_subst, .dispatch = .none, .tier = tier });
+            try out.append(s.scratch(), .{ .sym = l.sym, .subst = &empty_subst, .dispatch = .none, .tier = tier });
             any = true;
         }
         if (any) tier += 1;
@@ -1441,7 +1441,7 @@ fn extensionFunctions(ctx: *Ctx, n: Name) Allocator.Error![]const ExtCand {
         for (try members.lookup(s, try body.narrowedReceiver(ctx, r), n, .function)) |m| {
             try headers.functionHeader(s, m.sym);
             if (s.syms.functionInfo(m.sym).receiver == .none) continue;
-            try out.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .tier = tier });
+            try out.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .tier = tier });
             any = true;
         }
         if (any) tier += 1;
@@ -1449,15 +1449,15 @@ fn extensionFunctions(ctx: *Ctx, n: Name) Allocator.Error![]const ExtCand {
     // A package can be both the file's own and a default import; each
     // declaration is a candidate once, at its first tier.
     var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
-    for (out.items) |x| try seen.put(s.arena, x.sym, {});
+    for (out.items) |x| try seen.put(s.scratch(), x.sym, {});
     for (try topLevelTiers(ctx, n)) |top| {
         var any = false;
         for (top) |m| {
             if (s.syms.kind(m) != .function) continue;
-            if ((try seen.getOrPut(s.arena, m)).found_existing) continue;
+            if ((try seen.getOrPut(s.scratch(), m)).found_existing) continue;
             try headers.functionHeader(s, m);
             if (s.syms.functionInfo(m).receiver == .none) continue;
-            try out.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
+            try out.append(s.scratch(), .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
             any = true;
         }
         if (any) tier += 1;
@@ -1473,13 +1473,13 @@ fn appendExtensionLevels(ctx: *Ctx, levels: *std.ArrayList(Level), n: Name, recv
     for (try extensionFunctions(ctx, n)) |x| {
         if (operator_only and !try members.isOperator(s, x.sym)) continue;
         if (x.tier != cur_tier and cur.items.len != 0) {
-            try levels.append(s.arena, cur);
+            try levels.append(s.scratch(), cur);
             cur = newLevel();
         }
         cur_tier = x.tier;
-        try cur.append(s.arena, .{ .sym = x.sym, .subst = x.subst, .dispatch = x.dispatch, .extension = recv_src, .ext_ty = rt });
+        try cur.append(s.scratch(), .{ .sym = x.sym, .subst = x.subst, .dispatch = x.dispatch, .extension = recv_src, .ext_ty = rt });
     }
-    if (cur.items.len != 0) try levels.append(s.arena, cur);
+    if (cur.items.len != 0) try levels.append(s.scratch(), cur);
 }
 
 /// Top-level declarations named `n`, one slice per precedence tier:
@@ -1517,27 +1517,27 @@ pub fn topLevelTiers(ctx: *Ctx, n: Name) Allocator.Error![]const []const Sym {
         var list: std.ArrayList(Sym) = .empty;
         for (targets.items) |*t| {
             const on_object = try scope_mod.objectMembers(s, fi, t);
-            if (on_object) |ms| try list.appendSlice(s.arena, ms);
+            if (on_object) |ms| try list.appendSlice(s.scratch(), ms);
             for (scope_mod.membersOf(s, t.container, t.member)) |m| {
                 if (!scope_mod.visible(s, m)) continue;
                 // An object's functions and properties came from the lookup.
                 if (on_object != null and (s.syms.kind(m) == .function or s.syms.kind(m) == .property)) continue;
-                try list.append(s.arena, m);
+                try list.append(s.scratch(), m);
             }
         }
-        try tiers.append(s.arena, list.items);
+        try tiers.append(s.scratch(), list.items);
     }
     const fc = s.files.items[ctx.file];
-    try tiers.append(s.arena, try visibleMembers(ctx, fc.package, n));
+    try tiers.append(s.scratch(), try visibleMembers(ctx, fc.package, n));
     {
         var list: std.ArrayList(Sym) = .empty;
-        for (fi.star.items) |c| try list.appendSlice(s.arena, try visibleMembers(ctx, c, n));
-        try tiers.append(s.arena, list.items);
+        for (fi.star.items) |c| try list.appendSlice(s.scratch(), try visibleMembers(ctx, c, n));
+        try tiers.append(s.scratch(), list.items);
     }
     for (try scope_mod.defaultPackages(s)) |level| {
         var list: std.ArrayList(Sym) = .empty;
-        for (level) |p| try list.appendSlice(s.arena, try visibleMembers(ctx, p, n));
-        try tiers.append(s.arena, list.items);
+        for (level) |p| try list.appendSlice(s.scratch(), try visibleMembers(ctx, p, n));
+        try tiers.append(s.scratch(), list.items);
     }
     return tiers.items;
 }
@@ -1551,7 +1551,7 @@ fn visibleMembers(ctx: *Ctx, container: Sym, n: Name) Allocator.Error![]const Sy
         if (!scope_mod.visible(s, m)) continue;
         const sym = s.syms.get(m);
         if (sym.flags.visibility == .private and s.syms.kind(container) == .package and sym.file != ctx.file) continue;
-        try out.append(s.arena, m);
+        try out.append(s.scratch(), m);
     }
     return out.items;
 }
@@ -1611,7 +1611,7 @@ fn resolveLevels(ctx: *Ctx, levels: []const Level, id: ast.Ident, args: []Arg, t
                 const rt = if (cand.ext_ty != .none) try sema_mod.render.typeStr(s, s.arena, cand.ext_ty) else "-";
                 std.debug.print("[sema-trace]  level {d} cand {s} ext_recv={s}\n", .{ li, cid, rt });
             }
-            if (try check(ctx, cand, args, trailing, type_args, soft_expected)) |ap| try applicable.append(s.arena, ap);
+            if (try check(ctx, cand, args, trailing, type_args, soft_expected)) |ap| try applicable.append(s.scratch(), ap);
         }
         if (applicable.items.len == 0) continue;
         // Candidates the call cannot see yield to a later level's: a
@@ -1758,7 +1758,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
         }
         for (pinned, type_args) |tp, ta| {
             if (ta == .none) continue;
-            try written.put(s.arena, tp, ta);
+            try written.put(s.scratch(), tp, ta);
             const v = try sys.open(try s.types.param(tp, false));
             if (!try sys.constrain(ta, v) or !try sys.constrain(v, ta)) {
                 traceReject(ctx, cand, "type argument conflicts", .{});
@@ -1783,7 +1783,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
         }
     }
     var uses_vararg = false;
-    const conv = try s.arena.alloc(records.Conv, args.len);
+    const conv = try s.scratch().alloc(records.Conv, args.len);
     @memset(conv, .none);
     for (args, slots, 0..) |a, slot, ai| {
         const p = params[slot.param];
@@ -1813,12 +1813,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
             };
             continue;
         }
-        var trial_arg = try sys.clone();
-        defer trial_arg.deinit();
-        if (try trial_arg.constrain(a.ty, opened)) {
-            _ = try sys.constrain(a.ty, opened);
-            continue;
-        }
+        if (try sys.tryConstrain(a.ty, opened)) continue;
         if (try convertedArg(ctx, &sys, a.ty, opened)) |cv| {
             conv[ai] = cv;
             continue;
@@ -1849,7 +1844,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
             if (trace_active) traceReject(ctx, cand, "no context argument for {s}", .{try sema_mod.render.typeStr(s, s.arena, want)});
             return null;
         };
-        try contexts.append(s.arena, r);
+        try contexts.append(s.scratch(), r);
     };
     // The expected type constrains the result softly: a candidate that
     // cannot meet it is still applicable, as the result may be converted.
@@ -1948,8 +1943,8 @@ fn wrongReceiver(ctx: *Ctx, cand: Cand) Allocator.Error!Inapplicability {
 /// for an extension-function-type `invoke`.
 fn candArgs(ctx: *Ctx, cand: Cand, call_args: []const Arg) Allocator.Error![]Arg {
     const s = ctx.s;
-    if (cand.recv_arg_ty == .none) return s.arena.dupe(Arg, call_args);
-    const out = try s.arena.alloc(Arg, call_args.len + 1);
+    if (cand.recv_arg_ty == .none) return s.scratch().dupe(Arg, call_args);
+    const out = try s.scratch().alloc(Arg, call_args.len + 1);
     const placeholder = try s.arena.create(Expr);
     placeholder.* = .{ .NullLit = .{ .span = if (call_args.len != 0) call_args[0].expr.span() else span.Span.init(span.FileId.from(0), 0, 0) } };
     out[0] = .{ .expr = placeholder, .ty = cand.recv_arg_ty };
@@ -2124,11 +2119,7 @@ fn argumentProblems(ctx: *Ctx, cand: Cand, id: ast.Ident, call_args: []const Arg
         for (pinned, type_args, 0..) |tp, ta, ti| {
             if (ta == .none) continue;
             const v = try sys.open(try s.types.param(tp, false));
-            var trial = try sys.clone();
-            defer trial.deinit();
-            if (try trial.constrain(ta, v) and try trial.constrain(v, ta)) {
-                _ = try sys.constrain(ta, v);
-                _ = try sys.constrain(v, ta);
+            if (try sys.tryConstrainBoth(ta, v)) {
                 continue;
             }
             violated = true;
@@ -2163,12 +2154,7 @@ fn argumentProblems(ctx: *Ctx, cand: Cand, id: ast.Ident, call_args: []const Arg
         var pt = try s.types.substitute(try headers.paramType(s, p), cand.subst);
         if (s.syms.flags(p).vararg and !slot.vararg_elem and (a.spread or slot.named_array)) pt = try varargArrayType(ctx, pt);
         const opened = try sys.open(pt);
-        var trial = try sys.clone();
-        defer trial.deinit();
-        if (try trial.constrain(a.ty, opened)) {
-            _ = try sys.constrain(a.ty, opened);
-            continue;
-        }
+        if (try sys.tryConstrain(a.ty, opened)) continue;
         if (try convertedArg(ctx, &sys, a.ty, opened)) |_| continue;
         try mismatches.append(s.arena, .{ .arg = ai, .want = opened });
     }
@@ -2252,18 +2238,14 @@ fn contextArgument(ctx: *Ctx, sys: *infer.System, want: TypeId) Allocator.Error!
             // as its narrowed type (`if (ctx is String) bar()` for a
             // `context(s: String) fun bar()`).
             const ct = try body.narrowedType(ctx, cv.sym, cv.ty);
-            var trial = try sys.clone();
-            defer trial.deinit();
-            if (!try trial.constrain(ct, want)) continue;
+            if (!try sys.wouldConstrain(ct, want)) continue;
             n += 1;
             found = .{ .implicit = .{ .kind = .context, .owner = cv.sym } };
             found_ty = ct;
         }
         for (c.receivers.items) |r| {
             const rt = try body.narrowedReceiver(ctx, r);
-            var trial = try sys.clone();
-            defer trial.deinit();
-            if (!try trial.constrain(rt, want)) continue;
+            if (!try sys.wouldConstrain(rt, want)) continue;
             n += 1;
             found = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } };
             found_ty = rt;
@@ -2295,8 +2277,8 @@ fn candReturn(ctx: *Ctx, cand: Cand, sys: *infer.System) Allocator.Error!TypeId 
 /// declares none (`Cand.defaults`).
 fn mapArgs(ctx: *Ctx, fsym: Sym, defaults: Sym, params: []const Sym, args: []const Arg, trailing: bool) Allocator.Error!?[]Slot {
     const s = ctx.s;
-    const slots = try s.arena.alloc(Slot, args.len);
-    const filled = try s.arena.alloc(bool, params.len);
+    const slots = try s.scratch().alloc(Slot, args.len);
+    const filled = try s.scratch().alloc(bool, params.len);
     @memset(filled, false);
     var pos: usize = 0;
     for (args, 0..) |a, i| {
@@ -2512,12 +2494,7 @@ fn convertedArg(ctx: *Ctx, sys: *infer.System, at: TypeId, pt: TypeId) Allocator
     for (fvs) |ft_nn| {
         const ft = if (nullable) try s.types.makeNullable(ft_nn) else ft_nn;
         if (try suspendConverted(s, ft)) |st| {
-            var trial = try sys.clone();
-            defer trial.deinit();
-            if (try trial.constrain(st, pt)) {
-                _ = try sys.constrain(st, pt);
-                return .suspend_;
-            }
+            if (try sys.tryConstrain(st, pt)) return .suspend_;
         }
     }
     const pt_nn = try s.types.makeNotNull(pt);
@@ -2529,10 +2506,7 @@ fn convertedArg(ctx: *Ctx, sys: *infer.System, at: TypeId, pt: TypeId) Allocator
         const forms = [_]?TypeId{ ft, try suspendConverted(s, ft) };
         for (forms) |form| {
             const f = form orelse continue;
-            var trial = try sys.clone();
-            defer trial.deinit();
-            if (!try trial.constrain(f, want)) continue;
-            _ = try sys.constrain(f, want);
+            if (!try sys.tryConstrain(f, want)) continue;
             return .{ .sam = s.types.classSym(pt_nn) };
         }
     }
@@ -2551,23 +2525,23 @@ fn functionValueTypes(s: *Sema, t_in: TypeId) Allocator.Error![]const TypeId {
 fn collectFunctionTypes(s: *Sema, t: TypeId, out: *std.ArrayList(TypeId)) Allocator.Error!void {
     switch (s.types.get(t)) {
         .class => {
-            if (functionShape(s, t) != null) return out.append(s.arena, t);
+            if (functionShape(s, t) != null) return out.append(s.scratch(), t);
             var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
             var queue: std.ArrayList(TypeId) = .empty;
-            try queue.append(s.arena, t);
+            try queue.append(s.scratch(), t);
             var qi: usize = 0;
             while (qi < queue.items.len) : (qi += 1) {
                 const cur = queue.items[qi];
                 const c = s.types.get(cur).class;
-                if ((try seen.getOrPut(s.arena, c.sym)).found_existing) continue;
+                if ((try seen.getOrPut(s.scratch(), c.sym)).found_existing) continue;
                 if (qi != 0 and functionShape(s, cur) != null) {
-                    try out.append(s.arena, cur);
+                    try out.append(s.scratch(), cur);
                     continue;
                 }
-                const subst = try subtyping.classSubst(s, cur);
+                const subst = try subtyping.classSubstIn(s, s.scratch(), cur);
                 for (try headers.supertypes(s, c.sym)) |st| {
                     const inst = try s.types.substitute(st, &subst);
-                    if (s.types.get(inst) == .class) try queue.append(s.arena, inst);
+                    if (s.types.get(inst) == .class) try queue.append(s.scratch(), inst);
                 }
             }
         },
@@ -2772,9 +2746,7 @@ fn byLambdaReturn(ctx: *Ctx, apps: []Applied) Allocator.Error!?usize {
         };
         if (ac.args.len == 0) continue;
         const want = ac.args[ac.args.len - 1].ty;
-        var sys = try a.sys.clone();
-        defer sys.deinit();
-        if (!try sys.constrain(lret, try a.sys.open(want))) continue;
+        if (!try a.sys.wouldConstrain(lret, try a.sys.open(want))) continue;
         // An exact result wins over one it merely fits.
         if (try subtyping.equivalent(s, lret, want)) return i;
         if (hit == null) hit = i;
@@ -2831,12 +2803,12 @@ fn withoutConversion(ctx: *Ctx, apps: []Applied, args: []const Arg, kind: std.me
             .sam => try usesSam(ctx, a),
             else => usesConv(a, kind),
         };
-        if (!uses) try plain.append(s.arena, i);
+        if (!uses) try plain.append(s.scratch(), i);
     }
     const n = plain.items.len;
     if (n == 0 or n == apps.len) return null;
     if (n == 1) return .{ .index = plain.items[0], .ambiguous = false };
-    const sub = try s.arena.alloc(Applied, n);
+    const sub = try s.scratch().alloc(Applied, n);
     for (plain.items, sub) |i, *dst| dst.* = apps[i];
     const r = try mostSpecific(ctx, sub, args);
     return .{ .index = plain.items[r.index], .ambiguous = r.ambiguous };
@@ -2888,9 +2860,9 @@ fn mostSpecificByTypes(ctx: *Ctx, apps: []Applied, args: []const Arg) Allocator.
     // themselves (`UByteArray.sumBy((UByte) -> UInt)` over
     // `Iterable<T>.sumBy((T) -> Int)`).
     var plain: std.ArrayList(usize) = .empty;
-    for (apps, 0..) |*a, i| if (!a.generic) try plain.append(ctx.s.arena, i);
+    for (apps, 0..) |*a, i| if (!a.generic) try plain.append(ctx.s.scratch(), i);
     if (plain.items.len != 0 and plain.items.len != apps.len) {
-        const sub = try ctx.s.arena.alloc(Applied, plain.items.len);
+        const sub = try ctx.s.scratch().alloc(Applied, plain.items.len);
         for (plain.items, sub) |i, *dst| dst.* = apps[i];
         const c = try mostSpecificByTypes(ctx, sub, args);
         if (!c.ambiguous) return .{ .index = plain.items[c.index], .ambiguous = false };
@@ -3021,7 +2993,8 @@ fn complete(ctx: *Ctx, app_in: Applied, call_args: []Arg, trailing: bool, id: as
     // call is that function's, whose default bridge makes the value and
     // whose dispatch reaches the implementation the class inherits.
     if (try takesForeignDefault(ctx, &app)) app.cand.sym = cand.defaults;
-    try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = app.cand.sym, .dispatch = cand.dispatch, .extension = ext, .contexts = app.contexts, .detail = .{ .call = try callDetail(ctx, &app, form, ext) } });
+    const detail = try callDetail(ctx, &app, form, ext);
+    try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = kind, .target = app.cand.sym, .dispatch = cand.dispatch, .extension = ext, .contexts = detail.contexts, .detail = .{ .call = detail } });
     return ret;
 }
 
@@ -3114,7 +3087,7 @@ fn checkReifiedArgs(ctx: *Ctx, app: *Applied, id: ast.Ident) Allocator.Error!voi
 fn postponedInOrder(ctx: *Ctx, app: *Applied, label: Name) Allocator.Error!void {
     const s = ctx.s;
     var remaining: std.ArrayList(usize) = .empty;
-    for (app.args, 0..) |a, i| if (a.postponed) try remaining.append(s.arena, i);
+    for (app.args, 0..) |a, i| if (a.postponed) try remaining.append(s.scratch(), i);
     while (remaining.items.len != 0) {
         var pick: usize = 0;
         for (remaining.items, 0..) |i, ri| {
@@ -3140,7 +3113,7 @@ fn waitsOnLambdaResult(ctx: *Ctx, app: *Applied, i: usize, remaining: []const us
         const nn = try s.types.makeNotNull(try infer.zonk(s, mine));
         const args = s.types.argsOf(nn);
         if (functionShape(s, nn) == null or args.len == 0) break :blk .none;
-        const inputs = try s.arena.alloc(types.Arg, args.len - 1);
+        const inputs = try s.scratch().alloc(types.Arg, args.len - 1);
         @memcpy(inputs, args[0 .. args.len - 1]);
         break :blk try s.types.class(s.builtins.any, inputs, false);
     } else mine;
@@ -3187,7 +3160,7 @@ fn sharesOpenVar(s: *Sema, sys: *infer.System, a: TypeId, b: TypeId) Allocator.E
 
 fn collectOpenVars(s: *Sema, t: TypeId, out: *std.ArrayList(u32)) Allocator.Error!void {
     switch (s.types.get(t)) {
-        .variable => |v| if (!s.var_solution.contains(v.id)) try out.append(s.arena, v.id),
+        .variable => |v| if (!s.var_solution.contains(v.id)) try out.append(s.scratch(), v.id),
         .class => |c| for (c.args) |a| {
             if (a.variance != .star) try collectOpenVars(s, a.ty, out);
         },
@@ -3311,9 +3284,7 @@ fn writtenInputs(ctx: *Ctx, sys: *infer.System, e: *const Expr, pt: TypeId) Allo
         const want = args[first + i].ty;
         const written = try body.resolveTypeInBody(ctx, tr);
         if (s.types.isErr(written)) continue;
-        var trial = try sys.clone();
-        defer trial.deinit();
-        if (try trial.constrain(want, written)) _ = try sys.constrain(want, written);
+        _ = try sys.tryConstrain(want, written);
     }
 }
 
@@ -3418,7 +3389,7 @@ fn callDetail(ctx: *Ctx, app: *Applied, form: records.CallForm, ext: Receiver) A
         .dispatch = cand.dispatch,
         .extension = ext,
         .args = srcs,
-        .contexts = app.contexts,
+        .contexts = if (app.contexts.len != 0) try s.arena.dupe(Receiver, app.contexts) else &.{},
         .type_args = targs.items,
         .conv = convs,
         .composable = s.syms.flags(cand.sym).composable or cand.composable_value,
@@ -3869,7 +3840,7 @@ pub fn extensionProperty(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!?ExtPro
             if (s.syms.kind(m.sym) != .property) continue;
             try headers.propertyHeader(s, m.sym);
             if (s.syms.propertyInfo(m.sym).receiver == .none) continue;
-            try candidates.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .tier = tier });
+            try candidates.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .tier = tier });
         }
         tier += 1;
     }
@@ -3879,7 +3850,7 @@ pub fn extensionProperty(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!?ExtPro
             try headers.propertyHeader(s, m);
             if (s.syms.propertyInfo(m).receiver == .none) continue;
             // `import Duration.Companion.seconds`: read on the companion.
-            try candidates.append(s.arena, .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
+            try candidates.append(s.scratch(), .{ .sym = m, .subst = importedSubst(ctx, m), .dispatch = importedOwner(ctx, m), .tier = tier });
         }
         tier += 1;
     }
@@ -3892,7 +3863,7 @@ pub fn extensionProperty(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!?ExtPro
     for (candidates.items) |c| {
         if (best != null and c.tier != best_tier) break;
         const info = s.syms.propertyInfo(c.sym);
-        const sys = try s.arena.create(infer.System);
+        const sys = try s.scratch().create(infer.System);
         sys.* = infer.System.init(s);
         try sys.addTypeParams(info.type_params);
         const recv = try sys.open(try s.types.substitute(info.receiver, c.subst));
@@ -4072,9 +4043,9 @@ fn operatorLevels(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!std.ArrayList(
         if (!try members.isOperator(s, m.sym)) continue;
         try headers.functionHeader(s, m.sym);
         if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-        try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr });
+        try member_level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr });
     };
-    if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+    if (member_level.items.len != 0) try levels.append(s.scratch(), member_level);
     try appendExtensionLevels(ctx, &levels, n, .expr, rt, true);
     return levels;
 }
@@ -4086,7 +4057,7 @@ fn operatorCallFull(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: [
         try ctx.failNode(anchor);
         return s.types.errType();
     }
-    const args = try s.arena.dupe(Arg, pre_args);
+    const args = try s.scratch().dupe(Arg, pre_args);
     const levels = try operatorLevels(ctx, rt, n);
     const members_apply = !try subtyping.admitsNull(s, rt);
     if (try chooseOperator(ctx, levels.items, args, kind, expected)) |chosen| {
@@ -4098,7 +4069,8 @@ fn operatorCallFull(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: [
         _ = try app.sys.solve(false);
         try app.sys.forwardForeign();
         const ret = try app.sys.close(try candReturn(ctx, app.cand, &app.sys));
-        try ctx.addRef(.{ .file = ctx.file, .anchor = anchor, .kind = kind, .op = n, .target = app.cand.sym, .dispatch = app.cand.dispatch, .extension = app.cand.extension, .contexts = app.contexts, .detail = .{ .call = try callDetail(ctx, &app, .plain, app.cand.extension) } });
+        const detail = try callDetail(ctx, &app, .plain, app.cand.extension);
+        try ctx.addRef(.{ .file = ctx.file, .anchor = anchor, .kind = kind, .op = n, .target = app.cand.sym, .dispatch = app.cand.dispatch, .extension = app.cand.extension, .contexts = detail.contexts, .detail = .{ .call = detail } });
         return ret;
     }
     if (unsafe) |u| if (!members_apply) {
@@ -4152,7 +4124,7 @@ fn chooseOperator(ctx: *Ctx, levels: []const Level, args: []Arg, kind: RefKind, 
             // An indexed assignment's value binds to `set`'s last
             // parameter, as a trailing lambda does, whatever the
             // parameters before it default or absorb.
-            if (try check(ctx, cand, args, kind == .set, &.{}, expected)) |ap| try applicable.append(s.arena, ap);
+            if (try check(ctx, cand, args, kind == .set, &.{}, expected)) |ap| try applicable.append(s.scratch(), ap);
         }
         if (applicable.items.len != 0) {
             try dropLowPriority(ctx, &applicable);
@@ -4568,9 +4540,7 @@ fn operatorResultIn(ctx: *Ctx, sys: *infer.System, recv_t: TypeId, n: Name, this
         try trial.addTypeParams(fi.type_params);
         if (fi.params.len != 0) {
             const pt = try trial.open(try s.types.substitute(try headers.paramType(s, fi.params[0]), m.subst));
-            var probe = try trial.clone();
-            defer probe.deinit();
-            if (try probe.constrain(this_ref, pt)) _ = try trial.constrain(this_ref, pt);
+            _ = try trial.tryConstrain(this_ref, pt);
         }
         const ret = try trial.open(try s.types.substitute(fi.ret, m.subst));
         sys.* = trial;
@@ -4593,9 +4563,7 @@ fn operatorResultIn(ctx: *Ctx, sys: *infer.System, recv_t: TypeId, n: Name, this
         if (!try trial.constrain(recv_t, try trial.open(try s.types.substitute(fi.receiver, x.subst)))) continue;
         if (fi.params.len != 0) {
             const pt = try trial.open(try s.types.substitute(try headers.paramType(s, fi.params[0]), x.subst));
-            var probe = try trial.clone();
-            defer probe.deinit();
-            if (try probe.constrain(this_ref, pt)) _ = try trial.constrain(this_ref, pt);
+            _ = try trial.tryConstrain(this_ref, pt);
         }
         const ret = try trial.open(try s.types.substitute(fi.ret, x.subst));
         sys.* = trial;
@@ -4825,7 +4793,7 @@ fn superCall(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, args: []Arg, 
             try headers.functionHeader(s, m.sym);
             if (s.syms.functionInfo(m.sym).receiver != .none) continue;
             if (!s.syms.flags(m.sym).has_body and s.syms.flags(m.sym).modality == .abstract) continue;
-            try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .form = .super_ });
+            try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .form = .super_ });
         }
         // `super.Inner(args)`: an inner class of the supertype, built on
         // this instance.
@@ -4853,7 +4821,7 @@ fn superCall(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, args: []Arg, 
             if (shadowed) _ = level.orderedRemove(i) else i += 1;
         }
     }
-    if (level.items.len != 0) try levels.append(s.arena, level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
     return resolveLevels(ctx, levels.items, name, args, trailing, type_args, expected);
 }
 
@@ -5192,7 +5160,7 @@ fn boundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), rt: TypeId, src: 
             try headers.functionHeader(s, m.sym);
             if (s.syms.functionInfo(m.sym).receiver != .none) continue;
         }
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = src });
+        try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .dispatch = src });
     };
     // `outer::Inner` binds an inner class's constructor to `outer`.
     if (level.items.len == 0 and s.types.classSym(rt) != .none) {
@@ -5202,16 +5170,16 @@ fn boundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), rt: TypeId, src: 
         }
         if (level.items.len == 0) try innerAliasRefCands(ctx, &level, rt, .{ .dispatch = src }, n);
     }
-    if (level.items.len != 0) try levels.append(s.arena, level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
     var ext: RefLevel = .empty;
     for (try extensionFunctions(ctx, n)) |x| {
         const xs = (try extensionRefSubst(s, x.sym, x.subst, rt)) orelse continue;
-        try ext.append(s.arena, .{ .sym = x.sym, .subst = xs, .dispatch = x.dispatch, .extension = src, .ext_ty = rt });
+        try ext.append(s.scratch(), .{ .sym = x.sym, .subst = xs, .dispatch = x.dispatch, .extension = src, .ext_ty = rt });
     }
     if (try extensionProperty(ctx, rt, n)) |ep| {
-        try ext.append(s.arena, .{ .sym = ep.sym, .subst = ep.subst, .dispatch = ep.dispatch, .extension = src, .ext_ty = rt });
+        try ext.append(s.scratch(), .{ .sym = ep.sym, .subst = ep.subst, .dispatch = ep.dispatch, .extension = src, .ext_ty = rt });
     }
-    if (ext.items.len != 0) try levels.append(s.arena, ext);
+    if (ext.items.len != 0) try levels.append(s.scratch(), ext);
 }
 
 /// Candidates on a type named on the left (`Cls::f`): members and
@@ -5260,7 +5228,7 @@ fn unboundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), cls: Sym, self_
         }
         // A static member (`Color::valueOf`) takes no instance.
         const lead: TypeId = if (s.syms.flags(m.sym).static) .none else self_t;
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .lead = lead });
+        try level.append(s.scratch(), .{ .sym = m.sym, .subst = m.subst, .lead = lead });
     };
     const nested = try scope_mod.nestedClassifier(s, cls, n);
     if (members_apply and nested != .none and s.syms.kind(nested) == .class) {
@@ -5270,16 +5238,16 @@ fn unboundRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), cls: Sym, self_
     // The outer instance an alias of an inner class takes is the first
     // argument, not an implicit receiver.
     if (level.items.len == 0) try innerAliasRefCands(ctx, &level, self_t, .{ .lead = self_t }, n);
-    if (level.items.len != 0) try levels.append(s.arena, level);
+    if (level.items.len != 0) try levels.append(s.scratch(), level);
     var ext: RefLevel = .empty;
     for (try extensionFunctions(ctx, n)) |x| {
         const xs = (try extensionRefSubst(s, x.sym, x.subst, self_t)) orelse continue;
-        try ext.append(s.arena, .{ .sym = x.sym, .subst = xs, .dispatch = x.dispatch, .lead = self_t });
+        try ext.append(s.scratch(), .{ .sym = x.sym, .subst = xs, .dispatch = x.dispatch, .lead = self_t });
     }
     if (try extensionProperty(ctx, self_t, n)) |ep| {
-        try ext.append(s.arena, .{ .sym = ep.sym, .subst = ep.subst, .dispatch = ep.dispatch, .lead = self_t });
+        try ext.append(s.scratch(), .{ .sym = ep.sym, .subst = ep.subst, .dispatch = ep.dispatch, .lead = self_t });
     }
-    if (ext.items.len != 0) try levels.append(s.arena, ext);
+    if (ext.items.len != 0) try levels.append(s.scratch(), ext);
 }
 
 /// Candidates for `::f` without a left side: local declarations, then each
@@ -5313,15 +5281,15 @@ fn scopeRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), n: Name) Allocato
                         for (try body.implicitReceivers(ctx)) |r| {
                             const rt = try body.narrowedReceiver(ctx, r);
                             const xs = (try extensionRefSubst(s, loc, &empty_subst, rt)) orelse continue;
-                            try level.append(s.arena, .{ .sym = loc, .subst = xs, .extension = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .ext_ty = rt });
+                            try level.append(s.scratch(), .{ .sym = loc, .subst = xs, .extension = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, .ext_ty = rt });
                             break;
                         }
-                    } else try level.append(s.arena, .{ .sym = loc });
+                    } else try level.append(s.scratch(), .{ .sym = loc });
                 },
                 else => {},
             }
         }
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
     }
     for (try body.implicitReceivers(ctx)) |r| {
         const rt = try body.narrowedReceiver(ctx, r);
@@ -5338,12 +5306,12 @@ fn scopeRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), n: Name) Allocato
                 .function => {
                     try headers.functionHeader(s, m);
                     if (s.syms.functionInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(ctx, m) });
+                    try level.append(s.scratch(), .{ .sym = m, .dispatch = importedOwner(ctx, m) });
                 },
                 .property => {
                     try headers.propertyHeader(s, m);
                     if (s.syms.propertyInfo(m).receiver != .none) continue;
-                    try level.append(s.arena, .{ .sym = m, .dispatch = importedOwner(ctx, m) });
+                    try level.append(s.scratch(), .{ .sym = m, .dispatch = importedOwner(ctx, m) });
                 },
                 .class => try ctorRefCands(ctx, &level, m, .{}),
                 .type_alias => {
@@ -5353,13 +5321,13 @@ fn scopeRefLevels(ctx: *Ctx, levels: *std.ArrayList(RefLevel), n: Name) Allocato
                 else => {},
             }
         }
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
     }
     const cls = try body.classifierInScope(ctx, n);
     if (cls != .none and s.syms.kind(cls) == .class) {
         var level: RefLevel = .empty;
         try ctorRefCands(ctx, &level, cls, .{});
-        if (level.items.len != 0) try levels.append(s.arena, level);
+        if (level.items.len != 0) try levels.append(s.scratch(), level);
     }
 }
 
@@ -5373,7 +5341,7 @@ fn ctorRefCands(ctx: *Ctx, level: *RefLevel, cls: Sym, via: RefCand) Allocator.E
     // `(() -> T) -> Supplier<T>`.
     if (kind == .interface and s.syms.flags(cls).fun_iface and via.alias == .none and via.lead == .none and via.dispatch == .none) {
         const f = try samConstructor(ctx, cls);
-        if (f != .none) try level.append(s.arena, .{ .sym = f });
+        if (f != .none) try level.append(s.scratch(), .{ .sym = f });
         return;
     }
     if (kind == .interface or kind == .object or kind == .companion) return;
@@ -5392,7 +5360,7 @@ fn ctorRefCands(ctx: *Ctx, level: *RefLevel, cls: Sym, via: RefCand) Allocator.E
         if (s.syms.kind(ctor) != .constructor) continue;
         var c = base;
         c.sym = ctor;
-        try level.append(s.arena, c);
+        try level.append(s.scratch(), c);
     }
 }
 
@@ -5516,9 +5484,9 @@ fn visibleLevels(ctx: *Ctx, levels: []const RefLevel) Allocator.Error!?[]const R
     for (levels) |level| {
         var kept: RefLevel = .empty;
         for (level.items) |c| {
-            if (try memberVisible(ctx, c.sym)) try kept.append(s.arena, c) else some_unseen = true;
+            if (try memberVisible(ctx, c.sym)) try kept.append(s.scratch(), c) else some_unseen = true;
         }
-        if (kept.items.len != 0) try out.append(s.arena, kept);
+        if (kept.items.len != 0) try out.append(s.scratch(), kept);
     }
     if (!some_unseen or out.items.len == 0) return null;
     return out.items;
@@ -5545,14 +5513,14 @@ fn chooseRefIn(ctx: *Ctx, levels: []const RefLevel, expected: TypeId, fitting_on
         for (levels) |level| {
             var fits: std.ArrayList(RefChoice) = .empty;
             for (level.items) |c| {
-                if (try refFit(ctx, c, target)) |f| try fits.append(s.arena, .{ .c = c, .ty = if (sam_iface != .none) sam_iface else f.ty, .fn_ty = if (sam_iface != .none) f.ty else .none, .targs = f.targs, .adapted = f.adapted });
+                if (try refFit(ctx, c, target)) |f| try fits.append(s.scratch(), .{ .c = c, .ty = if (sam_iface != .none) sam_iface else f.ty, .fn_ty = if (sam_iface != .none) f.ty else .none, .targs = f.targs, .adapted = f.adapted });
             }
             if (fits.items.len == 0) continue;
             // A candidate that fits as declared wins over one that fits
             // only adapted: `map(String::trim)` is `trim()`, not
             // `trim(vararg chars)` with no chars.
             var exact: std.ArrayList(RefChoice) = .empty;
-            for (fits.items) |f| if (!f.adapted) try exact.append(s.arena, f);
+            for (fits.items) |f| if (!f.adapted) try exact.append(s.scratch(), f);
             return try mostSpecificRef(ctx, if (exact.items.len != 0) exact.items else fits.items);
         }
         if (fitting_only) return null;

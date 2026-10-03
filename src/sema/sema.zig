@@ -133,8 +133,56 @@ pub const Builtins = struct {
     continuation: Sym = .none,
 };
 
+/// `KLIO_SEMA_TABLES`: how much each of the analysis's tables holds, for
+/// the memory it keeps.
+pub fn printTables(s: *Sema) void {
+    const T = struct {
+        fn list(name: []const u8, l: anytype) void {
+            const E = @typeInfo(@TypeOf(l.items)).pointer.child;
+            std.debug.print("[sema-tables] {s}: {d} x {d}B = {d}KB (capacity {d}KB)\n", .{ name, l.items.len, @sizeOf(E), l.items.len * @sizeOf(E) / 1024, l.capacity * @sizeOf(E) / 1024 });
+        }
+        fn map(name: []const u8, m: anytype) void {
+            std.debug.print("[sema-tables] {s}: {d} entries (capacity {d})\n", .{ name, m.count(), m.capacity() });
+        }
+    };
+    var nodes: usize = 0;
+    for (s.files.items) |f| if (f.ast) |a| {
+        nodes += a.node_count;
+    };
+    std.debug.print("[sema-tables] nodes: {d} in {d} files\n", .{ nodes, s.files.items.len });
+    std.debug.print("[sema-tables] scratch high: {d}KB\n", .{s.scratch_high / 1024});
+    T.list("refs", s.refs);
+    T.list("expr_types", s.expr_types);
+    T.list("types", s.types.items);
+    T.list("syms", s.syms.syms);
+    T.list("functions", s.syms.functions);
+    T.list("locals", s.syms.locals);
+    T.list("params", s.syms.params);
+    T.map("var_solution", s.var_solution);
+    T.map("open_var_bounds", s.open_var_bounds);
+    T.map("reified_vars", s.reified_vars);
+    T.map("lookup_memo", s.lookup_memo);
+    T.map("path_subjects", s.path_subjects);
+    T.map("types.intern_map", s.types.intern_map);
+    T.map("exhaustive_whens", s.exhaustive_whens);
+    T.map("contracts", s.contracts);
+    T.map("nonnull_implies", s.nonnull_implies);
+    T.map("bool_implies", s.bool_implies);
+}
+
 pub const Sema = struct {
     arena: Allocator,
+    /// What resolving a body works in and drops: constraint systems,
+    /// candidate lists, supertype walks (`scratch`). Nothing the analysis
+    /// keeps points into it, so it is emptied after each top-level
+    /// declaration whose bodies are resolved (`resetScratch`), and freed
+    /// when `resolveAll` ends.
+    scratch_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
+    /// `resolveAll` is running: `scratch` is `scratch_arena`, else `arena`.
+    scratch_open: bool = false,
+    /// The most `scratch_arena` held when it was emptied: the working data
+    /// of the declaration that needed the most.
+    scratch_high: usize = 0,
     names: Names,
     syms: Symbols,
     types: TypeStore,
@@ -256,8 +304,34 @@ pub const Sema = struct {
         throwable: TypeId = .none,
     };
 
-    /// `arena` owns everything the analysis allocates; the analysis is
-    /// dropped by dropping it.
+    /// Where a resolution's working data goes: `scratch_arena` while
+    /// `resolveAll` runs, `arena` outside it (headers typed before bodies,
+    /// the checks after), whose analysis nothing empties.
+    pub fn scratch(self: *Sema) Allocator {
+        return if (self.scratch_open) self.scratch_arena.allocator() else self.arena;
+    }
+
+    /// Empties `scratch_arena`, keeping pages for the next declaration. Only
+    /// where no call is being resolved: between top-level declarations.
+    pub fn resetScratch(self: *Sema) void {
+        if (!self.scratch_open) return;
+        self.scratch_high = @max(self.scratch_high, self.scratch_arena.queryCapacity());
+        _ = self.scratch_arena.reset(.{ .retain_with_limit = 16 * 1024 * 1024 });
+    }
+
+    pub fn openScratch(self: *Sema) void {
+        self.scratch_open = true;
+    }
+
+    /// Ends what `openScratch` began and frees `scratch_arena`'s pages.
+    pub fn closeScratch(self: *Sema) void {
+        self.scratch_high = @max(self.scratch_high, self.scratch_arena.queryCapacity());
+        self.scratch_open = false;
+        _ = self.scratch_arena.reset(.free_all);
+    }
+
+    /// `arena` owns everything the analysis keeps; the analysis is dropped
+    /// by dropping it.
     pub fn init(arena: Allocator) Allocator.Error!*Sema {
         const s = try arena.create(Sema);
         s.* = .{

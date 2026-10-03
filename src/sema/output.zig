@@ -148,6 +148,13 @@ pub fn build(s: *Sema) Allocator.Error!Output {
     return .{ .files = out, .orphans = orphans };
 }
 
+/// Frees the logs `build` indexed (`Sema.refs`, `Sema.expr_types`), for a
+/// caller that reads only the index from then on, as lowering does.
+pub fn releaseLogs(s: *Sema) void {
+    s.refs.clearAndFree(s.arena);
+    s.expr_types.clearAndFree(s.arena);
+}
+
 /// Whether a sorted list of site offsets has one inside `sp`.
 fn holdsSite(starts: []const u32, sp: @import("span").Span) bool {
     const i = std.sort.lowerBound(u32, starts, sp.start, struct {

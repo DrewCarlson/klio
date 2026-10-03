@@ -148,8 +148,8 @@ fn supertypeWalk(s: *Sema, t: TypeId, target: Sym, seen: *std.AutoHashMapUnmanag
         else => return null,
     };
     if (sameClass(s, c.sym, target)) return t;
-    if ((try seen.getOrPut(s.arena, c.sym)).found_existing) return null;
-    const subst = try classSubst(s, t);
+    if ((try seen.getOrPut(s.scratch(), c.sym)).found_existing) return null;
+    const subst = try classSubstIn(s, s.scratch(), t);
     for (try headers.supertypes(s, c.sym)) |st| {
         const inst = try ts.substitute(st, &subst);
         if (try supertypeWalk(s, inst, target, seen)) |hit| return hit;
@@ -172,6 +172,11 @@ fn sameClass(s: *Sema, a: Sym, b: Sym) bool {
 /// The substitution a class type applies to its class's type parameters.
 /// A star projection maps to the parameter's first bound.
 pub fn classSubst(s: *Sema, t: TypeId) Allocator.Error!types.Subst {
+    return classSubstIn(s, s.arena, t);
+}
+
+/// `classSubst`, allocated in `a`.
+pub fn classSubstIn(s: *Sema, a: Allocator, t: TypeId) Allocator.Error!types.Subst {
     var subst: types.Subst = .empty;
     const c = switch (s.types.get(t)) {
         .class => |c| c,
@@ -185,7 +190,7 @@ pub fn classSubst(s: *Sema, t: TypeId) Allocator.Error!types.Subst {
             const bounds = try headers.typeParamBounds(s, tp);
             break :blk if (bounds.len != 0) bounds[0] else s.t.any_q;
         } else arg.ty;
-        try subst.put(s.arena, tp, ty);
+        try subst.put(a, tp, ty);
     }
     return subst;
 }
@@ -248,7 +253,7 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
         if (s.types.isErr(t)) return t;
         if (s.types.isNullable(t)) any_nullable = true;
         if (isNothing(s, t)) continue;
-        try non_nothing.append(s.arena, try s.types.makeNotNull(t));
+        try non_nothing.append(s.scratch(), try s.types.makeNotNull(t));
     }
     if (non_nothing.items.len == 0) return if (any_nullable) s.t.nothing_q else s.t.nothing;
     const first = non_nothing.items[0];
@@ -272,7 +277,7 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
         var qi: usize = 0;
         while (qi < queue.items.len) : (qi += 1) {
             const cls = queue.items[qi];
-            if ((try seen.getOrPut(s.arena, cls)).found_existing) continue;
+            if ((try seen.getOrPut(s.scratch(), cls)).found_existing) continue;
             var all = true;
             for (non_nothing.items) |t| {
                 if (try viewAs(s, t, cls) == null) {
@@ -281,12 +286,12 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
                 }
             }
             if (all) {
-                try common.append(s.arena, cls);
+                try common.append(s.scratch(), cls);
                 continue;
             }
             for (try headers.supertypes(s, cls)) |st| {
                 const sc = s.types.classSym(st);
-                if (sc != .none) try queue.append(s.arena, sc);
+                if (sc != .none) try queue.append(s.scratch(), sc);
             }
         }
         var minimal: std.ArrayList(TypeId) = .empty;
@@ -301,7 +306,7 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
                 }
             }
             if (dominated) continue;
-            try minimal.append(s.arena, try joinedClass(s, a, non_nothing.items, depth));
+            try minimal.append(s.scratch(), try joinedClass(s, a, non_nothing.items, depth));
         }
         if (minimal.items.len == 1) {
             result = minimal.items[0];
@@ -327,7 +332,7 @@ fn sharedParamBound(s: *Sema, items: []const TypeId) Allocator.Error!?TypeId {
     while (true) {
         if (s.types.get(t) == .param) {
             for (try headers.typeParamBounds(s, s.types.get(t).param.sym)) |bound| {
-                if (s.types.get(try s.types.makeNotNull(bound)) == .param) try queue.append(s.arena, bound);
+                if (s.types.get(try s.types.makeNotNull(bound)) == .param) try queue.append(s.scratch(), bound);
             }
         }
         if (qi >= queue.items.len or qi >= 16) return null;
@@ -341,7 +346,7 @@ fn sharedParamBound(s: *Sema, items: []const TypeId) Allocator.Error!?TypeId {
 /// intersection's parts'.
 fn classRoots(s: *Sema, t: TypeId, out: *std.ArrayList(Sym)) Allocator.Error!void {
     switch (s.types.get(t)) {
-        .class => |c| try out.append(s.arena, c.sym),
+        .class => |c| try out.append(s.scratch(), c.sym),
         .param => |p| for (try headers.typeParamBounds(s, p.sym)) |b| try classRoots(s, b, out),
         .intersection => |parts| for (parts) |part| try classRoots(s, part, out),
         else => {},
@@ -398,9 +403,9 @@ pub fn isSubclass(s: *Sema, sub: Sym, sup: Sym) Allocator.Error!bool {
 fn joinedClass(s: *Sema, cls: Sym, list: []const TypeId, depth: u8) Allocator.Error!TypeId {
     const tps = try headers.classTypeParams(s, cls);
     if (tps.len == 0) return headers.selfType(s, cls);
-    const views = try s.arena.alloc([]const types.Arg, list.len);
+    const views = try s.scratch().alloc([]const types.Arg, list.len);
     for (list, views) |t, *v| v.* = s.types.argsOf((try viewAs(s, t, cls)).?);
-    const args = try s.arena.alloc(types.Arg, tps.len);
+    const args = try s.scratch().alloc(types.Arg, tps.len);
     for (tps, args, 0..) |tp, *out, i| {
         var same = true;
         var star = false;
@@ -420,7 +425,7 @@ fn joinedClass(s: *Sema, cls: Sym, list: []const TypeId, depth: u8) Allocator.Er
             continue;
         }
         const decl = s.syms.typeParamInfo(tp).variance;
-        const tys = try s.arena.alloc(TypeId, views.len);
+        const tys = try s.scratch().alloc(TypeId, views.len);
         for (views, tys) |v, *t| t.* = v[i].ty;
         // A contravariant argument joins at the lowest of them, when one
         // is below every other (`(MutableCollection<E>) -> Unit` and
@@ -434,8 +439,8 @@ fn joinedClass(s: *Sema, cls: Sym, list: []const TypeId, depth: u8) Allocator.Er
             for (views, tys) |v, t| {
                 if (v[i].variance == .out) break;
                 switch (s.types.get(t)) {
-                    .intersection => |ps| try parts.appendSlice(s.arena, ps),
-                    else => try parts.append(s.arena, t),
+                    .intersection => |ps| try parts.appendSlice(s.scratch(), ps),
+                    else => try parts.append(s.scratch(), t),
                 }
             } else if (!try emptyIntersection(s, parts.items)) {
                 out.* = .{ .variance = .inv, .ty = try s.types.intern(.{ .intersection = parts.items }) };

@@ -22,6 +22,8 @@ const Allocator = std.mem.Allocator;
 const Sema = sema_mod.Sema;
 const Sym = symbols.Sym;
 const TypeId = types.TypeId;
+const ArgBuf = types.ArgBuf;
+const TypeBuf = types.TypeBuf;
 
 pub const Var = struct {
     /// The type parameter the variable stands for; `.none` for a variable
@@ -54,6 +56,9 @@ pub const Var = struct {
 
 pub const System = struct {
     s: *Sema,
+    /// Owns the system's lists and maps (`Sema.scratch`); `deinit` frees
+    /// them.
+    a: Allocator,
     vars: std.ArrayList(Var) = .empty,
     index: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     /// Type parameter to its variable type.
@@ -74,16 +79,24 @@ pub const System = struct {
     /// Variables a lambda's parameter or receiver type mentions: fixed
     /// before the lambda is analyzed, so never left open.
     must_fix: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// While an attempt is open (`attempts != 0`), the bounds `constrain`
+    /// appends, in order, so a failed attempt is taken back
+    /// (`tryConstrain`); the variables it adopts are the ones past the
+    /// attempt's start.
+    undo: std.ArrayList(Undo) = .empty,
+    attempts: u32 = 0,
+
+    const Undo = struct { var_index: u32, upper: bool };
 
     pub fn init(s: *Sema) System {
-        return .{ .s = s };
+        return .{ .s = s, .a = s.scratch() };
     }
 
     /// An independent copy, for a trial solve that must not fix the real
     /// system's variables. A trial never records its solutions.
     pub fn clone(self: *const System) Allocator.Error!System {
-        const a = self.s.arena;
-        var out = System{ .s = self.s, .trial = true, .keep = self.keep, .result = self.result };
+        const a = self.a;
+        var out = System{ .s = self.s, .a = a, .trial = true, .keep = self.keep, .result = self.result };
         var mf = self.must_fix.iterator();
         while (mf.next()) |e| try out.must_fix.put(a, e.key_ptr.*, {});
         for (self.vars.items) |v| {
@@ -103,16 +116,16 @@ pub const System = struct {
         return out;
     }
 
-    /// Frees what the system holds, for a trial copy nothing reads again;
-    /// the types it interned stay.
+    /// Frees what the system holds; the types it interned stay.
     pub fn deinit(self: *System) void {
-        const a = self.s.arena;
+        const a = self.a;
         for (self.vars.items) |*v| {
             v.lower.deinit(a);
             v.upper.deinit(a);
             v.declared.deinit(a);
         }
         self.vars.deinit(a);
+        self.undo.deinit(a);
         self.index.deinit(a);
         self.open_subst.deinit(a);
         self.must_fix.deinit(a);
@@ -130,11 +143,11 @@ pub const System = struct {
         const s = self.s;
         for (tps) |tp| {
             const v = try freshVar(s);
-            try self.index.put(s.arena, v.id, @intCast(self.vars.items.len));
+            try self.index.put(self.a, v.id, @intCast(self.vars.items.len));
             const reified = s.syms.flags(tp).reified;
             if (reified) try s.reified_vars.put(s.arena, v.id, {});
-            try self.vars.append(s.arena, .{ .tp = tp, .id = v.id, .ty = v.ty, .reified = reified });
-            try self.open_subst.put(s.arena, tp, v.ty);
+            try self.vars.append(self.a, .{ .tp = tp, .id = v.id, .ty = v.ty, .reified = reified });
+            try self.open_subst.put(self.a, tp, v.ty);
         }
     }
 
@@ -145,15 +158,15 @@ pub const System = struct {
             .variable => |v| {
                 if (self.index.contains(v.id)) return;
                 if (s.var_solution.contains(v.id)) return;
-                try self.index.put(s.arena, v.id, @intCast(self.vars.items.len));
+                try self.index.put(self.a, v.id, @intCast(self.vars.items.len));
                 var nv: Var = .{ .tp = .none, .id = v.id, .ty = try s.types.intern(.{ .variable = .{ .id = v.id } }), .foreign = s.builder_owners.contains(v.id), .reified = s.reified_vars.contains(v.id) };
                 // What the call that left it open knew about it, and the
                 // open variables that knowledge mentions.
                 const bounds = s.open_var_bounds.get(v.id);
                 if (bounds) |b| {
-                    try nv.lower.appendSlice(s.arena, b.lower);
-                    try nv.upper.appendSlice(s.arena, b.upper);
-                    try nv.declared.appendSlice(s.arena, b.declared);
+                    try nv.lower.appendSlice(self.a, b.lower);
+                    try nv.upper.appendSlice(self.a, b.upper);
+                    try nv.declared.appendSlice(self.a, b.declared);
                 }
                 // A builder variable: what the statements of the lambda so
                 // far said of it, so a candidate that contradicts them does
@@ -162,11 +175,11 @@ pub const System = struct {
                 if (nv.foreign) if (s.builder_owners.get(v.id)) |owner| {
                     if (owner.index.get(v.id)) |oi| {
                         const ov = &owner.vars.items[oi];
-                        for (ov.lower.items) |lb| if (!owner.mentionsOwnVar(lb)) try nv.lower.append(s.arena, lb);
-                        for (ov.upper.items) |ub| if (!owner.mentionsOwnVar(ub)) try nv.upper.append(s.arena, ub);
+                        for (ov.lower.items) |lb| if (!owner.mentionsOwnVar(lb)) try nv.lower.append(self.a, lb);
+                        for (ov.upper.items) |ub| if (!owner.mentionsOwnVar(ub)) try nv.upper.append(self.a, ub);
                     }
                 };
-                try self.vars.append(s.arena, nv);
+                try self.vars.append(self.a, nv);
                 const added = self.vars.items[self.vars.items.len - 1];
                 for (added.lower.items) |lb| try self.adopt(lb);
                 for (added.upper.items) |ub| try self.adopt(ub);
@@ -190,8 +203,9 @@ pub const System = struct {
         const args = s.types.argsOf(nn);
         if (args.len == 0) return out.items;
         var found: std.ArrayList(u32) = .empty;
+        defer found.deinit(self.a);
         for (args[0 .. args.len - 1]) |arg| {
-            if (arg.variance != .star) try collectVarIds(s, arg.ty, &found);
+            if (arg.variance != .star) try collectVarIds(self.a, s, arg.ty, &found);
         }
         for (found.items) |id| {
             const i = trial.index.get(id) orelse continue;
@@ -226,6 +240,7 @@ pub const System = struct {
         const i = self.index.get(id) orelse return null;
         if (self.vars.items[i].fixed != .none) return self.vars.items[i].fixed;
         var lowers: std.ArrayList(TypeId) = .empty;
+        defer lowers.deinit(self.a);
         var lits: types.IntLit = .{};
         var any_lit = false;
         for (self.vars.items[i].lower.items) |lb| {
@@ -236,14 +251,14 @@ pub const System = struct {
                     lits = mergeLits(lits, l);
                     any_lit = true;
                 },
-                else => try lowers.append(s.arena, z),
+                else => try lowers.append(self.a, z),
             }
         }
         var result: TypeId = .none;
         if (any_lit) {
             const lit = try s.types.intern(.{ .int_lit = lits });
             const joins = lowers.items.len != 0 and try subtyping.isSubtype(s, lit, try subtyping.commonSupertype(s, lowers.items));
-            if (!joins) try lowers.append(s.arena, try intLitDefault(s, lits));
+            if (!joins) try lowers.append(self.a, try intLitDefault(s, lits));
         }
         if (lowers.items.len != 0) {
             result = try subtyping.commonSupertype(s, lowers.items);
@@ -351,7 +366,7 @@ pub const System = struct {
     fn markVars(self: *System, t: TypeId) Allocator.Error!void {
         const s = self.s;
         switch (s.types.get(t)) {
-            .variable => |v| try self.must_fix.put(s.arena, v.id, {}),
+            .variable => |v| try self.must_fix.put(self.a, v.id, {}),
             .class => |c| for (c.args) |arg| {
                 if (arg.variance != .star) try self.markVars(arg.ty);
             },
@@ -373,7 +388,9 @@ pub const System = struct {
                 return withVarNullability(ts, v, f);
             },
             .class => |c| {
-                const out = try self.s.arena.alloc(types.Arg, c.args.len);
+                var buf: ArgBuf = .init(self.a);
+                const out = try buf.get(c.args.len);
+                defer buf.free(out);
                 for (c.args, out) |a, *o| {
                     o.* = a;
                     if (a.variance != .star) o.ty = try self.closeInputs(fixed, a.ty);
@@ -394,7 +411,9 @@ pub const System = struct {
             .variable => |v| return if (self.index.contains(v.id)) t else .none,
             .class => |c| {
                 if (c.args.len == 0) return t;
-                const out = try s.arena.alloc(types.Arg, c.args.len);
+                var buf: ArgBuf = .init(self.a);
+                const out = try buf.get(c.args.len);
+                defer buf.free(out);
                 for (c.args, out) |a, *o| {
                     o.* = a;
                     if (a.variance == .star) continue;
@@ -476,6 +495,70 @@ pub const System = struct {
         }
     }
 
+    /// Adds `sub <: sup` when it can hold, and leaves the system as it was
+    /// when it cannot: what constraining a trial copy, and then the system
+    /// again on success, does, without the copy.
+    pub fn tryConstrain(self: *System, sub: TypeId, sup: TypeId) Allocator.Error!bool {
+        const start = self.openAttempt();
+        errdefer self.closeAttempt(start, false);
+        const ok = try self.constrainFresh(sub, sup);
+        self.closeAttempt(start, ok);
+        return ok;
+    }
+
+    /// Adds `a <: b` and `b <: a` when both can hold, else neither.
+    pub fn tryConstrainBoth(self: *System, a: TypeId, b: TypeId) Allocator.Error!bool {
+        const start = self.openAttempt();
+        errdefer self.closeAttempt(start, false);
+        const ok = try self.constrainFresh(a, b) and try self.constrainFresh(b, a);
+        self.closeAttempt(start, ok);
+        return ok;
+    }
+
+    /// Whether `sub <: sup` could be added, leaving the system as it was.
+    pub fn wouldConstrain(self: *System, sub: TypeId, sup: TypeId) Allocator.Error!bool {
+        const start = self.openAttempt();
+        errdefer self.closeAttempt(start, false);
+        const ok = try self.constrainFresh(sub, sup);
+        self.closeAttempt(start, false);
+        return ok;
+    }
+
+    const Attempt = struct { vars: usize, undo: usize };
+
+    fn openAttempt(self: *System) Attempt {
+        self.attempts += 1;
+        return .{ .vars = self.vars.items.len, .undo = self.undo.items.len };
+    }
+
+    /// Ends the attempt begun at `start`: kept, or taken back to `start`.
+    fn closeAttempt(self: *System, start: Attempt, keep: bool) void {
+        self.attempts -= 1;
+        if (!keep) {
+            while (self.undo.items.len > start.undo) {
+                const u = self.undo.pop().?;
+                const v = &self.vars.items[u.var_index];
+                _ = if (u.upper) v.upper.pop() else v.lower.pop();
+            }
+            for (self.vars.items[start.vars..]) |v| _ = self.index.remove(v.id);
+            self.vars.shrinkRetainingCapacity(start.vars);
+        }
+        // With no attempt left open, nothing can be taken back.
+        if (self.attempts == 0) self.undo.clearRetainingCapacity();
+    }
+
+    /// `constrain` from depth 0, as on a fresh copy of the system.
+    fn constrainFresh(self: *System, sub: TypeId, sup: TypeId) Allocator.Error!bool {
+        const saved = self.depth;
+        self.depth = 0;
+        defer self.depth = saved;
+        return self.constrain(sub, sup);
+    }
+
+    fn noteAppend(self: *System, i: usize, upper: bool) Allocator.Error!void {
+        if (self.attempts != 0) try self.undo.append(self.a, .{ .var_index = @intCast(i), .upper = upper });
+    }
+
     /// Adds `sub <: sup`. False when the constraint cannot hold whatever
     /// the variables become.
     pub fn constrain(self: *System, sub_in: TypeId, sup_in: TypeId) Allocator.Error!bool {
@@ -545,9 +628,7 @@ pub const System = struct {
                 const sup_sym = ts.classSym(try ts.makeNotNull(sup));
                 if (sup_sym != .none) for (parts) |p| {
                     if ((try subtyping.supertypeWithClass(s, try ts.makeNotNull(p), sup_sym)) == null) continue;
-                    var trial = try self.clone();
-                    defer trial.deinit();
-                    if (try trial.constrain(p, sup)) return self.constrain(p, sup);
+                    if (try self.wouldConstrain(p, sup)) return self.constrain(p, sup);
                 };
                 return self.constrain(parts[0], sup);
             },
@@ -600,7 +681,8 @@ pub const System = struct {
                         const bs = try headers.typeParamBounds(s, tps[i]);
                         break :blk if (bs.len != 0) bs[0] else s.t.any_q;
                     } else s.t.any_q;
-                    try self.vars.items[vi].lower.append(s.arena, bound);
+                    try self.vars.items[vi].lower.append(self.a, bound);
+                    try self.noteAppend(vi, false);
                 }
                 continue;
             }
@@ -646,28 +728,30 @@ pub const System = struct {
     /// A new lower bound must fit every upper bound already known, and the
     /// constraint that says so is added too.
     fn addLower(self: *System, i: usize, lb: TypeId) Allocator.Error!bool {
-        const s = self.s;
         // A bound already known was incorporated when it was added.
         if (std.mem.indexOfScalar(TypeId, self.vars.items[i].lower.items, lb) != null) return true;
-        try self.vars.items[i].lower.append(s.arena, lb);
-        const uppers = try s.arena.dupe(TypeId, self.vars.items[i].upper.items);
-        for (uppers) |ub| {
-            if (!try self.constrain(lb, ub)) return false;
+        try self.vars.items[i].lower.append(self.a, lb);
+        try self.noteAppend(i, false);
+        // The bounds known now, read by index: incorporation appends to the
+        // lists (and `adopt` to `vars`), never changing what is there.
+        const n_upper = self.vars.items[i].upper.items.len;
+        for (0..n_upper) |k| {
+            if (!try self.constrain(lb, self.vars.items[i].upper.items[k])) return false;
         }
-        const declared = try s.arena.dupe(TypeId, self.vars.items[i].declared.items);
-        for (declared) |ub| {
-            if (!try self.constrain(lb, ub)) return false;
+        const n_declared = self.vars.items[i].declared.items.len;
+        for (0..n_declared) |k| {
+            if (!try self.constrain(lb, self.vars.items[i].declared.items[k])) return false;
         }
         return true;
     }
 
     fn addUpper(self: *System, i: usize, ub: TypeId) Allocator.Error!bool {
-        const s = self.s;
         if (std.mem.indexOfScalar(TypeId, self.vars.items[i].upper.items, ub) != null) return true;
-        try self.vars.items[i].upper.append(s.arena, ub);
-        const lowers = try s.arena.dupe(TypeId, self.vars.items[i].lower.items);
-        for (lowers) |lb| {
-            if (!try self.constrain(lb, ub)) return false;
+        try self.vars.items[i].upper.append(self.a, ub);
+        try self.noteAppend(i, true);
+        const n_lower = self.vars.items[i].lower.items.len;
+        for (0..n_lower) |k| {
+            if (!try self.constrain(self.vars.items[i].lower.items[k], ub)) return false;
         }
         return true;
     }
@@ -686,7 +770,7 @@ pub const System = struct {
             const i = self.varIndex(v) orelse continue;
             for (try headers.typeParamBounds(s, tp)) |b| {
                 if (s.types.classSym(b) == s.builtins.any and s.types.isNullable(b)) continue;
-                try self.vars.items[i].declared.append(s.arena, try self.open(try s.types.substitute(b, class_subst)));
+                try self.vars.items[i].declared.append(self.a, try self.open(try s.types.substitute(b, class_subst)));
             }
         }
         return true;
@@ -715,7 +799,9 @@ pub const System = struct {
             },
             .class => |c| {
                 if (!self.mentionsVar(t)) return t;
-                const out = try self.s.arena.alloc(types.Arg, c.args.len);
+                var buf: ArgBuf = .init(self.a);
+                const out = try buf.get(c.args.len);
+                defer buf.free(out);
                 for (c.args, out) |a, *o| {
                     o.* = a;
                     if (a.variance != .star) o.ty = try self.replaceVars(a.ty, unfixed_as_top);
@@ -723,7 +809,9 @@ pub const System = struct {
                 return ts.classAttrs(c.sym, out, c.nullable, c.attrs);
             },
             .intersection => |parts| {
-                const out = try self.s.arena.alloc(TypeId, parts.len);
+                var buf: TypeBuf = .init(self.a);
+                const out = try buf.get(parts.len);
+                defer buf.free(out);
                 for (parts, out) |p, *o| o.* = try self.replaceVars(p, unfixed_as_top);
                 return ts.intern(.{ .intersection = out });
             },
@@ -747,9 +835,10 @@ pub const System = struct {
         // Neither is below the other: below both is their intersection
         // (`E <: Int` and `E <: String` make `E` an `Int & String`).
         var parts: std.ArrayList(TypeId) = .empty;
+        defer parts.deinit(self.a);
         for ([_]TypeId{ a, b }) |t| switch (s.types.get(t)) {
-            .intersection => |ps| try parts.appendSlice(s.arena, ps),
-            else => try parts.append(s.arena, t),
+            .intersection => |ps| try parts.appendSlice(self.a, ps),
+            else => try parts.append(self.a, t),
         };
         return s.types.intern(.{ .intersection = parts.items });
     }
@@ -826,15 +915,10 @@ pub const System = struct {
                 if (v.fixed == .none or v.bounds_applied) continue;
                 v.bounds_applied = true;
                 const fixed = v.fixed;
-                for (try s.arena.dupe(TypeId, v.declared.items)) |db| {
+                for (try self.a.dupe(TypeId, v.declared.items)) |db| {
                     const z = try zonk(s, db);
                     if (!self.mentionsOtherUnfixed(z, self.vars.items[vi].id)) continue;
-                    var trial = try self.clone();
-                    defer trial.deinit();
-                    if (try trial.constrain(fixed, z)) {
-                        _ = try self.constrain(fixed, z);
-                        progress = true;
-                    }
+                    if (try self.tryConstrain(fixed, z)) progress = true;
                 }
             }
             for (self.vars.items) |*v| {
@@ -857,7 +941,7 @@ pub const System = struct {
                 // holds its null.
                 var pending_null = false;
                 var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                try seen.put(s.arena, v.id, {});
+                try seen.put(self.a, v.id, {});
                 for (v.lower.items) |lb| {
                     const z = try zonk(s, lb);
                     if (self.waitsOnOwn(z)) {
@@ -873,7 +957,7 @@ pub const System = struct {
                             lits = mergeLits(lits, l);
                             any_lit = true;
                         },
-                        else => try lowers.append(s.arena, try self.close(z)),
+                        else => try lowers.append(self.a, try self.close(z)),
                     }
                 }
                 if (any_lit and lowers.items.len == 0 and !pending) {
@@ -894,12 +978,12 @@ pub const System = struct {
                     // for `1` and a `Byte`), else as their default.
                     const lub = try subtyping.commonSupertype(s, lowers.items);
                     const lit = try s.types.intern(.{ .int_lit = lits });
-                    if (!try subtyping.isSubtype(s, lit, lub)) try lowers.append(s.arena, try intLitDefault(s, lits));
+                    if (!try subtyping.isSubtype(s, lit, lub)) try lowers.append(self.a, try intLitDefault(s, lits));
                 } else if (any_lit) {
                     // Beside a variable still open, the integral type an
                     // upper bound names, else the default: `Holder(4)` for a
                     // `Holder<T>` with `T : Long` holds a `Long`.
-                    try lowers.append(s.arena, (try self.literalTarget(v, lits)) orelse try intLitDefault(s, lits));
+                    try lowers.append(self.a, (try self.literalTarget(v, lits)) orelse try intLitDefault(s, lits));
                 }
                 if (lowers.items.len != 0) {
                     v.fixed = try subtyping.commonSupertype(s, lowers.items);
@@ -931,12 +1015,10 @@ pub const System = struct {
                     // and a variable below it is at most that type.
                     if (pending) {
                         const fixed = v.fixed;
-                        for (try s.arena.dupe(TypeId, v.lower.items)) |lb| {
+                        for (try self.a.dupe(TypeId, v.lower.items)) |lb| {
                             const z = try zonk(s, lb);
                             if (!self.waitsOnOwn(z)) continue;
-                            var trial = try self.clone();
-                            defer trial.deinit();
-                            if (try trial.constrain(z, fixed)) _ = try self.constrain(z, fixed);
+                            _ = try self.tryConstrain(z, fixed);
                         }
                     }
                     progress = true;
@@ -953,7 +1035,7 @@ pub const System = struct {
                     // and says what `v` is (`Holder(123)` for a `Holder<T>`
                     // with `T : Any` is a `Holder<Int>`, not a `Holder<Any>`).
                     var nothing_seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
-                    try nothing_seen.put(s.arena, v.id, {});
+                    try nothing_seen.put(self.a, v.id, {});
                     const only_vars = for (v.lower.items) |lb| {
                         const z = try zonk(s, lb);
                         if (self.varIndex(z) == null) break false;
@@ -1027,7 +1109,12 @@ pub const System = struct {
             if (v.fixed == .none) {
                 // Left open: whoever adopts it inherits what is known.
                 if (!self.trial and (v.lower.items.len != 0 or v.upper.items.len != 0 or v.declared.items.len != 0)) {
-                    try s.open_var_bounds.put(s.arena, v.id, .{ .lower = v.lower.items, .upper = v.upper.items, .declared = v.declared.items });
+                    // Kept past this system: in the analysis's own arena.
+                    try s.open_var_bounds.put(s.arena, v.id, .{
+                        .lower = try s.arena.dupe(TypeId, v.lower.items),
+                        .upper = try s.arena.dupe(TypeId, v.upper.items),
+                        .declared = try s.arena.dupe(TypeId, v.declared.items),
+                    });
                 }
                 continue;
             }
@@ -1093,7 +1180,10 @@ pub const System = struct {
         const have = ts.argsOf(up);
         if (have.len != bc.args.len) return false;
         const tps = try headers.classTypeParams(s, bc.sym);
-        const args = try s.arena.dupe(types.Arg, have);
+        var buf: ArgBuf = .init(s.scratch());
+        const args = try buf.get(have.len);
+        defer buf.free(args);
+        @memcpy(args, have);
         var captured = false;
         for (args, bc.args, 0..) |*h, w, i| {
             if (h.variance != .star or w.variance == .star) continue;
@@ -1134,21 +1224,22 @@ pub const System = struct {
         const s = self.s;
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
         var work: std.ArrayList(TypeId) = .empty;
-        try work.append(s.arena, try zonk(s, t));
+        defer work.deinit(self.a);
+        try work.append(self.a, try zonk(s, t));
         while (work.pop()) |cur| {
             switch (s.types.get(cur)) {
                 .variable => |v| {
                     if (seen.contains(v.id)) continue;
-                    try seen.put(s.arena, v.id, {});
+                    try seen.put(self.a, v.id, {});
                     const i = self.index.get(v.id) orelse continue;
                     const sv = &self.vars.items[i];
-                    for (sv.lower.items) |b| try work.append(s.arena, try zonk(s, b));
-                    for (sv.upper.items) |b| try work.append(s.arena, try zonk(s, b));
+                    for (sv.lower.items) |b| try work.append(self.a, try zonk(s, b));
+                    for (sv.upper.items) |b| try work.append(self.a, try zonk(s, b));
                 },
                 .class => |c| for (c.args) |a| {
-                    if (a.variance != .star) try work.append(s.arena, a.ty);
+                    if (a.variance != .star) try work.append(self.a, a.ty);
                 },
-                .intersection => |parts| try work.appendSlice(s.arena, parts),
+                .intersection => |parts| try work.appendSlice(self.a, parts),
                 else => {},
             }
         }
@@ -1251,7 +1342,7 @@ pub const System = struct {
             else => return,
         };
         const i = self.index.get(v.id) orelse return;
-        if ((try seen.getOrPut(s.arena, v.id)).found_existing) return;
+        if ((try seen.getOrPut(self.a, v.id)).found_existing) return;
         for (self.vars.items[i].lower.items) |lb| {
             const z = try zonk(s, lb);
             if (self.waitsOnOwn(z)) {
@@ -1260,7 +1351,7 @@ pub const System = struct {
             }
             if (s.types.get(z) == .int_lit) continue;
             const c = try self.close(z);
-            try lowers.append(s.arena, try withVarNullability(&s.types, v, c));
+            try lowers.append(self.a, try withVarNullability(&s.types, v, c));
         }
     }
 
@@ -1273,7 +1364,7 @@ pub const System = struct {
             else => return false,
         };
         const i = self.index.get(v.id) orelse return true;
-        if ((try seen.getOrPut(s.arena, v.id)).found_existing) return true;
+        if ((try seen.getOrPut(self.a, v.id)).found_existing) return true;
         for (self.vars.items[i].lower.items) |lb| {
             const z = try zonk(s, lb);
             if (self.varIndex(z) == null or !self.waitsOnOwn(z)) return false;
@@ -1319,7 +1410,9 @@ pub const System = struct {
             },
             .class => |c| {
                 if (!self.mentionsVar(t)) return t;
-                const out = try self.s.arena.alloc(types.Arg, c.args.len);
+                var buf: ArgBuf = .init(self.a);
+                const out = try buf.get(c.args.len);
+                defer buf.free(out);
                 for (c.args, out) |a, *o| {
                     o.* = a;
                     if (a.variance != .star) o.ty = try self.closeKnown(a.ty);
@@ -1418,8 +1511,9 @@ pub fn intLitDefault(s: *Sema, l: types.IntLit) Allocator.Error!TypeId {
 pub fn noteExpected(s: *Sema, actual: TypeId, expected: TypeId) Allocator.Error!void {
     if (actual == .none or expected == .none or s.builder_owners.count() == 0) return;
     var ids: std.ArrayList(u32) = .empty;
-    try collectVarIds(s, try zonk(s, actual), &ids);
-    try collectVarIds(s, try zonk(s, expected), &ids);
+    defer ids.deinit(s.scratch());
+    try collectVarIds(s.scratch(), s, try zonk(s, actual), &ids);
+    try collectVarIds(s.scratch(), s, try zonk(s, expected), &ids);
     for (ids.items) |id| {
         const owner = s.builder_owners.get(id) orelse continue;
         _ = try owner.constrain(actual, expected);
@@ -1442,13 +1536,13 @@ pub fn fixReceiver(s: *Sema, t: TypeId) Allocator.Error!TypeId {
     return zonk(s, z);
 }
 
-fn collectVarIds(s: *Sema, t: TypeId, out: *std.ArrayList(u32)) Allocator.Error!void {
+fn collectVarIds(a: Allocator, s: *Sema, t: TypeId, out: *std.ArrayList(u32)) Allocator.Error!void {
     switch (s.types.get(t)) {
-        .variable => |v| try out.append(s.arena, v.id),
-        .class => |c| for (c.args) |a| {
-            if (a.variance != .star) try collectVarIds(s, a.ty, out);
+        .variable => |v| try out.append(a, v.id),
+        .class => |c| for (c.args) |arg| {
+            if (arg.variance != .star) try collectVarIds(a, s, arg.ty, out);
         },
-        .intersection => |parts| for (parts) |p| try collectVarIds(s, p, out),
+        .intersection => |parts| for (parts) |p| try collectVarIds(a, s, p, out),
         else => {},
     }
 }
@@ -1548,7 +1642,9 @@ pub fn zonk(s: *Sema, t: TypeId) Allocator.Error!TypeId {
         .class => |c| {
             if (c.args.len == 0) return t;
             var changed = false;
-            const out = try s.arena.alloc(types.Arg, c.args.len);
+            var buf: ArgBuf = .init(s.scratch());
+            const out = try buf.get(c.args.len);
+            defer buf.free(out);
             for (c.args, out) |a, *o| {
                 o.* = a;
                 if (a.variance == .star) continue;
@@ -1560,7 +1656,9 @@ pub fn zonk(s: *Sema, t: TypeId) Allocator.Error!TypeId {
         },
         .intersection => |parts| {
             var changed = false;
-            const out = try s.arena.alloc(TypeId, parts.len);
+            var buf: TypeBuf = .init(s.scratch());
+            const out = try buf.get(parts.len);
+            defer buf.free(out);
             for (parts, out) |p, *o| {
                 o.* = try zonk(s, p);
                 if (o.* != p) changed = true;

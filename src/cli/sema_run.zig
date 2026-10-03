@@ -122,16 +122,18 @@ pub fn loadFailed(gpa: Allocator, e: anyerror, report: *const sema_cmd.LoadRepor
 }
 
 /// A run's allocations: the build's arena and its source map, on the heap,
-/// because a hosted UI keeps using both after `run` returns.
+/// because a hosted UI keeps using both after `run` returns. The arena frees
+/// its large allocations, so the tables a build grows keep only their last
+/// buffer.
 pub const RunMemory = struct {
-    arena_state: *std.heap.ArenaAllocator,
+    arena_state: *runtime.LargeArena,
     map: *span.SourceMap,
     /// The active source map this run's replaced, back in place after it.
     prev_map: ?*const span.SourceMap,
 
     pub fn init() !RunMemory {
-        const state = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
-        state.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const state = try std.heap.page_allocator.create(runtime.LargeArena);
+        state.* = runtime.LargeArena.init(std.heap.page_allocator);
         const map = try state.allocator().create(span.SourceMap);
         map.* = span.SourceMap.init(state.allocator());
         const prev = span.active_map;
