@@ -444,10 +444,13 @@ pub const Builder = struct {
         }
         threadJumps(b.blocks.items);
         try mergeBlocks(sa, b.blocks.items);
-        if (kinds.contains(.Move)) {
-            try forwardCopies(sa, b.blocks.items, b.next_reg);
-            try b.coalesceCopies();
-            try b.aliasRuns();
+        if (kinds.contains(.Move) and b.next_reg != 0) {
+            // Each of the three keeps the counts as it drops copies: one
+            // count serves them all.
+            const counts = try RegCounts.of(sa, b.blocks.items, b.next_reg);
+            try forwardCountedCopies(sa, b.blocks.items, b.next_reg, counts);
+            try b.coalesceCopies(counts);
+            try b.aliasRuns(counts);
         }
         const work = try sa.alloc(ir.Block, b.blocks.items.len);
         for (b.blocks.items, work, 0..) |*buf, *out, i| {
@@ -697,8 +700,8 @@ pub const Builder = struct {
     /// copy's block and nothing between them touches the destination: that
     /// instruction writes the destination itself. An argument run and a
     /// `val` copy a fresh temporary this way.
-    fn coalesceCopies(b: *Builder) Error!void {
-        try coalesceBlockCopies(b.sa, b.blocks.items, b.next_reg);
+    fn coalesceCopies(b: *Builder, counts: RegCounts) Error!void {
+        try coalesceCountedCopies(b.sa, b.blocks.items, b.next_reg, counts);
     }
 
     /// Gives a call the registers its argument run copies as its run, when
@@ -706,8 +709,8 @@ pub const Builder = struct {
     /// the call: `f(x)` and `x.g()` then pass `x`'s own register. The callee
     /// reads its parameters from the caller's registers, which the caller
     /// does not write while the call runs.
-    fn aliasRuns(b: *Builder) Error!void {
-        try aliasBlockRuns(b.sa, b.blocks.items, b.next_reg);
+    fn aliasRuns(b: *Builder, counts: RegCounts) Error!void {
+        try aliasCountedRuns(b.sa, b.blocks.items, b.next_reg, counts);
     }
 
     pub const call = records.call;
@@ -947,31 +950,56 @@ fn mergeBlocks(a: Allocator, blocks: []BlockBuf) Error!void {
     }
 }
 
+/// How many times each register of a body is read and written; a catch's
+/// exception register counts as written, by the unwinder.
+const RegCounts = struct {
+    reads: []u32,
+    defs: []u32,
+
+    fn of(a: Allocator, blocks: []BlockBuf, n: u32) Error!RegCounts {
+        const reads = try a.alloc(u32, n);
+        errdefer a.free(reads);
+        const defs = try a.alloc(u32, n);
+        @memset(reads, 0);
+        @memset(defs, 0);
+        const Count = struct {
+            reads: []u32,
+            defs: []u32,
+            fn cb(c: @This(), r: Reg, is_def: bool) void {
+                if (r.int() >= c.reads.len) return;
+                if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
+            }
+        };
+        const counts: Count = .{ .reads = reads, .defs = defs };
+        for (blocks) |*blk| {
+            for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
+            if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
+            for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
+        }
+        return .{ .reads = reads, .defs = defs };
+    }
+
+    fn free(self: RegCounts, a: Allocator) void {
+        a.free(self.defs);
+        a.free(self.reads);
+    }
+};
+
 /// Forwards a copy into the one instruction that reads it: `x = y` then a
 /// read of `x` later in the block reads `y`, when `x` is written only by
 /// the copy, read only there, and `y` is not written in between.
 fn forwardCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
     if (n == 0) return;
-    const reads = try a.alloc(u32, n);
-    defer a.free(reads);
-    const defs = try a.alloc(u32, n);
-    defer a.free(defs);
-    @memset(reads, 0);
-    @memset(defs, 0);
-    const Count = struct {
-        reads: []u32,
-        defs: []u32,
-        fn cb(c: @This(), r: Reg, is_def: bool) void {
-            if (r.int() >= c.reads.len) return;
-            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
-        }
-    };
-    const counts: Count = .{ .reads = reads, .defs = defs };
-    for (blocks) |*blk| {
-        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
-        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
-        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
-    }
+    const counts = try RegCounts.of(a, blocks, n);
+    defer counts.free(a);
+    try forwardCountedCopies(a, blocks, n, counts);
+}
+
+/// `forwardCopies` with the body's `counts`, which it keeps as it drops
+/// copies.
+fn forwardCountedCopies(a: Allocator, blocks: []BlockBuf, n: u32, counts: RegCounts) Error!void {
+    const reads = counts.reads;
+    const defs = counts.defs;
     var longest: usize = 0;
     for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
     // Copies forwarded, dropped once the block is walked: the walk reads
@@ -1182,27 +1210,16 @@ fn decellBlocks(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
 
 fn coalesceBlockCopies(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
     if (n == 0) return;
-    const reads = try a.alloc(u32, n);
-    defer a.free(reads);
-    const defs = try a.alloc(u32, n);
-    defer a.free(defs);
-    @memset(reads, 0);
-    @memset(defs, 0);
-    const Count = struct {
-        reads: []u32,
-        defs: []u32,
-        fn cb(c: @This(), r: Reg, is_def: bool) void {
-            if (r.int() >= c.reads.len) return;
-            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
-        }
-    };
-    const counts: Count = .{ .reads = reads, .defs = defs };
-    for (blocks) |*blk| {
-        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
-        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
-        // A caught exception is written into its register by the unwinder.
-        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
-    }
+    const counts = try RegCounts.of(a, blocks, n);
+    defer counts.free(a);
+    try coalesceCountedCopies(a, blocks, n, counts);
+}
+
+/// `coalesceBlockCopies` with the body's `counts`, which it keeps as it
+/// drops copies.
+fn coalesceCountedCopies(a: Allocator, blocks: []BlockBuf, n: u32, counts: RegCounts) Error!void {
+    const reads = counts.reads;
+    const defs = counts.defs;
     var longest: usize = 0;
     for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
     // Copies coalesced, dropped once the block is walked; the walk back to
@@ -1249,28 +1266,18 @@ fn dropMarked(blk: *BlockBuf, dropped: []const bool) void {
 
 fn aliasBlockRuns(a: Allocator, blocks: []BlockBuf, n: u32) Error!void {
     if (n == 0) return;
-    const reads = try a.alloc(u32, n);
-    defer a.free(reads);
-    const defs = try a.alloc(u32, n);
-    defer a.free(defs);
-    @memset(reads, 0);
-    @memset(defs, 0);
-    const Count = struct {
-        reads: []u32,
-        defs: []u32,
-        fn cb(c: @This(), r: Reg, is_def: bool) void {
-            if (r.int() >= c.reads.len) return;
-            if (is_def) c.defs[r.int()] += 1 else c.reads[r.int()] += 1;
-        }
-    };
-    const counts: Count = .{ .reads = reads, .defs = defs };
+    const counts = try RegCounts.of(a, blocks, n);
+    defer counts.free(a);
+    try aliasCountedRuns(a, blocks, n, counts);
+}
+
+/// `aliasBlockRuns` with the body's `counts`, which it keeps as it drops
+/// copies.
+fn aliasCountedRuns(a: Allocator, blocks: []BlockBuf, n: u32, counts: RegCounts) Error!void {
+    const reads = counts.reads;
+    const defs = counts.defs;
     var longest: usize = 0;
-    for (blocks) |*blk| {
-        for (blk.insts.items) |*inst| ir.visitInstRegs(inst, counts, Count.cb);
-        if (blk.terminator) |*t| ir.visitTerminatorRegs(t, counts, Count.cb);
-        for (blk.handlers.catches) |c| Count.cb(counts, c.exception_reg, true);
-        longest = @max(longest, blk.insts.items.len);
-    }
+    for (blocks) |*blk| longest = @max(longest, blk.insts.items.len);
     // By register, the last instruction of the block being walked that
     // writes it, up to the one the walk is at: `at` holds the index, and
     // `in` the block's number plus one, so no clearing between blocks.
@@ -1391,6 +1398,44 @@ fn testBlock(a: Allocator, insts: []const Inst, term: Terminator) Error!BlockBuf
     var blk: BlockBuf = .{ .terminator = term };
     try blk.insts.appendSlice(a, insts);
     return blk;
+}
+
+test "the copy passes with one count between them leave what each counting for itself leaves" {
+    const a = std.testing.allocator;
+    const r = Reg.from;
+    const body = [_]Inst{
+        .{ .LoadParam = .{ .dst = r(0), .idx = 0 } },
+        .{ .Const = .{ .dst = r(1), .value = ir.ConstId.from(0) } },
+        .{ .BinOp = .{ .dst = r(2), .op = .Add, .lhs = r(1), .rhs = r(0) } },
+        .{ .Move = .{ .dst = r(3), .src = r(2) } },
+        .{ .Move = .{ .dst = r(4), .src = r(3) } },
+        .{ .Move = .{ .dst = r(5), .src = r(4) } },
+        .{ .Move = .{ .dst = r(6), .src = r(0) } },
+        .{ .CallStatic = .{ .dst = r(7), .func = FuncId.from(0), .args = r(5), .n_args = 2 } },
+        .{ .Move = .{ .dst = r(8), .src = r(7) } },
+        .{ .BinOp = .{ .dst = r(9), .op = .Add, .lhs = r(8), .rhs = r(8) } },
+    };
+    var each = [_]BlockBuf{try testBlock(a, &body, .{ .Return = r(9) })};
+    defer each[0].insts.deinit(a);
+    try forwardCopies(a, &each, 10);
+    try coalesceBlockCopies(a, &each, 10);
+    try aliasBlockRuns(a, &each, 10);
+    var shared = [_]BlockBuf{try testBlock(a, &body, .{ .Return = r(9) })};
+    defer shared[0].insts.deinit(a);
+    const counts = try RegCounts.of(a, &shared, 10);
+    defer counts.free(a);
+    try forwardCountedCopies(a, &shared, 10, counts);
+    try coalesceCountedCopies(a, &shared, 10, counts);
+    try aliasCountedRuns(a, &shared, 10, counts);
+    // Something was dropped, and the same.
+    try std.testing.expect(each[0].insts.items.len < body.len);
+    try std.testing.expectEqual(each[0].insts.items.len, shared[0].insts.items.len);
+    for (each[0].insts.items, shared[0].insts.items) |x, y| try std.testing.expect(std.meta.eql(x, y));
+    // And the counts kept are the body's as it now stands.
+    const fresh = try RegCounts.of(a, &shared, 10);
+    defer fresh.free(a);
+    try std.testing.expectEqualSlices(u32, fresh.reads, counts.reads);
+    try std.testing.expectEqualSlices(u32, fresh.defs, counts.defs);
 }
 
 test "a copy of a temporary goes into the instruction that wrote it" {

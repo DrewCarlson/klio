@@ -149,6 +149,22 @@ cache file and mapped back.
 | bake compose_material3 | 946 MB to 817 MB |
 | cold compose_material3 | 664 MB to 635 MB |
 
+Then smaller costs on every path:
+
+- A type's hash in the intern map mixes its words; it streamed each field
+  through Wyhash a few bytes at a time. Loading an image rehashes every
+  type it holds.
+- The image decoder reads a one-byte varint without its loop, and checks
+  an enum numbered from zero by range rather than walking its values.
+- The three copy passes of `Builder.finish` share one count of each
+  register's reads and writes, which each keeps as it drops copies; each
+  counted the body again.
+
+| | before | after |
+|---|---:|---:|
+| `load base image`, compose_material3 | 106 ms | 99 ms |
+| `lower`, compose_material3 without an image | 590 ms | 557 ms |
+
 ## Next
 
 - Register compaction is a third of lowering now: liveness, interference

@@ -120,31 +120,35 @@ const Probe = struct {
     }
 };
 
+/// A type's hash in the intern map: each of its words mixed in, then the
+/// whole spread over every bit, since the map takes a slot from the low
+/// bits and a tag from the high ones. The map is only probed, never walked,
+/// so nothing depends on the order the hash gives.
 fn hashType(t: Type) u64 {
-    var h = std.hash.Wyhash.init(0);
-    h.update(&.{@intFromEnum(std.meta.activeTag(t))});
+    var h: u64 = @intFromEnum(std.meta.activeTag(t));
     switch (t) {
         .none, .err => {},
         .class => |c| {
-            h.update(std.mem.asBytes(&c.sym));
-            h.update(&.{ @intFromBool(c.nullable), @bitCast(c.attrs) });
-            for (c.args) |arg| {
-                h.update(&.{@intFromEnum(arg.variance)});
-                h.update(std.mem.asBytes(&arg.ty));
-            }
+            h = mixWord(h, @as(u64, c.sym.int()) << 16 | @as(u64, @intFromBool(c.nullable)) << 8 | @as(u8, @bitCast(c.attrs)));
+            for (c.args) |arg| h = mixWord(h, @as(u64, arg.ty.int()) << 2 | @intFromEnum(arg.variance));
         },
-        .param => |p| {
-            h.update(std.mem.asBytes(&p.sym));
-            h.update(&.{ @intFromBool(p.nullable), @intFromBool(p.dnn) });
+        .param => |p| h = mixWord(h, @as(u64, p.sym.int()) << 2 | @as(u64, @intFromBool(p.nullable)) << 1 | @intFromBool(p.dnn)),
+        .intersection => |parts| for (parts) |x| {
+            h = mixWord(h, x.int());
         },
-        .intersection => |parts| h.update(std.mem.sliceAsBytes(parts)),
-        .int_lit => |l| h.update(&.{@bitCast(l)}),
-        .variable => |v| {
-            h.update(std.mem.asBytes(&v.id));
-            h.update(&.{ @intFromBool(v.nullable), @intFromBool(v.dnn) });
-        },
+        .int_lit => |l| h = mixWord(h, @as(u8, @bitCast(l))),
+        .variable => |v| h = mixWord(h, @as(u64, v.id) << 2 | @as(u64, @intFromBool(v.nullable)) << 1 | @intFromBool(v.dnn)),
     }
-    return h.final();
+    h ^= h >> 33;
+    h *%= 0xff51afd7ed558ccd;
+    h ^= h >> 33;
+    h *%= 0xc4ceb9fe1a85ec53;
+    h ^= h >> 33;
+    return h;
+}
+
+inline fn mixWord(h: u64, w: u64) u64 {
+    return std.math.rotl(u64, (h ^ w) *% 0x9e3779b97f4a7c15, 31);
 }
 
 fn typeEql(a: Type, b: Type) bool {
@@ -373,6 +377,36 @@ pub const TypeStore = struct {
         };
     }
 };
+
+test "the intern hash tells apart types that differ in any part" {
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(std.testing.allocator);
+    var n: usize = 0;
+    const variances = [_]Variance{ .inv, .out, .in, .star };
+    var sym: u32 = 1;
+    while (sym < 200) : (sym += 1) {
+        for ([_]bool{ false, true }) |nullable| {
+            try seen.put(std.testing.allocator, hashType(.{ .param = .{ .sym = Sym.from(sym), .nullable = nullable } }), {});
+            try seen.put(std.testing.allocator, hashType(.{ .variable = .{ .id = sym, .nullable = nullable } }), {});
+            n += 2;
+            for (variances) |v| {
+                var arg: u32 = 1;
+                while (arg < 20) : (arg += 1) {
+                    const args = [_]Arg{ .{ .variance = v, .ty = TypeId.from(arg) }, .{ .variance = .inv, .ty = TypeId.from(sym) } };
+                    try seen.put(std.testing.allocator, hashType(.{ .class = .{ .sym = Sym.from(sym), .args = &args, .nullable = nullable } }), {});
+                    try seen.put(std.testing.allocator, hashType(.{ .class = .{ .sym = Sym.from(sym), .args = args[0..1], .nullable = nullable } }), {});
+                    n += 2;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(n, seen.count());
+    // Equal structures hash alike wherever their parts live.
+    const a = [_]Arg{.{ .variance = .out, .ty = TypeId.from(7) }};
+    var b: [1]Arg = undefined;
+    b[0] = a[0];
+    try std.testing.expectEqual(hashType(.{ .class = .{ .sym = Sym.from(3), .args = &a, .nullable = true } }), hashType(.{ .class = .{ .sym = Sym.from(3), .args = &b, .nullable = true } }));
+}
 
 test "types intern structurally and substitute" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

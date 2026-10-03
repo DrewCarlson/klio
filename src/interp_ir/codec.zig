@@ -388,10 +388,19 @@ const Decoder = struct {
     }
 
     fn byte(self: *Decoder) DecodeError!u8 {
-        return (try self.take(1))[0];
+        if (self.pos >= self.buf.len) return error.Malformed;
+        const b = self.buf[self.pos];
+        self.pos += 1;
+        return b;
     }
 
     fn varint(self: *Decoder) DecodeError!u64 {
+        // Most values fit in one byte.
+        if (self.pos < self.buf.len and self.buf[self.pos] < 0x80) {
+            const b = self.buf[self.pos];
+            self.pos += 1;
+            return b;
+        }
         var result: u64 = 0;
         var shift: u6 = 0;
         while (true) {
@@ -424,9 +433,22 @@ fn enumFromIntAny(comptime T: type, raw: anytype) DecodeError!T {
     const en = @typeInfo(T).@"enum";
     const tag = std.math.cast(en.tag_type, raw) orelse return error.Malformed;
     if (en.is_exhaustive) {
+        // Values 0 to n - 1, as most enums number them, check by range:
+        // `fromInt` walks every value.
+        if (comptime numberedFromZero(T)) {
+            if (tag < 0 or tag >= en.fields.len) return error.Malformed;
+            return @enumFromInt(tag);
+        }
         return std.enums.fromInt(T, tag) orelse error.Malformed;
     }
     return @enumFromInt(tag);
+}
+
+fn numberedFromZero(comptime T: type) bool {
+    for (@typeInfo(T).@"enum".fields, 0..) |f, i| {
+        if (f.value != i) return false;
+    }
+    return true;
 }
 
 var decode_stats: std.StringHashMapUnmanaged(struct { bytes: u64, count: u64 }) = .empty;
