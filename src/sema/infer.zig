@@ -613,6 +613,23 @@ pub const System = struct {
                 if (!try self.constrain(h.ty, w.ty)) return false;
                 continue;
             }
+            // A projection the other way round captures a type known by one
+            // bound. `Context<out Any>` where `Context<in W>` is wanted holds
+            // some type below `Any`, of which only `Nothing` is surely below,
+            // so `W` can be no more than `Nothing`; `in X` where `out W` is
+            // wanted holds some type above `X`, up to the parameter's bound.
+            if (w.variance == .in and h.variance == .out) {
+                if (!try self.constrain(w.ty, s.t.nothing)) return false;
+                continue;
+            }
+            if (w.variance == .out and h.variance == .in) {
+                const bound: TypeId = if (i < tps.len) blk: {
+                    const bs = try headers.typeParamBounds(s, tps[i]);
+                    break :blk if (bs.len != 0) bs[0] else s.t.any_q;
+                } else s.t.any_q;
+                if (!try self.constrain(bound, w.ty)) return false;
+                continue;
+            }
             const v: types.Variance = if (w.variance != .inv) w.variance else if (h.variance != .inv) h.variance else decl_var;
             switch (v) {
                 .out => if (!try self.constrain(h.ty, w.ty)) return false,

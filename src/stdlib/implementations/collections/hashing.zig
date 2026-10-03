@@ -40,11 +40,17 @@ pub fn elementHash(host: ?IntrinsicHost, out: Output, v: *const Value) Error!Has
     };
 }
 
-const Code = union(enum) {
+pub const Code = union(enum) {
     code: i32,
     none,
     thrown: EvalResult,
 };
+
+/// `v.hashCode()` as Kotlin answers it: none for a value with no host to ask,
+/// the exception a `hashCode` override threw.
+pub fn kotlinHashCode(host: ?IntrinsicHost, out: Output, v: *const Value) Error!Code {
+    return hashCode(host, out, v);
+}
 
 fn hashCode(host: ?IntrinsicHost, out: Output, v: *const Value) Error!Code {
     if (v.javaHashCode()) |c| return .{ .code = c };
@@ -55,6 +61,15 @@ fn hashCode(host: ?IntrinsicHost, out: Output, v: *const Value) Error!Code {
             const ho = host orelse return .none;
             // A class keeping `Any`'s members is equal only to itself: any hash of its own.
             if (ho.identityKey(v)) |id| return .{ .code = @bitCast(id) };
+            const r = (try ho.callWellKnown(v, .hash_code, &.{}, out)) orelse return .none;
+            return switch (r) {
+                .ok => |x| if (x == .Int) .{ .code = x.Int } else .none,
+                .err => .{ .thrown = r },
+            };
+        },
+        // A callable reference hashes as it compares (`callWellKnown`).
+        .IrClosure => {
+            const ho = host orelse return .none;
             const r = (try ho.callWellKnown(v, .hash_code, &.{}, out)) orelse return .none;
             return switch (r) {
                 .ok => |x| if (x == .Int) .{ .code = x.Int } else .none,

@@ -254,16 +254,16 @@ const KeyHash = union(enum) {
     thrown: EvalResult,
 };
 
-/// A key's hash for a map's index: `keyHash` for a simple key, an
-/// instance's own `hashCode()`; none for a key neither hashes.
+/// A key's hash for a map's index: `keyHash` for a simple key, the
+/// `hashCode()` Kotlin answers for a host-keyed one (an instance's own, a
+/// callable reference's); none for a key neither hashes.
 fn hostKeyHash(ctx: *CallCtx, key: *const Value) Error!KeyHash {
     if (MapStore.keyHash(key)) |h| return .{ .hash = h };
-    if (key.* != .Instance) return .none;
-    if (ctx.host.identityKey(key)) |id| return .{ .hash = @as(u64, id) *% 0x9E3779B97F4A7C15 };
-    const r = (try ctx.host.callWellKnown(key, .hash_code, &.{}, ctx.out)) orelse return .none;
-    return switch (r) {
-        .ok => |v| if (v == .Int) .{ .hash = @as(u64, @as(u32, @bitCast(v.Int))) *% 0x9E3779B97F4A7C15 } else .none,
-        .err => .{ .thrown = r },
+    if (!key.hostKeyed()) return .none;
+    return switch (try hashing.kotlinHashCode(ctx.host, ctx.out, key)) {
+        .code => |c| .{ .hash = @as(u64, @as(u32, @bitCast(c))) *% 0x9E3779B97F4A7C15 },
+        .none => .none,
+        .thrown => |e| .{ .thrown = e },
     };
 }
 
@@ -273,9 +273,10 @@ const Eq = union(enum) {
     thrown: EvalResult,
 };
 
-/// Whether stored key `k` equals instance `key`, by `k.equals(key)` as the
+/// Whether stored key `k` equals host-keyed `key`, by `k.equals(key)` as the
 /// map's lookup asks it.
 fn instanceKeyEq(ctx: *CallCtx, k: *const Value, key: *const Value) Error!Eq {
+    if (k.* != .Instance) return if (try common_mod.eqBoxedH(ctx.host, ctx.out, k, key)) .yes else .no;
     if (ctx.host.identityKey(k) != null) return if (key.* == .Instance and runtime.ObjRef(runtime.InstanceData).ptrEq(k.Instance, key.Instance)) .yes else .no;
     if (try ctx.host.callWellKnown(k, .equals, &.{key.*}, ctx.out)) |m| switch (m) {
         .ok => |v| if (v == .Bool) return if (v.Bool) .yes else .no,
@@ -284,10 +285,11 @@ fn instanceKeyEq(ctx: *CallCtx, k: *const Value, key: *const Value) Error!Eq {
     return if (eqBoxed(k, key)) .yes else .no;
 }
 
-/// The entry of `key`: an instance key through its own `hashCode()` and
-/// `equals`, as a `HashMap` finds it, any other by value.
+/// The entry of `key`: a host-keyed key (an instance, a callable reference,
+/// a pair holding one) through its `hashCode()` and `equals`, as a `HashMap`
+/// finds it, any other by value.
 pub fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!Lookup {
-    if (key != .Instance) {
+    if (!key.hostKeyed()) {
         const g = entries.borrowMut();
         defer g.deinit();
         if (try g.get().find(ctx.allocator, &key)) |i| return .{ .at = i };

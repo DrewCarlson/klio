@@ -8831,3 +8831,22 @@ test "a declaration a marker requires opt-in for is used where the use opts in" 
     }
     try std.testing.expectEqual(@as(usize, 1), warned);
 }
+
+test "an out projection passed where an in projection is wanted fixes the variable to Nothing" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Context<T>
+        \\fun <T> Any.decodeIn(typeFrom: Context<in T>): T = decodeIn(typeFrom)
+        \\fun <T> Any.decodeOut(typeFrom: Context<out T>): T = decodeOut(typeFrom)
+        \\fun use(outCtx: Context<out Any>, inCtx: Context<in String>) {
+        \\    val i: Int = "s".decodeIn(outCtx)
+        \\    val a: Any? = "s".decodeOut(inCtx)
+        \\    val s: String = "s".decodeOut(inCtx)
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectMessages(&fx, &.{
+        "Initializer type mismatch: expected 'String', actual 'Any?'.",
+    });
+}

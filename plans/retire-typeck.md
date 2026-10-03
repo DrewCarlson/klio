@@ -360,6 +360,12 @@ What sema still misses of kotlinc's diagnostics over the inputs
 - errors in typeck_negative: `NO_VALUE_FOR_PARAMETER` beside `DELEGATION_NOT_TO_INTERFACE` for
   `class B : A by a` naming a class without its constructor call (B4; the
   file is refused for the other two).
+- errors in programs, not reported yet: `NOT_YET_SUPPORTED_LOCAL_INLINE_FUNCTION`
+  (kotlinc's JVM backend refuses `inline` on a local function, "local inline
+  functions are not yet supported"). Packs keep them: kotlinx-datetime's
+  commonKotlin `readTzFile` declares one, which Native and JS compile, so
+  the lowering instantiates a local inline function as a top-level one and
+  the error belongs to checked program files only.
 - errors in examples, intended: klio's JVM-only API (`native_identity_hash`,
   `weak_references`, `thread_handle_values`) and kotlinx.coroutines
   internals (`channel_undelivered_element`, `INVISIBLE_REFERENCE`).

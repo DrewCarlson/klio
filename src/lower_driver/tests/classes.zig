@@ -385,6 +385,37 @@ test "an extension property's delegate receives the receiver as thisRef" {
     , "8\n10\n");
 }
 
+test "a generic delegate receives and returns a value class boxed, and so does thisRef" {
+    try expectRun(
+        \\value class Role(val value: Int) {
+        \\    override fun toString(): String = "Role#" + value
+        \\}
+        \\class Cell<T>(var v: T) {
+        \\    operator fun getValue(thisRef: Any?, p: kotlin.reflect.KProperty<*>): T = v
+        \\    operator fun setValue(thisRef: Any?, p: kotlin.reflect.KProperty<*>, value: T) {
+        \\        v = value
+        \\        println(p.name + " " + (thisRef is Role) + " " + (value is Role) + " " + value)
+        \\    }
+        \\}
+        \\class Owner { var role: Role by Cell(Role(1)) }
+        \\var top: Role by Cell(Role(2))
+        \\var Role.label: String by Cell("none")
+        \\fun twice(r: Role): Int = r.value * 2
+        \\fun main() {
+        \\    val o = Owner()
+        \\    o.role = Role(6)
+        \\    println(twice(o.role))
+        \\    top = Role(7)
+        \\    println(twice(top))
+        \\    var local: Role by Cell(Role(3))
+        \\    local = Role(8)
+        \\    println(twice(local))
+        \\    Role(9).label = "nine"
+        \\    println(Role(9).label)
+        \\}
+    , "role false true Role#6\n12\ntop false true Role#7\n14\nlocal false true Role#8\n16\nlabel true false nine\nnine\n");
+}
+
 test "enumValues and enumValueOf, called or referenced, are the enum class's own members" {
     try expectRun(
         \\enum class Color { RED, GREEN }

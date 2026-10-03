@@ -405,7 +405,7 @@ pub fn lowerLocalProperty(b: *Builder, prop: *const ast.Property) Error!void {
     if (prop.delegate) |d| {
         var delegate = try lowerExpr(b, d);
         const g = try b.delegate(prop.id);
-        if (g.provide) |*pr| delegate = try env.delegateCall(b, pr, delegate, prop, null);
+        if (g.provide) |*pr| delegate = try env.delegateCall(b, pr, delegate, prop, null, .none);
         return env.bindLocal(b, sym, delegate);
     }
     const init = prop.init orelse return env.declareLocal(b, sym);

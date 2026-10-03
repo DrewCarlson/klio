@@ -4122,6 +4122,22 @@ pub const Value = union(enum) {
         return structuralEqBoxed(&ap.key, &bp.key) and structuralEqBoxed(&ap.value, &bp.value);
     }
 
+    /// Whether a key's `hashCode` and `equals` are the host's to answer, not
+    /// its value's: an instance, a callable reference, or a pair, triple or
+    /// entry holding one.
+    pub fn hostKeyed(v: *const Value) bool {
+        return switch (v.*) {
+            .Instance, .IrClosure => true,
+            .Pair => |p| hostKeyed(p.first.asPtrConst()) or hostKeyed(p.second.asPtrConst()),
+            .Triple => |t| hostKeyed(t.first.asPtrConst()) or hostKeyed(t.second.asPtrConst()) or hostKeyed(t.third.asPtrConst()),
+            .MapEntry => |e| blk: {
+                const value = e.getValue();
+                break :blk hostKeyed(&e.key) or hostKeyed(&value);
+            },
+            else => false,
+        };
+    }
+
     /// A boxed type matches only its own type, elements included.
     /// `hashCode()` of a number, a `Char`, a `Boolean`, a string or null, as the JVM
     /// answers it; null for any other value, whose hash depends on what it holds or on a

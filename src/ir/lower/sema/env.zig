@@ -658,12 +658,14 @@ pub fn localPropertyRef(b: *Builder, prop: *const ast.Property) Error!Reg {
 
 /// Calls one of a local delegate's operators (`provideDelegate`,
 /// `getValue`, `setValue`) on `delegate`: `thisRef` is `null`, then the
-/// property, then the new value for `setValue`.
-pub fn delegateCall(b: *Builder, rec: *const records.CallRec, delegate: Reg, prop: *const ast.Property, value: ?Reg) Error!Reg {
+/// property, then the new value for `setValue`. `ty` is the local's type:
+/// the value goes in as it has it, and `getValue`'s result comes out so.
+pub fn delegateCall(b: *Builder, rec: *const records.CallRec, delegate: Reg, prop: *const ast.Property, value: ?Reg, ty: sema.TypeId) Error!Reg {
     const regs: [3]?Reg = .{ try b.nullValue(), try localPropertyRef(b, prop), value };
     const exprs: [3]?*const ast.Expr = .{ null, null, null };
+    const types: [3]sema.TypeId = .{ .none, .none, ty };
     const n: usize = if (value != null) 3 else 2;
-    return call.emitCall(b, rec, .{ .exprs = exprs[0..n], .regs = regs[0..n], .receiver = delegate });
+    return call.emitCall(b, rec, .{ .exprs = exprs[0..n], .regs = regs[0..n], .receiver = delegate, .types = types[0..n], .result_ty = ty });
 }
 
 fn delegateOf(b: *Builder, s: Sym) Error!Reg {
@@ -675,11 +677,11 @@ fn delegateOf(b: *Builder, s: Sym) Error!Reg {
 
 fn readDelegated(b: *Builder, s: Sym, prop: *const ast.Property) Error!Reg {
     const g = try b.delegate(prop.id);
-    return delegateCall(b, &g.get, try delegateOf(b, s), prop, null);
+    return delegateCall(b, &g.get, try delegateOf(b, s), prop, null, b.p.s.syms.localInfo(s).ty);
 }
 
 fn writeDelegated(b: *Builder, s: Sym, prop: *const ast.Property, value: Reg) Error!void {
     const g = try b.delegate(prop.id);
     const set = g.set orelse return b.fail(prop.span, "delegated `val {s}` is written", .{prop.name.name});
-    _ = try delegateCall(b, &set, try delegateOf(b, s), prop, value);
+    _ = try delegateCall(b, &set, try delegateOf(b, s), prop, value, b.p.s.syms.localInfo(s).ty);
 }

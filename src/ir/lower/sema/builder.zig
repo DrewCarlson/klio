@@ -368,7 +368,8 @@ pub const Builder = struct {
         const s = b.p.s;
         if (b.func.int() >= br.origin.len) return false;
         return switch (br.origin[b.func.int()]) {
-            .decl, .defaults => |sym| s.syms.flags(sym).inline_,
+            // A local function's origin is `.lambda`; only a declared one is inline.
+            .decl, .defaults, .lambda => |sym| s.syms.flags(sym).inline_,
             .getter => |sym| name_mod.inlineAccessor(s, sym, false),
             .setter => |sym| name_mod.inlineAccessor(s, sym, true),
             else => false,

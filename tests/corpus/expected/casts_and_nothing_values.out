@@ -1,0 +1,10 @@
+T : Any threw NullPointerException
+T : Number threw NullPointerException
+T : U, U : Any threw NullPointerException
+unbounded T -> null
+T? -> null
+a value -> kept
+Number given a String threw ClassCastException
+something<Nothing>() threw KotlinNothingValueException
+decodeIn(Context<out Any>) threw KotlinNothingValueException
+through a safe call threw KotlinNothingValueException

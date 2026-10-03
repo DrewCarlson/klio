@@ -502,6 +502,8 @@ pub fn sbLength(recv: Value) ?Value {
 pub fn mapGet(a: std.mem.Allocator, module: *const ir.Module, recv: Value, key: *const Value) ?Value {
     if (recv != .Map) return null;
     if (key.* == .Instance) return identityGet(module, recv.Map.entries, key);
+    // A key the store compares by more than its value is the host's.
+    if (key.hostKeyed()) return null;
     if (key.* == .Int and runtime.lockfreeReads()) {
         if (runtime.lookupIntNoLock(recv.Map.entries, key.Int)) |v| return v;
     } else if (runtime.lockfreeReads()) if (runtime.MapStore.keyHash(key)) |hsh| {

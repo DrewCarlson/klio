@@ -56,17 +56,14 @@ fn castOf(b: *Builder, e: *const ast.Expr, v: Reg) Error!Reg {
         try b.emit(.{ .CastDyn = .{ .dst = dst, .src = v, .ty = ty, .nullable = rec.nullable, .safe = safe } });
         return dst;
     }
-    // `T & Any` is checked for null: the cast of null throws.
-    const dnn = switch (b.p.s.types.get(rec.ty)) {
-        .param => |p| p.dnn,
-        else => false,
-    };
+    // A cast to `T & Any`, or to a `T` whose bounds admit no null, throws
+    // for null; one to `T?` or to a `T` bounded by a nullable type passes it.
+    const nullable = rec.nullable or try admitsNull(b.p.s, rec.ty);
     if (try erasedBound(b.p.s, rec.ty)) |cls| {
-        // A bound that admits null admits it through the cast.
-        try b.emit(.{ .RCast = .{ .dst = dst, .src = v, .class = b.p.br.classOf(cls), .nullable = !dnn, .safe = safe } });
+        try b.emit(.{ .RCast = .{ .dst = dst, .src = v, .class = b.p.br.classOf(cls), .nullable = nullable, .safe = safe } });
         return dst;
     }
-    if (dnn) if (b.p.br.classOfOpt(b.p.s.builtins.any)) |any| {
+    if (!nullable) if (b.p.br.classOfOpt(b.p.s.builtins.any)) |any| {
         try b.emit(.{ .RCast = .{ .dst = dst, .src = v, .class = any, .nullable = false, .safe = safe } });
         return dst;
     };
@@ -241,6 +238,24 @@ fn reifiedParam(s: *sema.Sema, t: TypeId) ?Sym {
     return switch (s.types.get(t)) {
         .param => |p| if (s.syms.flags(p.sym).reified) p.sym else null,
         else => null,
+    };
+}
+
+/// Whether a value of type parameter type `t` may be null: `t` is marked
+/// nullable, or it is a `T` every bound of which (followed through other
+/// type parameters) admits null, as `T`'s default `Any?` does.
+fn admitsNull(s: *sema.Sema, t: TypeId) Error!bool {
+    if (s.types.isNullable(t)) return true;
+    return switch (s.types.get(t)) {
+        .param => |p| blk: {
+            if (p.dnn) break :blk false;
+            const bounds = try sema.headers.typeParamBounds(s, p.sym);
+            for (bounds) |bound| {
+                if (!try admitsNull(s, bound)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
     };
 }
 

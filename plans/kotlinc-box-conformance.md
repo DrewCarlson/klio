@@ -6,23 +6,29 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-10-03, local run)
+## State (2026-10-03)
 
-A local run of the box runner (`KLIO_ITEST_BIN=<harness>
-KLIO_ITEST_HOME=zig-out/klio-test-home <box test binary>`) measures 6268
-passed / 84 failed. The ratchet (`BASELINE = 6271`, `max_failed` 81) was
-set on CI's sema-pipeline census at d8e0cae5; the same local run at that
-commit measures 100 failed, so local and CI counts differ by about 19 and
-the ratchet compares against CI's. Between d8e0cae5 and 2b815152 six tests
-regressed, bisected and fixed: `annotations/spreadOperatorInAnnotationArguments`
-(sema took a vararg annotation parameter of its own class for a cycle) and
-five value-class ones from a2e7d190's scalar value classes
-(`fullValueClasses/construction` and `vararg`,
-`inlineClasses/interfaceDelegation/memberFunDelegatedToInlineClass{Int,Long}`,
-`inlineClasses/kt57973`): a call through an inherited defaults bridge, a
-`by` delegate slot and a vararg parameter read must hold the instance, and
-a value class delegating `by` its value is no scalar class
-(`value-classes.md`).
+The box runner (`KLIO_ITEST_BIN=<harness> KLIO_ITEST_HOME=zig-out/klio-test-home
+<box test binary>`) measures 6271 passed / 81 failed, at the ratchet
+(`BASELINE = 6271`, `max_failed` 81). Before the three fixes below it measured
+84 failed, the same set on macOS arm64, Linux arm64 and macOS x86_64 (Rosetta):
+the count does not depend on the host. The ratchet was set from a census at
+d8e0cae5 that no host reproduces; the same runner at that commit measures 100
+failed, and no test failing now passed then. The fixes: a callable reference is a map and set key by `equals`/`hashCode`
+(`delegatedProperty/delegateToSingleton`), a cast of null to a `T` whose
+bounds admit no null throws (`casts/asWithGeneric`), and a call whose generic
+result is fixed as `Nothing` throws `KotlinNothingValueException` when it
+returns, with an `out` projection given for an `in` parameter fixing the
+variable to `Nothing` (`nothingValue/nothingValueException`).
+
+Between d8e0cae5 and 2b815152 six tests regressed, bisected and fixed:
+`annotations/spreadOperatorInAnnotationArguments` (sema took a vararg
+annotation parameter of its own class for a cycle) and five value-class ones
+from a2e7d190's scalar value classes (`fullValueClasses/construction` and
+`vararg`, `inlineClasses/interfaceDelegation/memberFunDelegatedToInlineClass{Int,Long}`,
+`inlineClasses/kt57973`): a call through an inherited defaults bridge, a `by`
+delegate slot and a vararg parameter read must hold the instance, and a value
+class delegating `by` its value is no scalar class (`value-classes.md`).
 
 ## State (2026-09-09, inherited-default-order, CI green)
 

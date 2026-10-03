@@ -33,6 +33,7 @@ const tailrec = @import("tailrec.zig");
 const compose = @import("compose.zig");
 const locals = @import("locals.zig");
 const coerce = @import("coerce.zig");
+const classes = @import("classes.zig");
 
 const Allocator = std.mem.Allocator;
 const Builder = builder.Builder;
@@ -321,12 +322,26 @@ pub fn lowerCall(b: *Builder, e: *const ast.Expr) Error!Reg {
     }
     ops.tail = !safe and tailrec.isTailCall(b, e, rec.callee);
     ops.call = e;
-    const site: CallSite = .{ .e = e, .rec = &rec, .ops = ops };
+    const site: CallSite = .{ .e = e, .rec = &rec, .ops = ops, .safe = safe };
     if (safe) {
         const r = recv orelse return b.fail(c.span, "a safe call without a receiver", .{});
         return control.lowerSafe(b, r, site);
     }
     return site.lower(b, recv);
+}
+
+/// A call typed `Nothing` to a function that may return, its result a `T`
+/// the call fixed as `Nothing`, throws `KotlinNothingValueException` when it
+/// does, as kotlinc's JVM backend has it.
+fn nothingValue(b: *Builder, rec: *const CallRec, ty: TypeId) Error!void {
+    const s = b.p.s;
+    if (ty == .none or b.terminated() or ty != s.t.nothing) return;
+    if (rec.callee == .none or s.syms.kind(rec.callee) != .function) return;
+    if (try sema.headers.returnType(s, rec.callee) == s.t.nothing) return;
+    // A base without the class (a test's miniature one) lets the value through.
+    if (s.classByFqn("kotlin.KotlinNothingValueException") == .none) return;
+    const exc = try classes.newThrowable(b, "kotlin.KotlinNothingValueException", try b.nullValue());
+    b.terminate(.{ .Throw = exc });
 }
 
 /// A written call once its receiver is evaluated; `lower` is what `?.`
@@ -335,6 +350,8 @@ const CallSite = struct {
     e: *const ast.Expr,
     rec: *const CallRec,
     ops: Operands,
+    /// `a?.f()`: the call's own type is the expression's without its `?`.
+    safe: bool = false,
 
     pub fn lower(self: CallSite, b: *Builder, recv: ?Reg) Error!Reg {
         var ops = self.ops;
@@ -344,7 +361,10 @@ const CallSite = struct {
         } else {
             ops.receiver = recv;
         }
-        return emitCall(b, self.rec, ops);
+        const result = try emitCall(b, self.rec, ops);
+        const own_ty = if (self.safe and ops.result_ty != .none) try b.p.s.types.makeNotNull(ops.result_ty) else ops.result_ty;
+        try nothingValue(b, self.rec, own_ty);
+        return result;
     }
 };
 

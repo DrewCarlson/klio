@@ -350,6 +350,11 @@ pub fn eqBoxed(x: *const Value, y: *const Value) bool {
 /// either side the VM dispatches `x.equals(y)`, as Kotlin's membership and dedup
 /// do; otherwise structural equality.
 pub fn eqBoxedH(host: IntrinsicHost, out: Output, x: *const Value, y: *const Value) Error!bool {
+    if (x.* == .IrClosure and y.* == .IrClosure) {
+        if (try host.callWellKnown(x, .equals, &.{y.*}, out)) |m| {
+            if (m == .ok and m.ok == .Bool) return m.ok.Bool;
+        }
+    }
     if (x.* == .Instance or y.* == .Instance) {
         if (host.identityKey(x) != null) return y.* == .Instance and runtime.ObjRef(runtime.InstanceData).ptrEq(x.Instance, y.Instance);
         if (try host.callWellKnown(x, .equals, &.{y.*}, out)) |m| {

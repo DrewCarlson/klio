@@ -447,7 +447,7 @@ fn initProperty(b: *Builder, cls: Sym, pd: *const ast.Property, this: Reg) Error
         try b.emit(.{ .Trace = .{ .span = d.span() } });
         var v = try body.lowerExpr(b, d);
         const g = try b.delegate(pd.id);
-        if (g.provide) |*pr| v = try delegateOp(b, pr, v, prop, this, null, null);
+        if (g.provide) |*pr| v = try delegateOp(b, pr, v, prop, this, null, null, .none);
         const slot = br.delegateFieldOf(prop) orelse return b.fail(pd.span, "delegated `{s}` has no delegate slot", .{pd.name.name});
         try b.emit(.{ .SetFieldSlot = .{ .obj = this, .slot = slot, .value = v } });
         return;
@@ -475,13 +475,20 @@ fn propertyRef(b: *Builder, prop: Sym, this: ?Reg) Error!Reg {
 
 /// One of a delegated property's operators on `delegate`: `thisRef` (an
 /// extension property's receiver, the instance, or `null` at the top
-/// level), the property, then the new value for `setValue`.
-fn delegateOp(b: *Builder, rec: *const CallRec, delegate: Reg, prop: Sym, this: ?Reg, this_ref_in: ?Reg, value: ?Reg) Error!Reg {
+/// level), the property, then the new value for `setValue`. The receiver
+/// and the value go in as their static types have them, so a value class
+/// is boxed for the operator's generic parameter; `result_ty` is the type
+/// the result is converted to (`getValue`'s: the property's).
+fn delegateOp(b: *Builder, rec: *const CallRec, delegate: Reg, prop: Sym, this: ?Reg, this_ref_in: ?Reg, value: ?Reg, result_ty: sema.TypeId) Error!Reg {
+    const s = b.p.s;
     const this_ref = this_ref_in orelse this orelse try b.nullValue();
+    const this_ty: sema.TypeId = if (this_ref_in != null) try sema.headers.receiverType(s, prop) else .none;
+    const value_ty: sema.TypeId = if (value != null) try sema.headers.propertyType(s, prop) else .none;
     const regs: [3]?Reg = .{ this_ref, try propertyRef(b, prop, this), value };
     const exprs: [3]?*const ast.Expr = .{ null, null, null };
+    const types: [3]sema.TypeId = .{ this_ty, .none, value_ty };
     const n: usize = if (value != null) 3 else 2;
-    return call.emitCall(b, rec, .{ .exprs = exprs[0..n], .regs = regs[0..n], .receiver = delegate });
+    return call.emitCall(b, rec, .{ .exprs = exprs[0..n], .regs = regs[0..n], .receiver = delegate, .types = types[0..n], .result_ty = result_ty });
 }
 
 /// How many parameters the body being written takes.
@@ -530,7 +537,7 @@ fn fileStatics(b: *Builder, file: u32, eager: bool) Error!void {
             try b.emit(.{ .Trace = .{ .span = d.span() } });
             var v = try body.lowerExpr(b, d);
             const g = try b.delegate(pd.id);
-            if (g.provide) |*pr| v = try delegateOp(b, pr, v, p, null, null, null);
+            if (g.provide) |*pr| v = try delegateOp(b, pr, v, p, null, null, null, .none);
             try b.emit(.{ .StoreStatic = .{ .static = st, .value = v } });
             continue;
         }
@@ -686,7 +693,7 @@ pub fn lowerAccessor(b: *Builder, prop: Sym, setter: bool) Error!void {
         if (pd) |x| if (x.delegate != null) {
             const g = try b.delegate(x.id);
             const set = g.set orelse return b.fail(x.span, "delegated `{s}` has no setValue", .{x.name.name});
-            _ = try delegateOp(b, &set, try delegateOf(b, prop, this), prop, this, ext, value);
+            _ = try delegateOp(b, &set, try delegateOf(b, prop, this), prop, this, ext, value, .none);
             b.terminate(.{ .Return = try b.unit() });
             return;
         };
@@ -703,8 +710,9 @@ pub fn lowerAccessor(b: *Builder, prop: Sym, setter: bool) Error!void {
     };
     if (pd) |x| if (x.delegate != null) {
         const g = try b.delegate(x.id);
-        const v = try delegateOp(b, &g.get, try delegateOf(b, prop, this), prop, this, ext, null);
-        b.terminate(.{ .Return = v });
+        const ty = try sema.headers.propertyType(s, prop);
+        const v = try delegateOp(b, &g.get, try delegateOf(b, prop, this), prop, this, ext, null, ty);
+        b.terminate(.{ .Return = try coerce.convert(b, v, try coerce.scalarOf(b, ty), try getterHeld(b, prop)) });
         return;
     };
     const field = try loadField(b, prop, this);
@@ -1348,7 +1356,7 @@ fn enumValueOf(b: *Builder, cls: Sym) Error!void {
 }
 
 /// A new instance of the base's throwable class `fqn` with `message`.
-fn newThrowable(b: *Builder, fqn: []const u8, message: Reg) Error!Reg {
+pub fn newThrowable(b: *Builder, fqn: []const u8, message: Reg) Error!Reg {
     const s = b.p.s;
     const br = b.p.br;
     const cls = s.classByFqn(fqn);

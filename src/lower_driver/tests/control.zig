@@ -1650,3 +1650,82 @@ test "a loop closed by its condition's branch, with forward edges inside, still 
         return err;
     };
 }
+
+test "a cast to a type parameter whose bounds admit no null throws for null" {
+    try expectRun(
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <T : Any> nonNull(x: Any?) = x as T
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <T : Number> number(x: Any?) = x as T
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <U : Any, T : U> chained(x: Any?) = x as T
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <T> plain(x: Any?) = x as T
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <T : Any> nullable(x: Any?) = x as T?
+        \\fun probe(name: String, f: () -> Any?) {
+        \\    try {
+        \\        println(name + " " + f())
+        \\    } catch (e: NullPointerException) {
+        \\        println(name + " npe")
+        \\    }
+        \\}
+        \\fun main() {
+        \\    probe("nonNull") { nonNull<String>(null) }
+        \\    probe("number") { number<Int>(null) }
+        \\    probe("chained") { chained<Any, String>(null) }
+        \\    probe("plain") { plain<String>(null) }
+        \\    probe("nullable") { nullable<String>(null) }
+        \\    probe("value") { nonNull<String>("s") }
+        \\}
+    ,
+        \\nonNull npe
+        \\number npe
+        \\chained npe
+        \\plain null
+        \\nullable null
+        \\value s
+        \\
+    );
+}
+
+test "a call whose generic result is Nothing throws when it returns" {
+    try expectRun(
+        \\@Suppress("UNCHECKED_CAST")
+        \\fun <T> something(): T = Any() as T
+        \\class Context<T>
+        \\fun <T> Any.decodeIn(typeFrom: Context<in T>): T = something()
+        \\fun probe(name: String, f: () -> Unit) {
+        \\    try {
+        \\        f()
+        \\        println(name + " returned")
+        \\    } catch (e: RuntimeException) {
+        \\        println(name + " threw")
+        \\    }
+        \\}
+        \\fun main() {
+        \\    probe("explicit") { something<Nothing>() }
+        \\    val ctx: Context<out Any> = Context<Any>()
+        \\    probe("projected") { "s".decodeIn(ctx) }
+        \\    probe("safe") {
+        \\        val receiver: Any? = "s"
+        \\        receiver?.decodeIn(ctx)
+        \\    }
+        \\    probe("value") { something<String>() }
+        \\    val nothingOrNull: (Any?) -> Nothing? = { null }
+        \\    probe("Nothing? returning null") { nothingOrNull(1) }
+        \\    probe("safe call skipped") {
+        \\        val receiver: Any? = null
+        \\        receiver?.decodeIn(ctx)
+        \\    }
+        \\}
+    ,
+        \\explicit threw
+        \\projected threw
+        \\safe threw
+        \\value returned
+        \\Nothing? returning null returned
+        \\safe call skipped returned
+        \\
+    );
+}

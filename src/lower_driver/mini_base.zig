@@ -314,6 +314,11 @@ pub const throwables =
     \\    public constructor(message: String?) : super(message)
     \\}
     \\
+    \\public class KotlinNothingValueException : RuntimeException {
+    \\    public constructor() : super()
+    \\    public constructor(message: String?) : super(message)
+    \\}
+    \\
     \\public open class ClassCastException : RuntimeException {
     \\    public constructor() : super()
     \\    public constructor(message: String?) : super(message)

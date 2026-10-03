@@ -400,6 +400,30 @@ test "a crossinline lambda called from a nested closure is a closure" {
     , "2\n");
 }
 
+test "a local inline function's lambda is called in place after its body reuses registers" {
+    // The body is wide enough that its registers are shared, and the values
+    // computed after the lambda's last call may take the parameter's register.
+    try expectRun(
+        \\fun outer(): Int {
+        \\    inline fun twice(n: Int, f: () -> Int): Int {
+        \\        var s = 0
+        \\        var i = 0
+        \\        while (i < n) {
+        \\            s = s * 10 + f()
+        \\            i = i + 1
+        \\        }
+        \\        val t = (s + 1) * (s - 1) + (s + 2) * (s - 2) + (s + 3) * (s - 3) + (s + 4) * (s - 4) + (s + 5) * (s - 5) + (s + 6) * (s - 6) + (s + 7) * (s - 7) + (s + 8) * (s - 8) + (s + 9) * (s - 9) + (s + 10) * (s - 10) + (s + 11) * (s - 11) + (s + 12) * (s - 12) + (s + 13) * (s - 13) + (s + 14) * (s - 14) + (s + 15) * (s - 15) + (s + 16) * (s - 16) + (s + 17) * (s - 17) + (s + 18) * (s - 18) + (s + 19) * (s - 19) + (s + 20) * (s - 20) + (s + 21) * (s - 21) + (s + 22) * (s - 22) + (s + 23) * (s - 23) + (s + 24) * (s - 24)
+        \\        return t + s
+        \\    }
+        \\    var k = 7
+        \\    return twice(2) { k = k + 1; k }
+        \\}
+        \\fun main() {
+        \\    println(outer())
+        \\}
+    , "185293\n");
+}
+
 test "a noinline parameter is a value the function can store" {
     try expectRun(
         \\inline fun keep(list: MutableList<() -> String>, noinline f: () -> String, g: () -> String): String {

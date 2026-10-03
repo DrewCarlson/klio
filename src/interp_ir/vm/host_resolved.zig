@@ -12,6 +12,7 @@ const stdlib = @import("stdlib");
 const vmhost = @import("vmhost.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_members = @import("host_members.zig");
+const builtin_members = @import("builtin_members.zig");
 
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -375,7 +376,14 @@ fn kotlinException(self: *VmHost, allocator: Allocator, exc: Value) Allocator.Er
 /// cover, or a member its class does not implement.
 pub fn callWellKnown(self: *VmHost, allocator: Allocator, recv: *const Value, member: runtime.WellKnown, args: []const Value) Allocator.Error!?EvalResult {
     switch (recv.*) {
-        .Null, .IrClosure, .PropertyRef, .Cell => return null,
+        // A callable reference equals one to the same declaration over the
+        // same receiver, and hashes as it compares.
+        .IrClosure => return switch (member) {
+            .equals => .{ .ok = .{ .Bool = args.len == 1 and args[0] == .IrClosure and try builtin_members.closureRefEquals(self, allocator, recv, &args[0]) } },
+            .hash_code => .{ .ok = Value.newInt(try builtin_members.closureRefHash(self, allocator, recv)) },
+            else => null,
+        },
+        .Null, .PropertyRef, .Cell => return null,
         else => {},
     }
     const module = self.module.asPtrConst();

@@ -296,8 +296,13 @@ fn paramRegisters(a: Allocator, f: *const ir.Func) Error![]const ?u16 {
 
 /// Whether the body reads parameter `i` only to call it: every read of a
 /// register holding it is an `RCallValue`'s callee or a copy into another
-/// such register.
+/// such register. A parameter whose register is written again holds it
+/// only for a while, and is not.
 fn onlyCalled(f: *const ir.Func, param_of: []const ?u16, i: u16) bool {
+    for (f.blocks) |blk| for (blk.insts) |inst| switch (inst) {
+        .LoadParam => |x| if (x.idx == i and (x.dst.int() >= param_of.len or param_of[x.dst.int()] != i)) return false,
+        else => {},
+    };
     const Scan = struct {
         param_of: []const ?u16,
         i: u16,
