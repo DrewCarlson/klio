@@ -12,6 +12,7 @@ package io.ktor.network.tls
 import io.ktor.network.sockets.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
+import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.*
 import kotlin.coroutines.*
@@ -164,16 +165,19 @@ private class KlioTlsSocket(
     private val output: ByteWriteChannel,
     override val coroutineContext: CoroutineContext
 ) : CoroutineScope, Socket by socket {
+    private val closed = atomic(false)
+    private val inputLoop = atomic<WriterJob?>(null)
+    private val outputLoop = atomic<ReaderJob?>(null)
 
     override fun attachForReading(channel: ByteChannel): WriterJob =
         writer(coroutineContext + CoroutineName("cio-tls-input-loop"), channel) {
             appDataInputLoop(this.channel)
-        }
+        }.also { inputLoop.value = it }
 
     override fun attachForWriting(channel: ByteChannel): ReaderJob =
         reader(coroutineContext + CoroutineName("cio-tls-output-loop"), channel) {
             appDataOutputLoop(this.channel)
-        }
+        }.also { outputLoop.value = it }
 
     private suspend fun appDataInputLoop(pipe: ByteWriteChannel) {
         val buffer = ByteArray(RECORD_BUFFER)
@@ -223,8 +227,21 @@ private class KlioTlsSocket(
         close()
     }
 
+    /**
+     * The data written so far and the close_notify alert go out before the
+     * connection closes, as the JVM's TLSSocket has it, and the session is
+     * freed once neither loop uses it.
+     */
     override fun close() {
-        socket.close()
-        engine.free()
+        if (!closed.compareAndSet(false, true)) return
+        launch(NonCancellable + CoroutineName("cio-tls-close")) {
+            outputLoop.value?.let {
+                runCatching { it.channel.flushAndClose() }
+                it.job.join()
+            }
+            socket.close()
+            inputLoop.value?.job?.cancelAndJoin()
+            engine.free()
+        }
     }
 }

@@ -83,6 +83,7 @@ const SERVER_SRC =
     \\        install(HttpsRedirect) { sslPort = PORT }
     \\        routing {
     \\            get("/hello") { call.respondText("hello over TLS") }
+    \\            get("/big") { call.respondText("z".repeat(500_000)) }
     \\            post("/length") { call.respondText("length=" + call.receiveText().length) }
     \\            get("/where") {
     \\                val local = call.request.local
@@ -145,7 +146,7 @@ fn bodyOf(resp: []const u8) []const u8 {
 }
 
 /// Serves SERVER_SRC with the fixture identity `name` (`<name>.pem`,
-/// `<name>-key.pem`) and checks three calls through std's client.
+/// `<name>-key.pem`) and checks four calls through std's client.
 fn serveAndCheck(name: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -197,6 +198,13 @@ fn serveAndCheck(name: []const u8) !void {
         const resp = try httpsRequest(a, io, port, &anchors, try std.mem.concat(a, u8, &.{ head, body }));
         try std.testing.expectEqual(@as(?u16, 200), statusOf(resp));
         try std.testing.expectEqualStrings("length=50000", bodyOf(resp));
+    }
+    {
+        // The connection closes once the response has gone out whole, with
+        // the close_notify after it, however much of it is still queued.
+        const resp = try httpsRequest(a, io, port, &anchors, "GET /big HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        try std.testing.expectEqual(@as(?u16, 200), statusOf(resp));
+        try std.testing.expectEqual(@as(usize, 500_000), bodyOf(resp).len);
     }
     {
         // A call on the HTTPS connector knows it: the https scheme, and 443
