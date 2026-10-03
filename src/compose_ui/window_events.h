@@ -1277,6 +1277,14 @@ inline bool klioScriptTraced() {
     return traced;
 }
 
+// Every poll of a window following the script, counted: how far the window
+// loop has come. The caps on waiting count polls, not time, so a stall of the
+// whole loop (a loaded machine) does not make every wait look over.
+inline unsigned long long& klioScriptPollSeq() {
+    static unsigned long long seq = 0;
+    return seq;
+}
+
 // When the windows' timed events count from: the first poll of any window.
 inline std::chrono::steady_clock::time_point& klioScriptOrigin() {
     static std::chrono::steady_clock::time_point origin;
@@ -1293,14 +1301,17 @@ struct KlioScriptState {
     int polls = 0;
     // When the window was made.
     std::chrono::steady_clock::time_point made = std::chrono::steady_clock::now();
+    // The poll count (klioScriptPollSeq) when the window was last polled, or
+    // made.
+    unsigned long long lastSeq = klioScriptPollSeq();
     std::chrono::steady_clock::time_point start;
     size_t nextTimed = 0;
     // Events came and the program has not shown their effect since: the
     // window presented no frame and the window loop has not settled. Every
-    // window's next events wait for it, no longer than klioScriptFrameWaitMs
-    // for a window that draws nothing.
+    // window's next events wait for it, no longer than klioScriptWaitPolls
+    // polls for a window that draws nothing.
     bool awaitFrame = false;
-    std::chrono::steady_clock::time_point awaitSince;
+    unsigned long long awaitSeq = 0;
     unsigned long long awaitSettles = 0;
 
     KlioScriptState() : KlioScriptState(false) {}
@@ -1315,7 +1326,12 @@ struct KlioScriptState {
     }
 };
 
-inline constexpr long long klioScriptFrameWaitMs = 1000;
+// How long a wait lasts: as many polls as the windows take in about a
+// second of a loop that runs, each window polling once a frame.
+inline unsigned long long klioScriptWaitPolls() {
+    const auto windows = static_cast<unsigned long long>(std::max<size_t>(klioScriptWindows().size(), 1));
+    return 60 * windows;
+}
 
 inline long long klioScriptMillis(std::chrono::steady_clock::duration d) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
@@ -1332,11 +1348,13 @@ inline void klioScriptSettled() {
     klioScriptSettles().fetch_add(1, std::memory_order_relaxed);
 }
 
-// Whether the window still waits for the effect of the events it took last.
-inline bool klioScriptAwaits(KlioScriptState& st, std::chrono::steady_clock::time_point now) {
+// Whether the window still waits for the effect of the events it took last:
+// no frame since, the loop has not settled, and the windows have not polled
+// klioScriptWaitPolls times meanwhile (a window that draws nothing).
+inline bool klioScriptAwaits(KlioScriptState& st) {
     if (!st.awaitFrame) return false;
     if (klioScriptSettles().load(std::memory_order_relaxed) == st.awaitSettles &&
-        klioScriptMillis(now - st.awaitSince) < klioScriptFrameWaitMs) {
+        klioScriptPollSeq() - st.awaitSeq < klioScriptWaitPolls()) {
         return true;
     }
     st.awaitFrame = false;
@@ -1359,11 +1377,10 @@ inline bool klioScriptDue(const KlioScriptState& st, size_t index, std::chrono::
 // Whether a window's timed event due at `due` waits for another window's
 // that is due before it (or at the same time, for a window made first): the
 // windows take the script's timed events in the order they fall due. A
-// window that has not taken its event klioScriptFrameWaitMs after it fell due
-// (or, polling for the first time only then, after it was made) is not waited
-// for.
-inline bool klioScriptOthersFirst(const KlioScriptState& st, std::chrono::steady_clock::time_point due,
-                                  std::chrono::steady_clock::time_point now) {
+// window the loop has not polled for klioScriptWaitPolls polls of the others
+// (one that is not polled, or not yet) is not waited for; one still polled
+// is, however late its events run.
+inline bool klioScriptOthersFirst(const KlioScriptState& st, std::chrono::steady_clock::time_point due) {
     bool before = true;  // whether the other window was made first
     for (const KlioScriptState* other : klioScriptWindows()) {
         if (other == &st) {
@@ -1372,8 +1389,7 @@ inline bool klioScriptOthersFirst(const KlioScriptState& st, std::chrono::steady
         }
         std::chrono::steady_clock::time_point theirs;
         if (!klioScriptDue(*other, other->nextTimed, &theirs)) continue;
-        const auto since = other->polls == 0 ? std::max(theirs, other->made) : theirs;
-        if (klioScriptMillis(now - since) >= klioScriptFrameWaitMs) continue;
+        if (klioScriptPollSeq() - other->lastSeq >= klioScriptWaitPolls()) continue;
         if (theirs < due || (before && theirs == due)) return true;
     }
     return false;
@@ -1389,9 +1405,10 @@ inline void klioScriptTick(KlioScriptState& st, std::deque<KlioEv>& q, bool tray
     if (script.empty()) return;
     const auto now = std::chrono::steady_clock::now();
     if (!tray) {
-        if (klioScriptAwaits(st, now)) return;
+        st.lastSeq = ++klioScriptPollSeq();
+        if (klioScriptAwaits(st)) return;
         for (KlioScriptState* other : klioScriptWindows()) {
-            if (other != &st && klioScriptAwaits(*other, now)) return;
+            if (other != &st && klioScriptAwaits(*other)) return;
         }
     }
     const int n = ++st.polls;
@@ -1415,7 +1432,7 @@ inline void klioScriptTick(KlioScriptState& st, std::deque<KlioEv>& q, bool tray
         if (e.poll == n) q.push_back(e.ev);
         if (e.poll >= 0) continue;
         if (timed++ < st.nextTimed || waiting) continue;
-        if (e.ms > elapsed || (!tray && klioScriptOthersFirst(st, st.start + std::chrono::milliseconds(e.ms), now))) {
+        if (e.ms > elapsed || (!tray && klioScriptOthersFirst(st, st.start + std::chrono::milliseconds(e.ms)))) {
             waiting = true;
             continue;
         }
@@ -1429,7 +1446,7 @@ inline void klioScriptTick(KlioScriptState& st, std::deque<KlioEv>& q, bool tray
                          q.size() - queued);
         }
         st.awaitFrame = true;
-        st.awaitSince = now;
+        st.awaitSeq = klioScriptPollSeq();
         st.awaitSettles = klioScriptSettles().load(std::memory_order_relaxed);
     }
 }

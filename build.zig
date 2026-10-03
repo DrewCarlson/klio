@@ -1083,6 +1083,18 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run the fast module unit tests");
+    // The scripted-input timeline the Skia shim's windows follow
+    // (src/compose_ui/window_events.h), tested with no window.
+    const window_events_test = b.addExecutable(.{
+        .name = "window-events-test",
+        .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true, .link_libcpp = true }),
+    });
+    window_events_test.root_module.addCSourceFile(.{ .file = b.path("tests/native/window_events_test.cpp"), .flags = &.{"-std=c++20"} });
+    window_events_test.root_module.addIncludePath(b.path("src/compose_ui"));
+    const run_window_events_test = b.addRunArtifact(window_events_test);
+    run_window_events_test.setEnvironmentVariable("KLIO_WIN_INPUT", b.pathFromRoot("tests/native/window_events_test.input"));
+    run_window_events_test.addFileInput(b.path("tests/native/window_events_test.input"));
+    test_step.dependOn(&run_window_events_test.step);
     const itest_step = b.step("itest", "Run the integration test suite (slow — interprets whole programs)");
     const itest_bin_step = b.step("itest-bin", "Build+install standalone itest binaries for stress looping");
 

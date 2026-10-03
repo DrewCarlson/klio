@@ -1,0 +1,4 @@
+# The scripted input window_events_test.cpp drives two windows with: a
+# press at 100 ms and its release at 200 ms, for each window.
+100ms press 10 10
+200ms release 10 10
