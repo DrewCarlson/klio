@@ -17,7 +17,9 @@ scenes allocate tens of thousands per frame (the 300 changing texts: about
 `Char`, `Byte`, `Short`, `Int`, `Long`, `Float`, `Double` or an unsigned
 type, declared outside `kotlin.*` (the unsigned types are host numbers
 already; `Duration` and the other stdlib ones follow once the natives that
-read them are audited). Such a class is *scalar*.
+read them are audited), and implementing no interface `by` a delegate (the
+instance keeps the delegate beside the number: `value class D(val x: Int) :
+Comparable<Int> by x`). Such a class is *scalar*.
 
 **Representation.** A value's representation is decided by the static type
 of the place that holds it. Where that type is exactly a scalar class `V`
@@ -88,7 +90,13 @@ coercion helper (`lower/sema/coerce.zig`), every site above, construction,
 members, synthesized members, Compose's change checks.
 `tests/fixtures/parity_corpus/value_class_flows.kt` and
 `value_class_members.kt` send scalar classes through each site, pinned
-with kotlinc's output.
+with kotlinc's output; `value_class_boxed_edges.kt` the places that box
+that the box corpus found missed: a call through the defaults bridge an
+override inherits (`I.f$default` takes the instance, as the declaration it
+belongs to does), a class's `by` delegate slot, a value class delegating
+`by` its own value. A vararg parameter of a scalar class holds the array
+of instances, so its read is never unboxed (the box corpus's
+`fullValueClasses/vararg`).
 
 Left: the stdlib's value classes (`Duration`, `Result` is no scalar class),
 once the natives that read them are audited; a `toString` or `hashCode` of

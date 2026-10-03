@@ -175,8 +175,57 @@ pub fn parseClass(
     };
 }
 
+/// Whether the annotations from token `start` belong to a primary
+/// constructor: past them and any modifiers comes `constructor`.
+fn annotatesConstructor(p: *Parser, start: usize) bool {
+    const toks = p.tokens;
+    var i = start;
+    while (i < toks.len) {
+        switch (std.meta.activeTag(toks[i].kind)) {
+            .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => {},
+            else => break,
+        }
+        i += 1;
+        // `get:` before the name, then `Name` or `pkg.Name`.
+        if (i + 1 < toks.len and std.meta.activeTag(toks[i].kind) == .Ident and std.meta.activeTag(toks[i + 1].kind) == .Colon) i += 2;
+        if (i < toks.len and std.meta.activeTag(toks[i].kind) == .Ident) i += 1;
+        while (i + 1 < toks.len and std.meta.activeTag(toks[i].kind) == .Dot and std.meta.activeTag(toks[i + 1].kind) == .Ident) i += 2;
+        // Type arguments, then arguments or a `[...]` set, balanced.
+        inline for (.{ .{ .Lt, .Gt }, .{ .LParen, .RParen }, .{ .LBracket, .RBracket } }) |pair| {
+            if (i < toks.len and std.meta.activeTag(toks[i].kind) == pair[0]) {
+                var depth: usize = 0;
+                while (i < toks.len) : (i += 1) {
+                    const k = std.meta.activeTag(toks[i].kind);
+                    if (k == pair[0]) depth += 1;
+                    if (k == pair[1]) {
+                        depth -= 1;
+                        if (depth == 0) {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        while (i < toks.len and std.meta.activeTag(toks[i].kind) == .Newline) i += 1;
+    }
+    while (i < toks.len) : (i += 1) {
+        const k = std.meta.activeTag(toks[i].kind);
+        if (k == .Newline) continue;
+        if (k != .Ident) return false;
+        const t = support.text(p, toks[i].span);
+        if (std.mem.eql(u8, t, "constructor")) return true;
+        const modifier = std.mem.eql(u8, t, "public") or std.mem.eql(u8, t, "private") or
+            std.mem.eql(u8, t, "protected") or std.mem.eql(u8, t, "internal") or
+            std.mem.eql(u8, t, "actual") or std.mem.eql(u8, t, "expect");
+        if (!modifier) return false;
+    }
+    return false;
+}
+
 /// Skip newlines only when the first non-newline token continues the class
-/// header (`<`, `(`, `:`, `{`, `@`, `where`, a visibility or `constructor`).
+/// header (`<`, `(`, `:`, `{`, `where`, a visibility, `constructor`, or a
+/// primary constructor's annotation).
 /// A bodyless `class A` must keep the newline separating it from the next
 /// declaration.
 fn skipNlIfHeaderContinues(p: *Parser) void {
@@ -189,7 +238,9 @@ fn skipNlIfHeaderContinues(p: *Parser) void {
     const k = p.tokens[i].kind;
     const continues = switch (k) {
         .Lt, .LParen, .Colon, .LBrace => true,
-        .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => true,
+        // Only a primary constructor's annotations continue the header;
+        // others annotate the next statement.
+        .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => annotatesConstructor(p, i),
         .Ident => blk: {
             const t = support.text(p, p.tokens[i].span);
             break :blk std.mem.eql(u8, t, "where") or
@@ -453,7 +504,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
             if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
                 std.mem.eql(u8, support.text(p, support.currentSpan(p)), "constructor"))
             {
-                if (parseSecondaryCtor(p, flags.visibility, flags.annotations.items)) |sc| {
+                if (parseSecondaryCtor(p, flags.visibility, flags.annotations.items, flags.is_inline)) |sc| {
                     secondary_ctors.append(p.allocator, sc) catch @panic("OOM");
                 }
                 continue;
@@ -690,7 +741,7 @@ pub fn parseClassBody(p: *Parser) ClassBody {
                     sp,
                 );
             }
-            if (parseSecondaryCtor(p, flags.visibility, flags.annotations.items)) |sc| {
+            if (parseSecondaryCtor(p, flags.visibility, flags.annotations.items, flags.is_inline)) |sc| {
                 secondary_ctors.append(p.allocator, sc) catch @panic("OOM");
             }
             continue;
@@ -716,6 +767,7 @@ pub fn parseSecondaryCtor(
     p: *Parser,
     visibility: Visibility,
     annotations: []Annotation,
+    is_inline: bool,
 ) ?SecondaryCtor {
     const kw = support.bump(p); // `constructor`
     _ = support.expect(p, .LParen, "`(`") orelse return null;
@@ -777,6 +829,7 @@ pub fn parseSecondaryCtor(
     const end = p.tokens[p.pos -| 1].span;
     return SecondaryCtor{
         .params = params,
+        .is_inline = is_inline,
         .delegation = delegation,
         .delegation_arg_names = delegation_arg_names,
         .body = body,
@@ -901,9 +954,10 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             }
         }
         var default: ?Expr = null;
+        var default_eq: u32 = 0;
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
-            _ = support.bump(p);
+            default_eq = support.bump(p).span.start;
             support.skipNl(p);
             default = expr.parseExpr(p);
         }
@@ -913,6 +967,7 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             .name = name,
             .ty = ty,
             .default = default,
+            .default_eq = default_eq,
             .visibility = visibility,
             .is_vararg = is_vararg,
             .annotations = annotations,

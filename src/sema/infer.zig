@@ -1453,6 +1453,21 @@ fn mentionsId(s: *Sema, t: TypeId, id: u32) bool {
 
 /// Whether `t` mentions an open variable nothing constrained: a type only
 /// the enclosing call can give.
+/// Whether `t`, as written before any variable in it is fixed, mentions an inference
+/// variable.
+pub fn mentionsVar(s: *Sema, t: TypeId) bool {
+    return switch (s.types.get(t)) {
+        .variable => true,
+        .class => |c| for (c.args) |a| {
+            if (a.ty != .none and mentionsVar(s, a.ty)) break true;
+        } else false,
+        .intersection => |parts| for (parts) |p| {
+            if (mentionsVar(s, p)) break true;
+        } else false,
+        else => false,
+    };
+}
+
 pub fn hasUnboundedVar(s: *Sema, t: TypeId) bool {
     switch (s.types.get(t)) {
         .variable => |v| {

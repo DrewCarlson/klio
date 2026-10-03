@@ -254,10 +254,19 @@ fn parseFallthroughStmt(p: *Parser, save: usize) ?Stmt {
     // discard them and let the expression parser see the statement. On a
     // function literal they stay, for the literal keeps them
     // (`@Composable { ... }` as a lambda's result is a composable lambda).
-    _ = file.parseAnnotations(p);
+    const annos = file.parseAnnotations(p);
     support.skipNl(p);
-    if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) p.pos = save;
-    return parseExprOrAssignStmt(p);
+    if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
+        p.pos = save;
+        return parseExprOrAssignStmt(p);
+    }
+    const st = parseExprOrAssignStmt(p) orelse return null;
+    switch (st) {
+        .Expr => |e| expr.noteAnnotated(p, annos, e.span(), e == .AnonFun),
+        .Assign => |a| expr.noteAnnotated(p, annos, a.span, false),
+        else => {},
+    }
+    return st;
 }
 
 pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
@@ -286,6 +295,7 @@ pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
+        .types = entries.types,
         .init = init,
         .span = sp,
     }) };
@@ -304,6 +314,7 @@ pub fn parseNameBasedDestructuringStmt(p: *Parser) ?Stmt {
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
+        .types = entries.types,
         .init = init,
         .span = sp,
     }) };
@@ -322,6 +333,7 @@ pub fn parseBracketDestructuringStmt(p: *Parser) ?Stmt {
         .names = entries.names,
         .by_name = entries.by_name,
         .sources = entries.sources,
+        .types = entries.types,
         .init = init,
         .span = sp,
     }) };
@@ -339,13 +351,14 @@ pub fn parseExprOrAssignStmt(p: *Parser) ?Stmt {
         else => null,
     };
     if (op) |o| {
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = expr.parseExpr(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         return Stmt{ .Assign = support.boxed(p, ast.AssignStmt{
             .target = lhs,
             .op = o,
+            .op_at = op_at,
             .value = rhs,
             .span = sp,
         }) };

@@ -91,6 +91,9 @@ pub const Parser = struct {
     in_accessor_body: bool,
     /// Set when any annotation named `Composable` is parsed.
     saw_composable: bool = false,
+    /// `@A expr` outside a function literal, for the file's
+    /// `annotated_exprs`.
+    annotated_exprs: std.ArrayList(ast.AnnotatedExpr) = .empty,
     /// The first `NodeId` the file's numbering hands out; a snippet spliced
     /// into another file continues from that file's `node_count`.
     first_node_id: u32 = 1,
@@ -1196,6 +1199,57 @@ test "a primary constructor keeps the annotations written before `constructor`" 
     try testing.expectEqual(@as(usize, 1), c.primary_params.len);
     // An annotation not followed by `constructor` is the next declaration's.
     try testing.expectEqual(@as(usize, 1), out.file.decls[1].Class.annotations.len);
+}
+
+test "a primary constructor's annotations may be followed by its modifiers on the next line" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\class Sparse<E>
+        \\@JvmOverloads public constructor(initialCapacity: Int = 10) {
+        \\    val size = initialCapacity
+        \\}
+        \\class Result
+        \\@PublishedApi internal constructor(val holder: Any?)
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    try testing.expectEqual(@as(usize, 1), out.file.decls[0].Class.x().primary_ctor_annotations.len);
+    try testing.expectEqual(@as(usize, 1), out.file.decls[0].Class.primary_params.len);
+    try testing.expectEqual(@as(usize, 1), out.file.decls[1].Class.x().primary_ctor_annotations.len);
+}
+
+test "an annotation on an expression is kept with the whole postfix expression it stands on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun f() {
+        \\    val w = @OptIn(X::class) a.b()
+        \\    @Suppress("Y") g()
+        \\    val l = @Composable { }
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    try testing.expectEqual(@as(usize, 2), out.file.annotated_exprs.len);
+    const first = out.file.annotated_exprs[0];
+    try testing.expectEqualStrings("a.b()", out.parser.src[first.span.start..first.span.end]);
+    const second = out.file.annotated_exprs[1];
+    try testing.expectEqualStrings("g()", out.parser.src[second.span.start..second.span.end]);
+}
+
+test "a bodyless local class ends at its line when the next statement is annotated" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(arena.allocator(),
+        \\fun f() {
+        \\    class Local
+        \\    @Suppress("X") val v = 1
+        \\}
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const body = out.file.decls[0].Function.body.?.Block;
+    try testing.expectEqual(@as(usize, 2), body.stmts.len);
+    try testing.expectEqual(@as(usize, 0), body.stmts[0].Decl.Class.x().primary_ctor_annotations.len);
+    try testing.expectEqual(@as(usize, 1), body.stmts[1].Decl.Property.annotations.len);
 }
 
 test "a soft keyword followed by `:` names a parameter" {

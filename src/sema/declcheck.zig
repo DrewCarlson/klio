@@ -43,9 +43,19 @@ pub fn checkProgram(s: *Sema) Allocator.Error!void {
                 try c.supertypes(sym, d.?.supertypes, d.?.supertype_args, d.?.supertype_delegates, true);
                 try c.inheritedMembers(sym, d.?.span);
             },
-            .function => |d| if (info.kind == .function) try c.function(sym, d.?),
-            .property => |d| if (info.kind == .property) try c.property(sym, d.?),
-            .class_param => |d| if (info.kind == .property) try c.overrides(sym, d.?.is_override, d.?.name.span),
+            .function => |d| if (info.kind == .function) {
+                try c.function(sym, d.?);
+                try c.memberVariance(sym);
+            },
+            .property => |d| if (info.kind == .property) {
+                try c.property(sym, d.?);
+                try c.memberVariance(sym);
+            },
+            .class_param => |d| if (info.kind == .property) {
+                try c.overrides(sym, d.?.is_override, d.?.name.span);
+                try c.memberVariance(sym);
+            },
+            .type_alias => |d| if (info.kind == .type_alias) try c.aliasCycle(sym, d.?),
             .secondary_ctor => |d| try c.params(d.?.params, false),
             else => {},
         }
@@ -112,6 +122,14 @@ const Checker = struct {
             if (c.is_value and !c.is_data and !expect) try self.valueClass(cls, c);
         }
         try self.classParams(c.primary_params);
+        const primary_ctor = self.s.syms.classInfo(cls).primary_ctor;
+        if (primary_ctor != .none and c.primary_params.len != 0) {
+            try headers.functionHeader(self.s, primary_ctor);
+            const syms = self.s.syms.functionInfo(primary_ctor).params;
+            if (syms.len == c.primary_params.len) for (c.primary_params, syms) |p, ps| {
+                if (p.is_vararg) try self.varargType(p.span, ps);
+            };
+        }
         if (!expect and !c.is_external) {
             // A class has a primary constructor when it writes one or
             // declares no other.
@@ -120,6 +138,8 @@ const Checker = struct {
             if (!c.is_annotation) try self.inheritedMembers(cls, at);
         }
         try self.genericThrowable(cls, c.type_params);
+        try self.cyclicBounds(c.type_params, c.x().where_bounds, false);
+        try self.supertypeVariance(cls, c.supertypes);
         if (c.is_enum and !expect) try self.enumEntries(cls, c);
         try self.constructorCycles(cls);
     }
@@ -481,6 +501,19 @@ const Checker = struct {
         try self.report(tps[0].span, .GENERIC_THROWABLE_SUBCLASS, "Subclass of 'Throwable' cannot have type parameters.", .{});
     }
 
+    /// A vararg of a value class is refused unless `FullValueClasses` is on:
+    /// its array would hold the values boxed. The unsigned types have arrays
+    /// of their own.
+    fn varargType(self: Checker, at: Span, p: Sym) Allocator.Error!void {
+        const s = self.s;
+        if (self.language().full_value_classes) return;
+        const t = try headers.paramType(s, p);
+        if (s.types.isErr(t)) return;
+        const cls = s.types.classSym(t);
+        if (cls == .none or s.syms.kind(cls) != .class or !s.syms.flags(cls).value or unsigned(s, cls)) return;
+        try self.report(at, .FORBIDDEN_VARARG_PARAMETER_TYPE, "Prohibited vararg parameter type '{s}'.", .{try diagnose.typeText(s, s.arena, t)});
+    }
+
     fn classParams(self: Checker, ps: []const ast.ClassParam) Allocator.Error!void {
         var varargs: usize = 0;
         for (ps) |p| varargs += @intFromBool(p.is_vararg);
@@ -508,8 +541,23 @@ const Checker = struct {
                 if (tp.is_reified) try self.report(tp.span, .REIFIED_TYPE_PARAMETER_NO_INLINE, "Only type parameters of inline functions can be reified.", .{});
             }
         }
+        try self.cyclicBounds(d.type_params, d.where_bounds, true);
         try self.params(d.params, d.is_inline);
+        {
+            try headers.functionHeader(s, f);
+            const syms = s.syms.functionInfo(f).params;
+            if (syms.len == d.params.len) for (d.params, syms) |p, ps| {
+                if (p.is_vararg) try self.varargType(p.span, ps);
+            };
+        }
         if (member) try self.overrides(f, d.is_override, at);
+        // A member a subclass may override cannot be tail-recursive.
+        if (d.is_tailrec and member and (open or d.is_abstract or (d.is_override and !d.is_final))) {
+            const cls = s.syms.owner(f);
+            const cls_open = s.syms.kind(cls) == .class and (s.syms.classInfo(cls).kind == .interface or s.syms.flags(cls).modality != .final);
+            if (cls_open) try self.report(at, .TAILREC_ON_VIRTUAL_MEMBER_ERROR, "Tailrec is prohibited on open members.", .{});
+        }
+        if (d.is_inline) try self.nullableInlineParams(f, d);
         if (d.is_operator) try self.operatorShape(f, d, member);
         if (d.is_inline and !inExpect(s, f) and !try inlinesSomething(s, f, d)) {
             try self.warn(at, .NOTHING_TO_INLINE, "Expected performance impact from inlining is insignificant. Inlining works best for functions with parameters of function types.", .{});
@@ -523,6 +571,21 @@ const Checker = struct {
         }
         if (d.is_infix and ((!member and d.receiver_type == null) or d.params.len != 1 or d.params[0].is_vararg or d.params[0].default != null)) {
             try self.report(at, .INAPPLICABLE_INFIX_MODIFIER, "'infix' modifier is inapplicable on this function: must be a member or an extension function with a single value parameter.", .{});
+        }
+    }
+
+    /// An inline function's parameter of a nullable function type, which it
+    /// cannot inline, unless it is `noinline`.
+    fn nullableInlineParams(self: Checker, f: Sym, d: *const ast.Function) Allocator.Error!void {
+        const s = self.s;
+        const syms = s.syms.functionInfo(f).params;
+        if (syms.len != d.params.len) return;
+        for (d.params, syms) |p, ps| {
+            if (p.is_noinline) continue;
+            const t = try headers.paramType(s, ps);
+            if (s.types.isErr(t) or !s.types.isNullable(t)) continue;
+            if (@import("calls.zig").functionShape(s, try s.types.makeNotNull(t)) == null) continue;
+            try self.report(p.span, .NULLABLE_INLINE_PARAMETER, "Inline parameter '{s}: {s}' of '{s}' cannot be nullable. Add 'noinline' modifier to the parameter declaration or make its type not nullable.", .{ p.name.name, try diagnose.typeText(s, s.arena, t), try diagnose.declarationText(s, s.arena, f) });
         }
     }
 
@@ -877,6 +940,378 @@ const Checker = struct {
             try self.report(e.span(), .CONST_VAL_WITH_NON_CONST_INITIALIZER, "Const 'val' initializer must be a constant value.", .{});
         }
     }
+
+    // ------------------------------------------------------------- bounds --
+
+    /// Type parameters bounded by each other in a circle (`<T : U, U : T>`,
+    /// `<T : T>`): each one in it, at its name for a function's and at the
+    /// bound that closes the circle for a class's, as kotlinc places them.
+    fn cyclicBounds(self: Checker, tps: []const ast.TypeParam, wheres: []const ast.WhereBound, at_name: bool) Allocator.Error!void {
+        const s = self.s;
+        const n = tps.len;
+        if (n == 0) return;
+        const Edge = struct { from: usize, to: usize, at: Span };
+        var edges: std.ArrayList(Edge) = .empty;
+        for (tps, 0..) |*tp, i| if (tp.upper_bound) |*b| if (boundParam(tps, b)) |j| try edges.append(s.arena, .{ .from = i, .to = j, .at = b.span });
+        for (wheres) |*w| {
+            const i = for (tps, 0..) |tp, k| {
+                if (std.mem.eql(u8, tp.name.name, w.name.name)) break k;
+            } else continue;
+            if (boundParam(tps, &w.bound)) |j| try edges.append(s.arena, .{ .from = i, .to = j, .at = w.bound.span });
+        }
+        if (edges.items.len == 0) return;
+        const reach = try s.arena.alloc(bool, n * n);
+        @memset(reach, false);
+        for (edges.items) |e| reach[e.from * n + e.to] = true;
+        for (0..n) |k| for (0..n) |i| for (0..n) |j| {
+            if (reach[i * n + k] and reach[k * n + j]) reach[i * n + j] = true;
+        };
+        for (tps, 0..) |*tp, i| {
+            if (!reach[i * n + i]) continue;
+            var names: std.ArrayList(u8) = .empty;
+            for (tps, 0..) |o, j| if (reach[i * n + j] and reach[j * n + i]) {
+                if (names.items.len != 0) try names.appendSlice(s.arena, ", ");
+                try names.appendSlice(s.arena, o.name.name);
+            };
+            if (at_name) {
+                try self.report(tp.name.span, .CYCLIC_GENERIC_UPPER_BOUND, "Type parameter has cyclic upper bounds: {s}.", .{names.items});
+            } else for (edges.items) |e| if (e.from == i and reach[e.to * n + i]) {
+                try self.report(e.at, .CYCLIC_GENERIC_UPPER_BOUND, "Type parameter has cyclic upper bounds: {s}.", .{names.items});
+            };
+        }
+    }
+
+    /// The type parameter of `tps` a bound names itself (`T`, `T?`).
+    fn boundParam(tps: []const ast.TypeParam, b: *const ast.TypeRef) ?usize {
+        if (b.function != null or b.type_args.len != 0 or b.x().qualified_path != null) return null;
+        for (tps, 0..) |tp, j| if (std.mem.eql(u8, tp.name.name, b.name.name)) return j;
+        return null;
+    }
+
+    // ------------------------------------------------------------ aliases --
+
+    /// A type alias whose expansion reaches the alias again.
+    fn aliasCycle(self: Checker, alias: Sym, ta: *const ast.TypeAlias) Allocator.Error!void {
+        var seen: std.AutoHashMapUnmanaged(Sym, void) = .empty;
+        if (try self.expandsTo(alias, headers.ctxOf(self.s, alias), &ta.target, &seen)) {
+            try self.report(ta.target.span, .RECURSIVE_TYPEALIAS_EXPANSION, "Recursive type alias in expansion.", .{});
+        }
+    }
+
+    fn expandsTo(self: Checker, alias: Sym, ctx: headers.TypeCtx, tr: *const ast.TypeRef, seen: *std.AutoHashMapUnmanaged(Sym, void)) Allocator.Error!bool {
+        const s = self.s;
+        if (tr.function) |ft| {
+            for (ft.context_params) |*cp| if (try self.expandsTo(alias, ctx, cp, seen)) return true;
+            if (ft.receiver) |*r| if (try self.expandsTo(alias, ctx, r, seen)) return true;
+            for (ft.params) |*p| if (try self.expandsTo(alias, ctx, p, seen)) return true;
+            return self.expandsTo(alias, ctx, &ft.ret, seen);
+        }
+        for (tr.type_args) |*a| {
+            if (!a.is_star and try self.expandsTo(alias, ctx, &a.ty, seen)) return true;
+        }
+        const c = try headers.resolveClassifierRef(s, ctx, tr);
+        if (c == .none or s.syms.kind(c) != .type_alias) return false;
+        if (c == alias) return true;
+        if ((try seen.getOrPut(s.arena, c)).found_existing) return false;
+        // An alias from an image has no syntax and cannot reach a program's.
+        const next = s.syms.get(c).decl.type_alias orelse return false;
+        return self.expandsTo(alias, headers.ctxOf(s, c), &next.target, seen);
+    }
+
+    // ----------------------------------------------------------- variance --
+
+    const Position = enum {
+        in,
+        out,
+        invariant,
+
+        fn flip(p: Position) Position {
+            return switch (p) {
+                .in => .out,
+                .out => .in,
+                .invariant => .invariant,
+            };
+        }
+
+        fn of(v: types.Variance) Position {
+            return switch (v) {
+                .in => .in,
+                .out => .out,
+                else => .invariant,
+            };
+        }
+
+        fn written(v: ast.Variance) Position {
+            return switch (v) {
+                .In => .in,
+                .Out => .out,
+                .Invariant => .invariant,
+            };
+        }
+
+        /// A type argument's place: its parameter's declared variance, or
+        /// the argument's projection where the parameter is invariant.
+        fn orProjection(declared: Position, projection: Position) Position {
+            return if (declared == .invariant) projection else declared;
+        }
+
+        /// `inner` read from inside a place at `p`.
+        fn through(p: Position, inner: Position) Position {
+            if (p == .invariant) return .invariant;
+            return switch (inner) {
+                .out => p,
+                .in => p.flip(),
+                .invariant => .invariant,
+            };
+        }
+    };
+
+    /// The types a member of a class with `in`/`out` type parameters
+    /// declares: parameter, receiver and bound types are read in `in`
+    /// position, a return type and a `val`'s type in `out`, a `var`'s type
+    /// in both. A private member is exempt.
+    fn memberVariance(self: Checker, m: Sym) Allocator.Error!void {
+        const s = self.s;
+        const owner = s.syms.owner(m);
+        if (owner == .none or s.syms.kind(owner) != .class) return;
+        if (!variantScope(s, owner)) return;
+        switch (s.syms.get(m).decl) {
+            .function => |d| {
+                const f = d.?;
+                if (f.visibility == .Private) return;
+                if (f.receiver_type) |r| try self.variance(owner, m, r, .in);
+                for (f.params) |*p| try self.variance(owner, m, &p.ty, .in);
+                for (f.type_params) |*tp| if (tp.upper_bound) |*b| try self.variance(owner, m, b, .in);
+                for (f.where_bounds) |*wb| try self.variance(owner, m, &wb.bound, .in);
+                if (f.return_type) |r| try self.variance(owner, m, r, .out);
+            },
+            .property => |d| {
+                const p = d.?;
+                if (p.visibility == .Private) return;
+                if (p.receiver_type) |r| try self.variance(owner, m, r, .in);
+                if (p.ty) |t| try self.variance(owner, m, t, if (p.mutable) .invariant else .out);
+            },
+            .class_param => |d| {
+                const p = d.?;
+                const mutable = p.property orelse return;
+                if (p.visibility == .Private) return;
+                try self.variance(owner, m, &p.ty, if (mutable) .invariant else .out);
+            },
+            else => {},
+        }
+    }
+
+    /// A class's supertypes are read in `out` position.
+    fn supertypeVariance(self: Checker, cls: Sym, written: []const ast.TypeRef) Allocator.Error!void {
+        if (!variantScope(self.s, cls)) return;
+        for (written) |*tr| try self.variance(cls, cls, tr, .out);
+    }
+
+    /// Whether `cls`, or a class it is inner to, declares an `in` or `out`
+    /// type parameter.
+    fn variantScope(s: *Sema, cls: Sym) bool {
+        var c = cls;
+        while (c != .none and s.syms.kind(c) == .class) : (c = s.syms.owner(c)) {
+            for (s.syms.classInfo(c).type_params) |tp| {
+                if (s.syms.typeParamInfo(tp).variance != .inv) return true;
+            }
+            if (!s.syms.flags(c).inner) break;
+        }
+        return false;
+    }
+
+    fn variance(self: Checker, owner: Sym, decl: Sym, tr: *const ast.TypeRef, pos: Position) Allocator.Error!void {
+        const ctx: headers.TypeCtx = .{ .decl = decl, .file = self.file, .header = decl == owner };
+        const t = try self.mutedType(ctx, tr);
+        try self.varianceIn(owner, ctx, tr, tr.span, t, pos, t, false);
+    }
+
+    fn mutedType(self: Checker, ctx: headers.TypeCtx, tr: *const ast.TypeRef) Allocator.Error!TypeId {
+        self.s.census.muted += 1;
+        defer self.s.census.muted -= 1;
+        return headers.resolveTypeRef(self.s, ctx, tr);
+    }
+
+    /// Walks `t`, written as `tr` when the syntax still follows it; where
+    /// it does not, findings land on `at`. `expanded`: `t` stands directly
+    /// in a type alias's expansion, which kotlinc reports apart.
+    fn varianceIn(self: Checker, owner: Sym, ctx: headers.TypeCtx, tr: ?*const ast.TypeRef, at: Span, t: TypeId, pos: Position, whole: TypeId, expanded: bool) Allocator.Error!void {
+        const s = self.s;
+        const here = if (tr) |w| w.span else at;
+        if (tr) |w| {
+            if (try unsafeVariance(s, ctx, w)) return;
+            // An alias is walked through its written target, which may
+            // mark a place `@UnsafeVariance`. kotlinc places a finding by
+            // the expansion's argument index among the written arguments.
+            if (w.function == null) {
+                const c = try headers.resolveClassifierRef(s, ctx, w);
+                if (c != .none and s.syms.kind(c) == .type_alias) if (try self.aliasPositions(c, 0)) |places| {
+                    for (w.type_args, 0..) |*arg, i| {
+                        if (arg.is_star or i >= places.len) continue;
+                        const arg_t = try self.mutedType(ctx, &arg.ty);
+                        for (places[i]) |r| {
+                            const p = pos.through(r.pos.orProjection(.written(arg.variance)));
+                            const same = r.top != null and r.top.? == i;
+                            const shown: Span = if (r.top) |j| (if (j < w.type_args.len) w.type_args[j].ty.span else here) else here;
+                            try self.varianceIn(owner, ctx, if (same) &arg.ty else null, shown, arg_t, p, whole, r.direct);
+                        }
+                    }
+                    return;
+                };
+            }
+        }
+        switch (s.types.get(t)) {
+            .param => |p| {
+                const declared = s.syms.typeParamInfo(p.sym).variance;
+                const conflict = switch (declared) {
+                    .out => pos != .out,
+                    .in => pos != .in,
+                    else => false,
+                };
+                if (!conflict or !visibleFrom(s, owner, s.syms.owner(p.sym))) return;
+                var buf: std.ArrayList(u8) = .empty;
+                try diagnose.writeTypeAs(s, s.arena, &buf, whole, true);
+                const name = s.str(s.syms.name(p.sym));
+                if (expanded) {
+                    try self.report(here, .TYPE_VARIANCE_CONFLICT_IN_EXPANDED_TYPE, "Type parameter '{s}' is declared as '{s}' but occurs in '{s}' position in abbreviated type '{s}'.", .{
+                        name, @tagName(declared), @tagName(pos), buf.items,
+                    });
+                } else {
+                    try self.report(here, .TYPE_VARIANCE_CONFLICT_ERROR, "Type parameter '{s}' is declared as '{s}' but occurs in '{s}' position in type '{s}'.", .{
+                        name, @tagName(declared), @tagName(pos), buf.items,
+                    });
+                }
+            },
+            .intersection => |parts| for (parts) |part| try self.varianceIn(owner, ctx, tr, here, part, pos, whole, expanded),
+            .class => |c| {
+                const tps = try headers.classTypeParams(s, c.sym);
+                const written = writtenArgs(s, tr, c.args.len);
+                for (c.args, 0..) |arg, i| {
+                    if (arg.variance == .star) continue;
+                    const declared: Position = if (i < tps.len) .of(s.syms.typeParamInfo(tps[i]).variance) else .invariant;
+                    try self.varianceIn(owner, ctx, if (written) |w| w[i] else null, here, arg.ty, pos.through(declared.orProjection(.of(arg.variance))), whole, false);
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Where a type parameter of an alias stands in the alias's expansion:
+    /// its position relative to the expansion, the index of the expansion's
+    /// argument it is under, and whether it is that argument itself.
+    const Occurrence = struct { pos: Position, top: ?usize, direct: bool };
+
+    /// Each type parameter's occurrences in the alias `alias`'s written
+    /// target; a place marked `@UnsafeVariance` is left out. Null for an
+    /// alias without syntax.
+    fn aliasPositions(self: Checker, alias: Sym, depth: u32) Allocator.Error!?[]const []const Occurrence {
+        const s = self.s;
+        const ta = s.syms.get(alias).decl.type_alias orelse return null;
+        // A recursive alias is reported on its own.
+        if (depth > 16) return null;
+        const tps = s.syms.aliasInfo(alias).type_params;
+        const lists = try s.arena.alloc(std.ArrayList(Occurrence), tps.len);
+        for (lists) |*l| l.* = .empty;
+        try self.occurrences(tps, lists, headers.ctxOf(s, alias), &ta.target, .out, depth, true, null, false);
+        const out = try s.arena.alloc([]const Occurrence, tps.len);
+        for (out, lists) |*o, l| o.* = l.items;
+        return out;
+    }
+
+    /// `at_top`: `tr` is the expansion itself; `top` the expansion argument
+    /// it is under; `parent_top`: it is that argument.
+    fn occurrences(self: Checker, tps: []const Sym, lists: []std.ArrayList(Occurrence), ctx: headers.TypeCtx, tr: *const ast.TypeRef, pos: Position, depth: u32, at_top: bool, top: ?usize, parent_top: bool) Allocator.Error!void {
+        const s = self.s;
+        if (try unsafeVariance(s, ctx, tr)) return;
+        if (tr.function) |ft| {
+            var j: usize = 0;
+            for (ft.context_params) |*cp| {
+                try self.occurrences(tps, lists, ctx, cp, pos.flip(), depth, false, if (at_top) j else top, at_top);
+                j += 1;
+            }
+            if (ft.receiver) |*r| {
+                try self.occurrences(tps, lists, ctx, r, pos.flip(), depth, false, if (at_top) j else top, at_top);
+                j += 1;
+            }
+            for (ft.params) |*p| {
+                try self.occurrences(tps, lists, ctx, p, pos.flip(), depth, false, if (at_top) j else top, at_top);
+                j += 1;
+            }
+            return self.occurrences(tps, lists, ctx, &ft.ret, pos, depth, false, if (at_top) j else top, at_top);
+        }
+        const c = try headers.resolveClassifierRef(s, ctx, tr);
+        if (c == .none) return;
+        switch (s.syms.kind(c)) {
+            .type_param => if (std.mem.indexOfScalar(Sym, tps, c)) |i| try lists[i].append(s.arena, .{ .pos = pos, .top = top, .direct = parent_top }),
+            .class => {
+                const ctps = try headers.classTypeParams(s, c);
+                for (tr.type_args, 0..) |*arg, i| {
+                    if (arg.is_star) continue;
+                    const declared: Position = if (i < ctps.len) .of(s.syms.typeParamInfo(ctps[i]).variance) else .invariant;
+                    try self.occurrences(tps, lists, ctx, &arg.ty, pos.through(declared.orProjection(.written(arg.variance))), depth, false, if (at_top) i else top, at_top);
+                }
+            },
+            .type_alias => {
+                const places = (try self.aliasPositions(c, depth + 1)) orelse return;
+                for (tr.type_args, 0..) |*arg, i| {
+                    if (arg.is_star or i >= places.len) continue;
+                    for (places[i]) |r| {
+                        const p = pos.through(r.pos.orProjection(.written(arg.variance)));
+                        try self.occurrences(tps, lists, ctx, &arg.ty, p, depth, false, if (at_top) r.top else top, at_top and r.direct);
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// The written type of each of `n` type arguments, in the order the
+    /// resolved type holds them; null when the syntax does not line up.
+    fn writtenArgs(s: *Sema, tr: ?*const ast.TypeRef, n: usize) ?[]const ?*const ast.TypeRef {
+        const w = tr orelse return null;
+        const out = s.arena.alloc(?*const ast.TypeRef, n) catch return null;
+        if (w.function) |ft| {
+            const count = ft.context_params.len + @intFromBool(ft.receiver != null) + ft.params.len + 1;
+            if (count != n) return null;
+            var i: usize = 0;
+            for (ft.context_params) |*cp| {
+                out[i] = cp;
+                i += 1;
+            }
+            if (ft.receiver) |*r| {
+                out[i] = r;
+                i += 1;
+            }
+            for (ft.params) |*p| {
+                out[i] = p;
+                i += 1;
+            }
+            out[i] = &ft.ret;
+            return out;
+        }
+        if (w.type_args.len > n) return null;
+        for (out, 0..) |*o, i| o.* = if (i < w.type_args.len and !w.type_args[i].is_star) &w.type_args[i].ty else null;
+        return out;
+    }
+
+    /// Whether `cls` sees the type parameters of `holder`: it is `holder`,
+    /// or inner to a class that does.
+    fn visibleFrom(s: *Sema, cls: Sym, holder: Sym) bool {
+        var c = cls;
+        while (c != .none and s.syms.kind(c) == .class) : (c = s.syms.owner(c)) {
+            if (c == holder) return true;
+            if (!s.syms.flags(c).inner) break;
+        }
+        return false;
+    }
+
+    fn unsafeVariance(s: *Sema, ctx: headers.TypeCtx, tr: *const ast.TypeRef) Allocator.Error!bool {
+        for (tr.x().annotations) |*ann| {
+            const c = try headers.annotationClass(s, ctx, ann);
+            if (c != .none and std.mem.eql(u8, s.str(s.syms.classInfo(c).fqn), "kotlin.UnsafeVariance")) return true;
+        }
+        return false;
+    }
 };
 
 /// Whether an init block of the class declaring `p` assigns the name `n`.
@@ -987,24 +1422,35 @@ fn inExpect(s: *Sema, sym: Sym) bool {
     return false;
 }
 
-/// Whether a file's declarations are checked: a program's, and under
-/// `KLIO_CHECK_PACKS=1` a pack's too, which kotlinc compiled.
+/// Whether a file's declarations are checked: a program's, under
+/// `KLIO_CHECK_PACKS=1` a pack's too, and under `KLIO_CHECK_BASE=1` the base set's
+/// (the stdlib and klio's actuals), which kotlinc compiled.
 pub fn checked(fc: *const sema_mod.FileCtx) bool {
     if (fc.generated) return false;
-    return fc.origin == .program or (fc.origin == .pack and checkPacks());
+    return switch (fc.origin) {
+        .program => true,
+        .pack => check_packs.on(),
+        .base => check_base.on(),
+    };
 }
 
-/// Read once: the checks ask for every reference in a pack.
-fn checkPacks() bool {
-    if (check_packs_state.load(.acquire) == 0) {
-        check_packs = if (std.c.getenv("KLIO_CHECK_PACKS")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-        check_packs_state.store(1, .release);
+/// An environment switch read once: the checks ask for every reference.
+const EnvSwitch = struct {
+    name: [:0]const u8,
+    state: std.atomic.Value(u8) = .init(0),
+    value: bool = false,
+
+    fn on(self: *EnvSwitch) bool {
+        if (self.state.load(.acquire) == 0) {
+            self.value = if (std.c.getenv(self.name)) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+            self.state.store(1, .release);
+        }
+        return self.value;
     }
-    return check_packs;
-}
+};
 
-var check_packs_state = std.atomic.Value(u8).init(0);
-var check_packs: bool = false;
+var check_packs: EnvSwitch = .{ .name = "KLIO_CHECK_PACKS" };
+var check_base: EnvSwitch = .{ .name = "KLIO_CHECK_BASE" };
 
 /// Declared in a class's body rather than a package or a body.
 fn isMember(s: *Sema, sym: Sym) bool {
@@ -1040,7 +1486,7 @@ fn inlineProperty(d: *const ast.Property) bool {
 
 /// Whether a property keeps a field: an accessor the language generates
 /// reads or writes it, as does a written one that names `field`.
-fn hasBackingField(d: *const ast.Property) bool {
+pub fn hasBackingField(d: *const ast.Property) bool {
     const g = d.getter orelse return true;
     if (mentionsField(g)) return true;
     if (!d.mutable) return false;

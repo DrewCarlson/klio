@@ -1169,8 +1169,11 @@ test "an object literal's setter runs when the property holding it was typed ear
 }
 
 test "a top-level property read before its initializer runs holds its seed" {
+    // kotlinc refuses the read written in `a`'s initializer; through a
+    // function it runs, and sees `b`'s seed.
     try expectRun(
-        \\val a: Int = b + 1
+        \\val a: Int = readB() + 1
+        \\fun readB() = b
         \\val b: Int = 10
         \\var c = 0
         \\fun main() {

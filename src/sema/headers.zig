@@ -10,6 +10,8 @@ const sema_mod = @import("sema.zig");
 const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 const subtyping = @import("subtyping.zig");
+const annocheck = @import("annocheck.zig");
+const declcheck = @import("declcheck.zig");
 const names_mod = @import("names.zig");
 const scope = @import("scope.zig");
 const body = @import("body.zig");
@@ -48,6 +50,8 @@ pub fn resolveTypeRef(s: *Sema, ctx: TypeCtx, tr: *const ast.TypeRef) Allocator.
         try s.census.reportFmt(.unresolved_type, ctx.file, tr.span, "{s}", .{typeRefText(tr)});
         return s.types.errType();
     }
+    if (tr.definitely_non_null) try definitelyNonNullLeft(s, ctx, cls, tr);
+    if (tr.x().annotations.len != 0) try typeAnnotations(s, ctx, tr);
     switch (s.syms.kind(cls)) {
         .type_param => {
             if (tr.definitely_non_null) {
@@ -102,6 +106,28 @@ pub fn resolveTypeRef(s: *Sema, ctx: TypeCtx, tr: *const ast.TypeRef) Allocator.
 
 /// The substitution `outer`'s type parameters take inside `decl`: from the
 /// innermost class enclosing `decl` that is `outer` or extends it.
+/// A written type's annotations stand on a type usage, in the files whose
+/// declarations are checked.
+fn typeAnnotations(s: *Sema, ctx: TypeCtx, tr: *const ast.TypeRef) Allocator.Error!void {
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc)) return;
+    try annocheck.checkPlace(s, ctx, tr.x().annotations, .{ .admits = &.{.TYPE}, .name = "type usage" });
+}
+
+/// `T & Any` makes a type parameter whose bound admits null not null; any
+/// other left side is refused, once where it is written.
+fn definitelyNonNullLeft(s: *Sema, ctx: TypeCtx, cls: Sym, tr: *const ast.TypeRef) Allocator.Error!void {
+    if (s.syms.kind(cls) == .type_param) {
+        const bounds = try typeParamBounds(s, cls);
+        for (bounds) |b| {
+            if (!try subtyping.admitsNull(s, b)) break;
+        } else return;
+    }
+    if (s.census.reportedAt(ctx.file, tr.span, .INCORRECT_LEFT_COMPONENT_OF_INTERSECTION)) return;
+    const msg = "Intersection types are supported only for definitely non-nullable types: left part must be a type parameter with nullable bounds.";
+    try s.census.reportFacts(.declaration, ctx.file, tr.span, .{ .message = msg, .factory = .INCORRECT_LEFT_COMPONENT_OF_INTERSECTION }, "{s}", .{msg});
+}
+
 fn enclosingView(s: *Sema, decl: Sym, outer: Sym) Allocator.Error!?types.Subst {
     var d = decl;
     while (d != .none) : (d = s.syms.owner(d)) {
@@ -304,17 +330,68 @@ fn expandAlias(s: *Sema, ctx: TypeCtx, alias: Sym, tr: *const ast.TypeRef) Alloc
     if (info.type_params.len == 0) return target;
     var subst: types.Subst = .empty;
     var starred: std.ArrayList(Sym) = .empty;
+    const Projected = struct { tp: Sym, variance: types.Variance, ty: TypeId };
+    var projected: std.ArrayList(Projected) = .empty;
     for (info.type_params, 0..) |tp, i| {
         if (i < tr.type_args.len and !tr.type_args[i].is_star) {
-            try subst.put(s.arena, tp, try resolveTypeRef(s, ctx, &tr.type_args[i].ty));
+            const at = try resolveTypeRef(s, ctx, &tr.type_args[i].ty);
+            switch (tr.type_args[i].variance) {
+                .Invariant => try subst.put(s.arena, tp, at),
+                .In => try projected.append(s.arena, .{ .tp = tp, .variance = .in, .ty = at }),
+                .Out => try projected.append(s.arena, .{ .tp = tp, .variance = .out, .ty = at }),
+            }
         } else try starred.append(s.arena, tp);
     }
     var t = try s.types.substitute(target, &subst);
+    // `ML<out T>` for `MutableList<K>` is `MutableList<out T>`: a projected
+    // argument projects each place the parameter is a type argument.
+    for (projected.items) |pj| {
+        t = try projectParam(s, t, pj.tp, pj.variance, pj.ty);
+        var rest: types.Subst = .empty;
+        try rest.put(s.arena, pj.tp, pj.ty);
+        t = try s.types.substitute(t, &rest);
+    }
     // `Provider<*>` for `(Base) -> Strategy<Base>?` is
     // `Function1<*, Strategy<*>?>`: a star argument projects each place the
     // parameter is a type argument.
     for (starred.items) |tp| t = try starProject(s, t, tp);
     return t;
+}
+
+/// `t` with each type argument that is the parameter `tp` replaced by
+/// `ty` projected `v`; a projection the place already has the other way
+/// round becomes a star.
+fn projectParam(s: *Sema, t: TypeId, tp: Sym, v: types.Variance, ty: TypeId) Allocator.Error!TypeId {
+    switch (s.types.get(t)) {
+        .class => |c| {
+            var changed = false;
+            const args = try s.arena.alloc(types.Arg, c.args.len);
+            for (c.args, args) |a, *o| {
+                o.* = a;
+                if (a.variance == .star) continue;
+                switch (s.types.get(a.ty)) {
+                    .param => |p| if (p.sym == tp) {
+                        const arg_t = if (p.nullable) try s.types.makeNullable(ty) else ty;
+                        o.* = if (a.variance == .inv or a.variance == v)
+                            .{ .variance = v, .ty = arg_t }
+                        else
+                            .{ .variance = .star, .ty = .none };
+                        changed = true;
+                        continue;
+                    },
+                    else => {},
+                }
+                const inner = try projectParam(s, a.ty, tp, v, ty);
+                if (inner != a.ty) {
+                    o.ty = inner;
+                    changed = true;
+                }
+            }
+            if (!changed) return t;
+            return s.types.classAttrs(c.sym, args, c.nullable, c.attrs);
+        },
+        else => return t,
+    }
 }
 
 fn starProject(s: *Sema, t: TypeId, tp: Sym) Allocator.Error!TypeId {

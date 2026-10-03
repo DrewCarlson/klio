@@ -68,6 +68,8 @@ const USAGE =
     \\  run <file...> [options]    Run one or more `.kt` source files.
     \\                             --language=+Feature[,+Other] enables a parser-gated
     \\                             language feature (kotlinc `-XXLanguage:+Feature`).
+    \\                             --opt-in=pkg.Marker[,...] opts the whole program in
+    \\                             to a `@RequiresOptIn` marker (kotlinc `-opt-in`).
     \\  test [path] [options]      Run `kotlin.test` `@Test` functions. A
     \\                             project dir (with klio.toml) tests its
     \\                             composed `[[test]]` sets; default `.`.
@@ -199,6 +201,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
                 feature_specs.append(gpa, v) catch return 1;
             } else if (optionValue(rest[i], "--language=")) |v| {
                 applyLanguageSpecs(v);
+            } else if (optionValue(rest[i], "--opt-in=")) |v| {
+                applyOptIns(v);
             } else if (std.mem.eql(u8, rest[i], "--native")) {
                 native = true;
             } else {
@@ -277,6 +281,8 @@ fn runBakeImageCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, v) catch return 1;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (std.mem.startsWith(u8, a, "--")) {
             return usageBakeImage(gpa);
         } else {
@@ -349,6 +355,8 @@ fn runDumpIrCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, v) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (std.mem.startsWith(u8, a, "--")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
@@ -384,6 +392,8 @@ fn runTranspileDumpCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, v) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (std.mem.startsWith(u8, a, "--")) {
             printErr(gpa, "error: unknown option `{s}`\n", .{a});
             return 2;
@@ -436,6 +446,8 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             resource_includes.append(gpa, includes.parse(v)) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
@@ -762,6 +774,8 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, v) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
@@ -831,6 +845,8 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
             feature_specs.append(gpa, v) catch return 2;
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
+        } else if (optionValue(a, "--opt-in=")) |v| {
+            applyOptIns(v);
         } else if (perfOptValue(a, args, &i)) |v| {
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
@@ -957,6 +973,11 @@ fn parseFormat(s: []const u8) ?DiagFormat {
 fn applyLanguageSpecs(specs: []const u8) void {
     var it = std.mem.tokenizeAny(u8, specs, ", ");
     while (it.next()) |spec| _ = parser.setLanguageFeature(spec);
+}
+
+fn applyOptIns(markers: []const u8) void {
+    var it = std.mem.tokenizeAny(u8, markers, ", ");
+    while (it.next()) |fqn| @import("sema").optin.optInEverywhere(fqn);
 }
 
 fn optionValue(arg: []const u8, prefix: []const u8) ?[]const u8 {

@@ -6,6 +6,24 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
+## State (2026-10-03, local run)
+
+A local run of the box runner (`KLIO_ITEST_BIN=<harness>
+KLIO_ITEST_HOME=zig-out/klio-test-home <box test binary>`) measures 6268
+passed / 84 failed. The ratchet (`BASELINE = 6271`, `max_failed` 81) was
+set on CI's sema-pipeline census at d8e0cae5; the same local run at that
+commit measures 100 failed, so local and CI counts differ by about 19 and
+the ratchet compares against CI's. Between d8e0cae5 and 2b815152 six tests
+regressed, bisected and fixed: `annotations/spreadOperatorInAnnotationArguments`
+(sema took a vararg annotation parameter of its own class for a cycle) and
+five value-class ones from a2e7d190's scalar value classes
+(`fullValueClasses/construction` and `vararg`,
+`inlineClasses/interfaceDelegation/memberFunDelegatedToInlineClass{Int,Long}`,
+`inlineClasses/kt57973`): a call through an inherited defaults bridge, a
+`by` delegate slot and a vararg parameter read must hold the instance, and
+a value class delegating `by` its value is no scalar class
+(`value-classes.md`).
+
 ## State (2026-09-09, inherited-default-order, CI green)
 
 Census 6040 passed / 316 failed / 1 did not complete, **zero crashes**
@@ -62,7 +80,8 @@ name, mixed Char comparisons, collection type-check bridges,
   become numbered files under `/tmp/klio_itest_box_home/cases/<path>/`; a
   synthesized `__box_main.kt` throws unless `box() == "OK"`; the
   `WITH_COROUTINES` helpers are appended; `OPTIONAL_JVM_INLINE_ANNOTATION`
-  becomes `@JvmInline`.
+  becomes `@JvmInline`; `LANGUAGE` passes `--language=` and `OPT_IN`
+  `--opt-in=`, as kotlinc's test harness passes its compiler flags.
 - One directory: `KLIO_ITEST_BIN=zig-out/bin/klio-harness
   KLIO_BOX_FILTER=enum/ KLIO_BOX_JOBS=4 zig-out/bin/klio-census box`
   (`KLIO_BOX_FILTER` is a path substring; `enum` also matches `enumEntries`).

@@ -142,6 +142,8 @@ pub const Case = struct {
     backend_marker: bool = false,
     /// `// LANGUAGE: +Feature …` specs, passed to the child as `--language=`.
     language: []const u8 = "",
+    /// `// OPT_IN: pkg.Marker` names, passed to the child as `--opt-in=`.
+    opt_in: []const u8 = "",
     package: ?[]const u8 = null,
 };
 
@@ -188,6 +190,8 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                 } else if (std.mem.eql(u8, d.name, "LANGUAGE")) {
                     if (languageDisablesFeature(d.value)) reason = reason orelse "LANGUAGE:-feature";
                     c.language = d.value;
+                } else if (std.mem.eql(u8, d.name, "OPT_IN")) {
+                    c.opt_in = if (c.opt_in.len == 0) d.value else try std.fmt.allocPrint(a, "{s},{s}", .{ c.opt_in, d.value });
                 } else if ((std.mem.eql(u8, d.name, "IGNORE_BACKEND") or std.mem.eql(u8, d.name, "IGNORE_BACKEND_K2")) and
                     std.mem.find(u8, d.value, "ANY") != null)
                 {
@@ -481,6 +485,7 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
         try argv.append(a, bin);
         try argv.append(a, "run");
         if (case.language.len != 0) try argv.append(a, try std.fmt.allocPrint(a, "--language={s}", .{case.language}));
+        if (case.opt_in.len != 0) try argv.append(a, try std.fmt.allocPrint(a, "--opt-in={s}", .{case.opt_in}));
         for (case.sections, 0..) |s, si| {
             const base = std.fs.path.basename(s.name);
             const fname = try std.fmt.allocPrint(a, "{d}_{s}", .{ si, base });

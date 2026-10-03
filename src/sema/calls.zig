@@ -20,11 +20,13 @@ const symbols = @import("symbols.zig");
 const types = @import("types.zig");
 const names_mod = @import("names.zig");
 const headers = @import("headers.zig");
+const decls = @import("decls.zig");
 const scope_mod = @import("scope.zig");
 const subtyping = @import("subtyping.zig");
 const members = @import("members.zig");
 const records = @import("records.zig");
 const census_mod = @import("census.zig");
+const declcheck = @import("declcheck.zig");
 const infer = @import("infer.zig");
 const body = @import("body.zig");
 
@@ -167,6 +169,9 @@ pub const Cand = struct {
     on_value: bool = false,
     /// `invoke` on a value of a composable function type.
     composable_value: bool = false,
+    /// `invoke` named on a value that may be null: the value's type, which
+    /// kotlinc reports the call on.
+    nullable_value: TypeId = .none,
     /// How the call runs, where the candidate's kind alone does not say:
     /// through `super`, a constructor delegation, a SAM constructor.
     form: records.CallForm = .plain,
@@ -208,6 +213,10 @@ const Applied = struct {
 
 pub var empty_subst: types.Subst = .empty;
 
+/// A call as written: where its callee is, and its argument labels' places
+/// and type arguments.
+pub const CallSite = struct { callee: Span, extra: *const ast.CallExtra };
+
 // -------------------------------------------------------------- entry ----
 
 pub fn call(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId {
@@ -232,11 +241,14 @@ pub fn call(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId 
         try body.applyFacts(ctx, facts);
         const args = try prepareArgs(ctx, c.args, c.argNames());
         const type_args = try explicitTypeArgs(ctx, c.typeArgs());
-        const t = try memberCall(ctx, rt, .expr, m.name, args, c.has_trailing_lambda, type_args, expected, true);
+        const t = try memberCall(ctx, rt, .expr, m.name, args, c.has_trailing_lambda, type_args, expected, true, null);
         return s.types.makeNullable(t);
     }
     const args = try prepareArgs(ctx, c.args, c.argNames());
     const type_args = try explicitTypeArgs(ctx, c.typeArgs());
+    const saved_site = ctx.call_site;
+    defer ctx.call_site = saved_site;
+    ctx.call_site = if (c.extra) |x| .{ .callee = calleeSpan(c.callee), .extra = x } else null;
     switch (c.callee.*) {
         .Path => |p| {
             if (p.segments.len == 1) {
@@ -253,13 +265,13 @@ pub fn call(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId 
                 switch (head.kind) {
                     .package => return packageCall(ctx, head.pkg, last, args, c.has_trailing_lambda, type_args, expected),
                     .classifier => return staticCall(ctx, head.cls, prefix[prefix.len - 1].span, last, args, c.has_trailing_lambda, type_args, expected),
-                    .value => return memberCall(ctx, head.ty, .expr, last, args, c.has_trailing_lambda, type_args, expected, false),
+                    .value => return memberCall(ctx, head.ty, .expr, last, args, c.has_trailing_lambda, type_args, expected, false, dotBefore(last)),
                     .none => unreachable,
                 }
             }
             // A value or classifier prefix followed by more members.
             const recv_t = try body.qualifiedAccessPrefix(ctx, prefix, head);
-            return memberCall(ctx, recv_t, .expr, last, args, c.has_trailing_lambda, type_args, expected, false);
+            return memberCall(ctx, recv_t, .expr, last, args, c.has_trailing_lambda, type_args, expected, false, dotBefore(last));
         },
         .Member => |m| {
             if (m.receiver.* == .Super) return superCall(ctx, m.receiver.Super, m.name, args, c.has_trailing_lambda, type_args, expected);
@@ -271,7 +283,7 @@ pub fn call(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId 
                 }
             }
             const rt = try body.receiverExpr(ctx, m.receiver);
-            const t = try memberCall(ctx, rt, .expr, m.name, args, c.has_trailing_lambda, type_args, expected, m.safe);
+            const t = try memberCall(ctx, rt, .expr, m.name, args, c.has_trailing_lambda, type_args, expected, m.safe, memberDot(c.callee));
             return if (m.safe) s.types.makeNullable(t) else t;
         },
         else => {
@@ -280,6 +292,29 @@ pub fn call(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId 
             return invokeValue(ctx, vt, c.callee.span(), .none, .none, .expr, args, c.has_trailing_lambda, expected);
         },
     }
+}
+
+/// The `.` before a path segment: a path is names joined by dots.
+pub fn dotBefore(seg: ast.Ident) Span {
+    const at = seg.span.start -| 1;
+    return Span.init(seg.span.file, at, at + 1);
+}
+
+/// Where a member access's `.` is written.
+pub fn memberDot(e: *const Expr) Span {
+    const m = e.Member;
+    if (m.dot == 0) return dotBefore(m.name);
+    return Span.init(m.name.span.file, m.dot, m.dot + 1);
+}
+
+/// Where a call names what it calls: the last segment of a path, a
+/// member's name, else the callee expression.
+fn calleeSpan(callee: *const Expr) Span {
+    return switch (callee.*) {
+        .Path => |p| p.segments[p.segments.len - 1].span,
+        .Member => |m| m.name.span,
+        else => callee.span(),
+    };
 }
 
 /// Types a call's arguments before its candidates are checked. A lambda,
@@ -478,7 +513,7 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
                         try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
                     },
                     .property => {
-                        const pt = try members.memberType(s, m);
+                        const pt = try body.implicitPropertyType(ctx, r, rt, m);
                         try appendInvokes(ctx, &member_level, pt, m.sym, recv);
                         try ext_props.append(s.arena, pt);
                         try ext_syms.append(s.arena, m.sym);
@@ -583,22 +618,57 @@ fn bareCall(ctx: *Ctx, id: ast.Ident, args: []Arg, trailing: bool, type_args: []
         try appendValueInvokes(ctx, &value_level, cls);
         if (value_level.items.len != 0) try levels.append(s.arena, value_level);
     }
+    // An implicit receiver that may be null (`this` in `fun K?.f()`) has
+    // its non-null type's members only unsafely: kotlinc takes one when
+    // nothing else applies, and reports it.
+    if (try implicitUnsafe(ctx, n)) |u| if (!try anyApplies(ctx, levels.items, args, trailing, type_args, expected) and try anyApplies(ctx, &.{u.level}, args, trailing, type_args, expected)) {
+        try reportUnsafe(ctx, .{ .at = id.span, .factory = .UNSAFE_CALL }, u.rt);
+        return resolveLevels(ctx, &.{u.level}, id, args, trailing, type_args, expected);
+    };
     return resolveLevels(ctx, levels.items, id, args, trailing, type_args, expected);
+}
+
+/// The innermost implicit receiver that may be null and whose non-null
+/// type has callables named `n`: those callables, dispatched on it.
+fn implicitUnsafe(ctx: *Ctx, n: Name) Allocator.Error!?struct { level: Level, rt: TypeId } {
+    const s = ctx.s;
+    for (try body.implicitReceivers(ctx)) |r| {
+        const rt = try body.narrowedReceiver(ctx, r);
+        if (!try subtyping.admitsNull(s, rt) or s.types.isErr(rt)) continue;
+        const nn = try s.types.definitelyNotNull(rt);
+        const recv: Receiver = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } };
+        var level = newLevel();
+        for (try members.lookup(s, nn, n, .callable)) |m| {
+            switch (s.syms.kind(m.sym)) {
+                .function => {
+                    try headers.functionHeader(s, m.sym);
+                    if (s.syms.functionInfo(m.sym).receiver != .none) continue;
+                    try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv, .defaults = m.defaults });
+                },
+                .property => try appendInvokes(ctx, &level, try members.memberType(s, m), m.sym, recv),
+                else => {},
+            }
+        }
+        if (level.items.len != 0) return .{ .level = level, .rt = rt };
+    }
+    return null;
 }
 
 /// `a f b`: `a.f(b)` for an `infix` function `f` only, so an infix
 /// extension is chosen over a member that is not infix
 /// (`infix fun Int.rem(other: Int)` for `5 rem 2`).
 fn infixCall(ctx: *Ctx, rt: TypeId, id: ast.Ident, args: []Arg, expected: TypeId) Allocator.Error!TypeId {
-    return memberCallAs(ctx, rt, .expr, id, args, false, &.{}, expected, false, true);
+    return memberCallAs(ctx, rt, .expr, id, args, false, &.{}, expected, false, true, null);
 }
 
 /// `recv.f(args)` on a value of type `rt`.
-pub fn memberCall(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId, safe: bool) Allocator.Error!TypeId {
-    return memberCallAs(ctx, rt_lit, recv_src, id, args, trailing, type_args, expected, safe, false);
+/// `unsafe_at`: where the call's `.` is written, for a receiver that may be
+/// null; null where the receiver cannot be (an implicit one, `?.`).
+pub fn memberCall(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId, safe: bool, unsafe_at: ?Span) Allocator.Error!TypeId {
+    return memberCallAs(ctx, rt_lit, recv_src, id, args, trailing, type_args, expected, safe, false, unsafe_at);
 }
 
-fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId, safe: bool, infix_only: bool) Allocator.Error!TypeId {
+fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId, safe: bool, infix_only: bool, unsafe_at: ?Span) Allocator.Error!TypeId {
     const s = ctx.s;
     const rt_in = try literalReceiver(s, rt_lit);
     // A safe call sees the receiver not null: `T & Any` for a type
@@ -610,57 +680,20 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
         return s.types.errType();
     }
     const n = try ctx.intern(id.name);
-    var levels: std.ArrayList(Level) = .empty;
-    var member_level = newLevel();
     // A receiver that may be null (`String?`, an unbounded `T`) has no
     // members without a safe call; the extensions that take a nullable
     // receiver apply (`Any?.toString()`).
     const members_apply = !try subtyping.admitsNull(s, rt);
-    // `content.invoke()` on a composable function value.
-    const comp_invoke = n == wk.invoke and try composableFunctionType(s, rt);
-    if (members_apply) for (try members.lookup(s, rt, n, .callable)) |m| {
-        switch (s.syms.kind(m.sym)) {
-            .function => {
-                try headers.functionHeader(s, m.sym);
-                if (s.syms.functionInfo(m.sym).receiver != .none) continue;
-                try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .composable_value = comp_invoke, .defaults = m.defaults });
-            },
-            .property => try appendInvokes(ctx, &member_level, try members.memberType(s, m), m.sym, recv_src),
-            else => {},
+    // Without `?.`, a receiver that may be null takes a member, or an
+    // extension of its non-null type, only when nothing applies on it as it
+    // is: kotlinc resolves the call on the non-null type and reports it.
+    if (unsafe_at) |at| if (!safe and !members_apply) {
+        if (try unsafeReceiver(ctx, rt, recv_src, n, args, trailing, type_args, expected)) |nn| {
+            try reportUnsafe(ctx, .{ .at = at, .factory = .UNSAFE_CALL }, rt);
+            return memberCallAs(ctx, nn, recv_src, id, args, trailing, type_args, expected, false, infix_only, null);
         }
     };
-    // An inner class's constructor on an outer instance: `outer.Inner()`,
-    // or through a type alias of it: `outer.InnerAlias()`.
-    if (s.types.classSym(rt) != .none) {
-        const nested = try scope_mod.nestedClassifier(s, s.types.classSym(rt), n);
-        if (nested != .none and s.syms.kind(nested) == .class and s.syms.flags(nested).inner) {
-            try appendCtorsVia(ctx, &member_level, nested, .{ .dispatch = recv_src }, rt);
-        }
-        // An alias is found by its name in scope, not among the receiver's
-        // members: a nested alias of an enclosing class, then a top-level
-        // one. Outside `Outer`, `outer.A()` for its nested alias `A` names
-        // nothing.
-        if (member_level.items.len == 0) {
-            const alias = try scope_mod.classifierInContext(s, body.typeCtx(ctx).decl, ctx.file, n);
-            if (try innerAliasOn(s, alias, rt)) try appendAliasCtorsOn(ctx, &member_level, alias, recv_src, rt);
-        }
-        if (member_level.items.len == 0) {
-            for (try topLevelTiers(ctx, n)) |tier| {
-                for (tier) |m| {
-                    if (!try innerAliasOn(s, m, rt)) continue;
-                    try appendAliasCtorsOn(ctx, &member_level, m, recv_src, rt);
-                }
-                if (member_level.items.len != 0) break;
-            }
-        }
-    }
-    if (member_level.items.len != 0) try levels.append(s.arena, member_level);
-    // A value of extension-function type named `n`, with the receiver as
-    // its receiver: `recv.block()`.
-    const rinv = try receiverInvokeLevel(ctx, n, rt, recv_src);
-    if (rinv.items.len != 0) try levels.append(s.arena, rinv);
-    try appendExtensionLevels(ctx, &levels, n, recv_src, rt, false);
-    try appendExtPropInvokeLevel(ctx, &levels, n, rt, recv_src);
+    const levels = try receiverLevels(ctx, rt, recv_src, n);
     // The functions an infix call names that are not `infix`: when no
     // other candidate is left, the call is theirs, and kotlinc asks for the
     // modifier.
@@ -716,6 +749,219 @@ fn memberCallAs(ctx: *Ctx, rt_lit: TypeId, recv_src: Receiver, id: ast.Ident, ar
         return s.types.errType();
     }
     return resolveLevels(ctx, levels.items, id, args, trailing, type_args, expected);
+}
+
+/// The levels a call named `n` on a receiver of type `rt` takes its
+/// candidates from: the receiver's members (none when it may be null), an
+/// inner class's constructors, a value of extension-function type, then
+/// the extensions.
+fn receiverLevels(ctx: *Ctx, rt: TypeId, recv_src: Receiver, n: Name) Allocator.Error!std.ArrayList(Level) {
+    const s = ctx.s;
+    var levels: std.ArrayList(Level) = .empty;
+    var member_level = newLevel();
+    const members_apply = !try subtyping.admitsNull(s, rt);
+    // `content.invoke()` on a composable function value.
+    const comp_invoke = n == wk.invoke and try composableFunctionType(s, rt);
+    if (members_apply) for (try members.lookup(s, rt, n, .callable)) |m| {
+        switch (s.syms.kind(m.sym)) {
+            .function => {
+                try headers.functionHeader(s, m.sym);
+                if (s.syms.functionInfo(m.sym).receiver != .none) continue;
+                try member_level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = recv_src, .composable_value = comp_invoke, .defaults = m.defaults });
+            },
+            .property => try appendInvokes(ctx, &member_level, try members.memberType(s, m), m.sym, recv_src),
+            else => {},
+        }
+    };
+    // An inner class's constructor on an outer instance: `outer.Inner()`,
+    // or through a type alias of it: `outer.InnerAlias()`.
+    if (s.types.classSym(rt) != .none) {
+        const nested = try scope_mod.nestedClassifier(s, s.types.classSym(rt), n);
+        if (nested != .none and s.syms.kind(nested) == .class and s.syms.flags(nested).inner) {
+            try appendCtorsVia(ctx, &member_level, nested, .{ .dispatch = recv_src }, rt);
+        }
+        // An alias is found by its name in scope, not among the receiver's
+        // members: a nested alias of an enclosing class, then a top-level
+        // one. Outside `Outer`, `outer.A()` for its nested alias `A` names
+        // nothing.
+        if (member_level.items.len == 0) {
+            const alias = try scope_mod.classifierInContext(s, body.typeCtx(ctx).decl, ctx.file, n);
+            if (try innerAliasOn(s, alias, rt)) try appendAliasCtorsOn(ctx, &member_level, alias, recv_src, rt);
+        }
+        if (member_level.items.len == 0) {
+            for (try topLevelTiers(ctx, n)) |tier| {
+                for (tier) |m| {
+                    if (!try innerAliasOn(s, m, rt)) continue;
+                    try appendAliasCtorsOn(ctx, &member_level, m, recv_src, rt);
+                }
+                if (member_level.items.len != 0) break;
+            }
+        }
+    }
+    if (member_level.items.len != 0) try levels.append(s.arena, member_level);
+    // A value of extension-function type named `n`, with the receiver as
+    // its receiver: `recv.block()`.
+    const rinv = try receiverInvokeLevel(ctx, n, rt, recv_src);
+    if (rinv.items.len != 0) try levels.append(s.arena, rinv);
+    try appendExtensionLevels(ctx, &levels, n, recv_src, rt, false);
+    try appendExtPropInvokeLevel(ctx, &levels, n, rt, recv_src);
+    return levels;
+}
+
+/// The receiver's non-null type when a call on a receiver that may be null
+/// is unsafe: nothing applies on the receiver as it is, and on its non-null
+/// type a member or an extension takes the receiver. Null otherwise.
+fn unsafeReceiver(ctx: *Ctx, rt: TypeId, recv_src: Receiver, n: Name, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId) Allocator.Error!?TypeId {
+    const s = ctx.s;
+    const as_is = try receiverLevels(ctx, rt, recv_src, n);
+    if (try anyApplies(ctx, as_is.items, args, trailing, type_args, expected)) return null;
+    const nn = try s.types.definitelyNotNull(rt);
+    if (nn == rt or s.types.isErr(nn)) return null;
+    const non_null = try receiverLevels(ctx, nn, recv_src, n);
+    return if (try someTakesReceiver(ctx, non_null.items, args, trailing)) nn else null;
+}
+
+/// Whether a candidate of `levels` takes its receiver, whatever its
+/// arguments do.
+fn someTakesReceiver(ctx: *Ctx, levels: []const Level, args: []const Arg, trailing: bool) Allocator.Error!bool {
+    for (levels) |level| for (level.items) |cand| {
+        if (@intFromEnum(try inapplicability(ctx, cand, args, trailing)) >= @intFromEnum(Inapplicability.mapping)) return true;
+    };
+    return false;
+}
+
+/// Whether some candidate of `levels` accepts the call.
+fn anyApplies(ctx: *Ctx, levels: []const Level, args: []Arg, trailing: bool, type_args: []const TypeId, expected: TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    s.census.muted += 1;
+    defer s.census.muted -= 1;
+    for (levels) |level| for (level.items) |cand| {
+        if (try check(ctx, cand, args, trailing, type_args, expected) != null) return true;
+    };
+    return false;
+}
+
+/// A call in a public inline function, whose body is copied into its
+/// callers, of a function they cannot see: kotlinc's
+/// `NON_PUBLIC_CALL_FROM_PUBLIC_INLINE`, unless the callee is
+/// `@PublishedApi`.
+fn checkPublishedCall(ctx: *Ctx, f: Sym, at: Span) Allocator.Error!void {
+    const s = ctx.s;
+    if (s.syms.kind(f) != .function) return;
+    const vis = s.syms.flags(f).visibility;
+    if (vis != .private and vis != .internal) return;
+    if (try publishedApi(s, f)) return;
+    // The named function the call is in, through any function literals.
+    var sc: ?*body.Scope = ctx.scope;
+    const outer: Sym = while (sc) |c| : (sc = c.parent) {
+        if (c.kind != .function or c.owner == .none) continue;
+        if (s.syms.get(c.owner).decl == .function) break c.owner;
+    } else return;
+    if (!s.syms.flags(outer).inline_ or !try effectivelyPublic(s, outer)) return;
+    // A function local to the inline one is part of its body.
+    if (s.syms.owner(f) == outer) return;
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc)) return;
+    if (s.syms.flags(f).inline_) {
+        const msg = "Public-API inline function cannot access non-public-API inline function as it could transitively access non-public-API declarations.";
+        try ctx.reportFacts(.declaration, at, .{ .message = msg, .factory = .NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE }, "{s}", .{msg});
+        return;
+    }
+    const msg = "Public-API inline function cannot access non-public-API function.";
+    try ctx.reportFacts(.declaration, at, .{ .message = msg, .factory = .NON_PUBLIC_CALL_FROM_PUBLIC_INLINE }, "{s}", .{msg});
+}
+
+/// Whether `sym` is seen outside its module: public or protected, as is every
+/// class around it, or marked `@PublishedApi`.
+fn effectivelyPublic(s: *Sema, sym: Sym) Allocator.Error!bool {
+    var cur = sym;
+    while (cur != .none and s.syms.kind(cur) != .package) : (cur = s.syms.owner(cur)) {
+        switch (s.syms.kind(cur)) {
+            .function, .class, .property, .constructor => {},
+            // Local: inside a body.
+            else => return false,
+        }
+        if (cur != sym and s.syms.kind(cur) == .function) return false;
+        const vis = s.syms.flags(cur).visibility;
+        if ((vis == .private or vis == .internal) and !try publishedApi(s, cur)) return false;
+    }
+    return true;
+}
+
+/// Whether a declaration is annotated `@PublishedApi`.
+fn publishedApi(s: *Sema, sym: Sym) Allocator.Error!bool {
+    if (try annotatedPublishedApi(s, sym)) return true;
+    // An actual is published where its expect is.
+    if (!s.syms.flags(sym).actual) return false;
+    const owner = s.syms.owner(sym);
+    if (owner == .none or s.syms.kind(owner) != .package) return false;
+    const list = s.syms.packageInfo(owner).members.get(s.syms.name(sym)) orelse return false;
+    for (list.items) |e| {
+        if (e == sym or !s.syms.flags(e).expect or s.syms.kind(e) != s.syms.kind(sym)) continue;
+        if (s.syms.kind(e) == .function and !try decls.sameErasedSignature(s, e, sym)) continue;
+        if (try annotatedPublishedApi(s, e)) return true;
+    }
+    return false;
+}
+
+fn annotatedPublishedApi(s: *Sema, sym: Sym) Allocator.Error!bool {
+    for (try headers.annotationClasses(s, sym, .decl)) |c| {
+        if (c != .none and std.mem.eql(u8, s.str(s.syms.classInfo(c).fqn), "kotlin.PublishedApi")) return true;
+    }
+    return false;
+}
+
+/// A call of suspend function `f` where it is written: in a suspend function
+/// or a suspend lambda, through any lambdas run in place between. Elsewhere
+/// kotlinc refuses it: `NON_LOCAL_SUSPENSION_POINT` when a suspend function
+/// or lambda encloses the function literal or local function it is in,
+/// `ILLEGAL_SUSPEND_FUNCTION_CALL` otherwise.
+fn checkSuspendCall(ctx: *Ctx, f: Sym, at: Span) Allocator.Error!void {
+    const s = ctx.s;
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc)) return;
+    var crossed = false;
+    var sc: ?*body.Scope = ctx.scope;
+    while (sc) |c| : (sc = c.parent) {
+        switch (c.kind) {
+            .lambda, .function => {
+                const literal = c.kind == .lambda or (c.owner != .none and s.syms.get(c.owner).decl == .anon_fun);
+                const runs: body.Runs = if (literal) c.runs else if (c.owner != .none and s.syms.flags(c.owner).suspend_) .suspend_ else .plain;
+                switch (runs) {
+                    .suspend_ => {
+                        if (!crossed) return;
+                        const msg = "Suspension functions can only be called within coroutine body.";
+                        try ctx.reportFacts(.declaration, at, .{ .message = msg, .factory = .NON_LOCAL_SUSPENSION_POINT }, "{s}", .{msg});
+                        return;
+                    },
+                    .in_place => {},
+                    // A literal whose type is not known yet says nothing.
+                    .unknown => return,
+                    .plain => crossed = true,
+                }
+            },
+            .class => crossed = true,
+            .file, .block => {},
+        }
+    }
+    const msg = try std.fmt.allocPrint(s.arena, "Suspend function '{s}' can only be called from a coroutine or another suspend function.", .{try sema_mod.diagnose.declarationText(s, s.arena, f)});
+    try ctx.reportFacts(.declaration, at, .{ .message = msg, .factory = .ILLEGAL_SUSPEND_FUNCTION_CALL }, "{s}", .{msg});
+}
+
+/// Where a member, operator, `invoke` or iteration on a value that may be
+/// null is written, and the diagnostic kotlinc gives it there.
+pub const Unsafe = struct { at: Span, factory: census_mod.Factory };
+
+pub fn reportUnsafe(ctx: *Ctx, u: Unsafe, t: TypeId) Allocator.Error!void {
+    const s = ctx.s;
+    const tt = try sema_mod.diagnose.typeText(s, s.arena, t);
+    const msg = switch (u.factory) {
+        .UNSAFE_OPERATOR_CALL => try std.fmt.allocPrint(s.arena, "Operator call is prohibited on a nullable receiver of type '{s}'. Use '?.'-qualified call instead.", .{tt}),
+        .UNSAFE_IMPLICIT_INVOKE_CALL => try std.fmt.allocPrint(s.arena, "Reference has a nullable type '{s}'. Use explicit '?.invoke' to make a function-like call instead.", .{tt}),
+        .ITERATOR_ON_NULLABLE => "Non-nullable value required to call an 'iterator()' method in a for-loop.",
+        else => try std.fmt.allocPrint(s.arena, "Only safe (?.) or non-null asserted (!!.) calls are allowed on a nullable receiver of type '{s}'.", .{tt}),
+    };
+    try ctx.reportFacts(.null_safety, u.at, .{ .message = msg, .factory = u.factory }, "{s}", .{msg});
 }
 
 /// `Cls.f(args)`: a member of the class's companion or of the object, a
@@ -1063,12 +1309,14 @@ fn appendInvokesVia(ctx: *Ctx, level: *Level, vt: TypeId, via: Sym, via_dispatch
     if (s.types.isErr(vt)) return;
     const k = contextCount(s, vt);
     const comp = try composableFunctionType(s, vt);
+    // A member `invoke` on a value that may be null is an unsafe call.
+    const nullable: TypeId = if (try subtyping.admitsNull(s, vt)) vt else .none;
     for (try members.lookup(s, vt, wk.invoke, .function)) |m| {
         if (!try members.isOperator(s, m.sym)) continue;
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true, .composable_value = comp });
+        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .on_value = true, .composable_value = comp, .nullable_value = nullable });
         // A contextual function value is also invoked with its contexts
         // taken from the scope.
-        if (k != 0) try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .ctx_scope = k, .on_value = true, .composable_value = comp });
+        if (k != 0) try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .via_extension = via_extension, .ctx_scope = k, .on_value = true, .composable_value = comp, .nullable_value = nullable });
     }
     for (try extensionFunctions(ctx, wk.invoke)) |x| {
         if (!try members.isOperator(s, x.sym)) continue;
@@ -1096,8 +1344,9 @@ fn appendReceiverInvokes(ctx: *Ctx, level: *Level, vt: TypeId, via: Sym, via_dis
     const shape = functionShape(s, nn) orelse return;
     if (!shape.has_receiver) return;
     const comp = try composableFunctionType(s, nn);
+    const nullable: TypeId = if (nn != vt and try subtyping.admitsNull(s, vt)) vt else .none;
     for (try members.lookup(s, nn, wk.invoke, .function)) |m| {
-        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .recv_arg_ty = recv_ty, .recv_arg_src = recv_src, .ctx_scope = @intCast(shape.contexts), .on_value = true, .composable_value = comp });
+        try level.append(s.arena, .{ .sym = m.sym, .subst = m.subst, .dispatch = .expr, .via = via, .via_dispatch = via_dispatch, .recv_arg_ty = recv_ty, .recv_arg_src = recv_src, .ctx_scope = @intCast(shape.contexts), .on_value = true, .composable_value = comp, .nullable_value = nullable });
     }
 }
 
@@ -1115,9 +1364,10 @@ fn receiverInvokeLevel(ctx: *Ctx, n: Name, recv_ty: TypeId, recv_src: Receiver) 
     }
     if (level.items.len != 0) return level;
     for (try body.implicitReceivers(ctx)) |r| {
-        for (try members.lookup(s, try body.narrowedReceiver(ctx, r), n, .property)) |m| {
+        const rt = try body.narrowedReceiver(ctx, r);
+        for (try members.lookup(s, rt, n, .property)) |m| {
             if (s.syms.kind(m.sym) != .property) continue;
-            try appendReceiverInvokes(ctx, &level, try members.memberType(s, m), m.sym, .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, recv_ty, recv_src);
+            try appendReceiverInvokes(ctx, &level, try body.implicitPropertyType(ctx, r, rt, m), m.sym, .{ .implicit = .{ .kind = r.kind, .owner = r.owner } }, recv_ty, recv_src);
         }
         if (level.items.len != 0) return level;
     }
@@ -1388,6 +1638,7 @@ fn resolveLevels(ctx: *Ctx, levels: []const Level, id: ast.Ident, args: []Arg, t
     }
     try finishArgsBlind(ctx, args);
     if (any_candidate) {
+        if (try reportInapplicable(ctx, levels, id, args, trailing, type_args)) return s.types.errType();
         try ctx.reportFacts(.no_applicable, id.span, .{ .name = id.name, .arg_types = try argTypes(ctx, args), .syms = try levelSyms(ctx, levels) }, "{s}({s})", .{ id.name, try argTypesText(ctx, args) });
     } else {
         try ctx.report(.unresolved_call, id.span, "{s}", .{id.name});
@@ -1482,14 +1733,7 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
     }
     try headers.functionHeader(s, cand.sym);
     const params = candParams(s, cand);
-    const args: []Arg = if (cand.recv_arg_ty != .none) blk: {
-        const out = try s.arena.alloc(Arg, call_args.len + 1);
-        const placeholder = try s.arena.create(Expr);
-        placeholder.* = .{ .NullLit = .{ .span = if (call_args.len != 0) call_args[0].expr.span() else span.Span.init(span.FileId.from(0), 0, 0) } };
-        out[0] = .{ .expr = placeholder, .ty = cand.recv_arg_ty };
-        @memcpy(out[1..], call_args);
-        break :blk out;
-    } else try s.arena.dupe(Arg, call_args);
+    const args = try candArgs(ctx, cand, call_args);
     const slots = (try mapArgs(ctx, cand.sym, cand.defaults, params, args, trailing)) orelse {
         traceReject(ctx, cand, "arguments do not map to {d} parameters", .{params.len});
         return null;
@@ -1630,6 +1874,367 @@ fn check(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool, type_arg
     }
     return .{ .cand = cand, .sys = sys, .args = args, .slots = slots, .uses_default = uses_default, .uses_vararg = uses_vararg, .generic = tps.len != 0, .contexts = contexts.items, .conv = conv };
 }
+
+/// How far a candidate gets before it fails, ranked as kotlinc ranks it: a
+/// receiver that does not fit (below it, one a default import brings, which
+/// kotlinc does not name), then arguments that do not map to its
+/// parameters, then an argument that does not fit its parameter. kotlinc
+/// reports the candidates that fail latest, and names the problems of one
+/// that is alone there.
+const Inapplicability = enum(u8) { hidden, default_receiver, receiver, mapping, argument };
+
+/// Where `cand` fails for the call, its stages in kotlinc's order.
+fn inapplicability(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool) Allocator.Error!Inapplicability {
+    const s = ctx.s;
+    if (s.syms.flags(cand.sym).hidden) return .hidden;
+    try headers.functionHeader(s, cand.sym);
+    const info = s.syms.functionInfo(cand.sym);
+    if (cand.extension != .none or cand.outer_want != .none) {
+        if (cand.extension != .none and info.receiver == .none) return .receiver;
+        var sys = infer.System.init(s);
+        const tps = try candTypeParams(s, cand);
+        try sys.addTypeParams(tps);
+        _ = try sys.addDeclaredBounds(tps, cand.subst);
+        if (cand.extension != .none) {
+            const want = try sys.open(try s.types.substitute(info.receiver, cand.subst));
+            if (!try sys.constrain(cand.ext_ty, want)) return wrongReceiver(ctx, cand);
+        }
+        if (cand.outer_want != .none and !try sys.constrain(cand.outer_arg, try sys.open(cand.outer_want))) return .receiver;
+    }
+    const args = try candArgs(ctx, cand, call_args);
+    if ((try mapArgs(ctx, cand.sym, cand.defaults, candParams(s, cand), args, trailing)) == null) return .mapping;
+    return .argument;
+}
+
+/// A candidate whose arguments map to its parameters, as `check` would
+/// apply it, for comparing its parameters with another's: its types are
+/// not inferred.
+fn mappedOnly(ctx: *Ctx, cand: Cand, call_args: []const Arg, trailing: bool) Allocator.Error!Applied {
+    const s = ctx.s;
+    const params = candParams(s, cand);
+    const args = try candArgs(ctx, cand, call_args);
+    const slots = (try mapArgs(ctx, cand.sym, cand.defaults, params, args, trailing)).?;
+    var uses_default: u16 = 0;
+    var uses_vararg = false;
+    for (params, 0..) |p, pi| {
+        var mapped = false;
+        var spread = false;
+        for (slots, args) |sl, a| if (sl.param == pi) {
+            mapped = true;
+            if (a.spread) spread = true;
+        };
+        if (!mapped and !s.syms.flags(p).vararg) uses_default += 1;
+        if (s.syms.flags(p).vararg and !spread) uses_vararg = true;
+    }
+    const tps = try candTypeParams(s, cand);
+    return .{ .cand = cand, .sys = infer.System.init(s), .args = args, .slots = slots, .uses_default = uses_default, .uses_vararg = uses_vararg, .generic = tps.len != 0 };
+}
+
+/// A candidate whose receiver does not fit: kotlinc names one the program
+/// declares or imports, and passes over one a default import brings
+/// (`x.trim()` on an `Any` is an unresolved reference).
+fn wrongReceiver(ctx: *Ctx, cand: Cand) Allocator.Error!Inapplicability {
+    const s = ctx.s;
+    const pkg = s.syms.packageOf(cand.sym);
+    const own = if (s.fileOf(ctx.file)) |fc| fc.package else Sym.none;
+    if (pkg == own) return .receiver;
+    for (try scope_mod.defaultPackages(s)) |level| {
+        if (std.mem.indexOfScalar(Sym, level, pkg) != null) return .default_receiver;
+    }
+    return .receiver;
+}
+
+/// The arguments as `cand` sees them: the call's, with the receiver first
+/// for an extension-function-type `invoke`.
+fn candArgs(ctx: *Ctx, cand: Cand, call_args: []const Arg) Allocator.Error![]Arg {
+    const s = ctx.s;
+    if (cand.recv_arg_ty == .none) return s.arena.dupe(Arg, call_args);
+    const out = try s.arena.alloc(Arg, call_args.len + 1);
+    const placeholder = try s.arena.create(Expr);
+    placeholder.* = .{ .NullLit = .{ .span = if (call_args.len != 0) call_args[0].expr.span() else span.Span.init(span.FileId.from(0), 0, 0) } };
+    out[0] = .{ .expr = placeholder, .ty = cand.recv_arg_ty };
+    @memcpy(out[1..], call_args);
+    return out;
+}
+
+/// A call no candidate accepts, reported as kotlinc reports it: the
+/// candidates that fail latest, `NONE_APPLICABLE` when they are several,
+/// else the one's problems, each where it is. False when the analysis is
+/// muted, or the one's problem is not one named here.
+fn reportInapplicable(ctx: *Ctx, levels: []const Level, id: ast.Ident, call_args: []const Arg, trailing: bool, type_args: []const TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    if (s.census.muted != 0) return false;
+    var best: Inapplicability = .hidden;
+    var group: std.ArrayList(Cand) = .empty;
+    var seen: std.ArrayList(Sym) = .empty;
+    for (levels) |level| for (level.items) |cand| {
+        if (std.mem.indexOfScalar(Sym, seen.items, cand.sym) != null) continue;
+        try seen.append(s.arena, cand.sym);
+        const r = try inapplicability(ctx, cand, call_args, trailing);
+        if (r == .hidden) continue;
+        if (@intFromEnum(r) > @intFromEnum(best)) {
+            best = r;
+            group.clearRetainingCapacity();
+        }
+        if (r == best) try group.append(s.arena, cand);
+    };
+    if (group.items.len == 0) return false;
+    var cand = group.items[0];
+    if (best == .default_receiver) {
+        try ctx.reportFacts(.unresolved_member, id.span, .{ .name = id.name, .on = try sema_mod.diagnose.typeText(s, s.arena, cand.ext_ty) }, "{s}", .{id.name});
+        return true;
+    }
+    // Of candidates whose arguments map but do not fit, kotlinc names the
+    // most specific when there is one (`listOf<Int>("s")` is `listOf(element)`'s
+    // mismatch, not the vararg overload's).
+    if (best == .argument and group.items.len > 1) {
+        const apps = try s.arena.alloc(Applied, group.items.len);
+        for (group.items, apps) |c, *app| app.* = try mappedOnly(ctx, c, call_args, trailing);
+        const chosen = try mostSpecificByTypes(ctx, apps, call_args);
+        if (!chosen.ambiguous) {
+            group.items[0] = group.items[chosen.index];
+            group.shrinkRetainingCapacity(1);
+            cand = group.items[0];
+        }
+    }
+    if (group.items.len > 1 and best != .receiver) {
+        const syms = try s.arena.alloc(Sym, group.items.len);
+        for (group.items, syms) |c, *o| o.* = c.sym;
+        try ctx.reportFacts(.no_applicable, id.span, .{ .name = id.name, .arg_types = try argTypes(ctx, call_args), .syms = syms }, "{s}({s})", .{ id.name, try argTypesText(ctx, call_args) });
+        return true;
+    }
+    if (best == .receiver) {
+        const msg = try std.fmt.allocPrint(s.arena, "Candidate '{s}' is inapplicable because of a receiver type mismatch.", .{try sema_mod.diagnose.declarationText(s, s.arena, cand.sym)});
+        try ctx.reportFacts(.no_applicable, id.span, .{ .name = id.name, .message = msg, .factory = .UNRESOLVED_REFERENCE_WRONG_RECEIVER }, "{s}", .{msg});
+        return true;
+    }
+    return argumentProblems(ctx, cand, id, call_args, trailing, type_args);
+}
+
+fn problem(ctx: *Ctx, at: span.Span, factory: census_mod.Factory, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+    const msg = try std.fmt.allocPrint(ctx.s.arena, fmt, args);
+    try ctx.reportFacts(.no_applicable, at, .{ .message = msg, .factory = factory }, "{s}", .{msg});
+}
+
+/// Where an argument's value is: past a spread's `*`.
+fn valueSpan(a: Arg) span.Span {
+    return if (a.expr.* == .Spread) a.expr.Spread.expr.span() else a.expr.span();
+}
+
+/// The extras of the call `call` is resolving when `id` is its callee.
+fn callSiteOf(ctx: *const Ctx, id: ast.Ident) ?*const ast.CallExtra {
+    const cs = ctx.call_site orelse return null;
+    if (cs.callee.start != id.span.start or cs.callee.end != id.span.end) return null;
+    return cs.extra;
+}
+
+/// The problems of `cand`, the one candidate a call fails latest on, as
+/// kotlinc names them: arguments that map to no parameter, parameters no
+/// argument passes, written type arguments outside their bounds, and
+/// arguments whose type does not fit. False when it finds none of these.
+fn argumentProblems(ctx: *Ctx, cand: Cand, id: ast.Ident, call_args: []const Arg, trailing: bool, type_args: []const TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    const params = candParams(s, cand);
+    const args = try candArgs(ctx, cand, call_args);
+    // An extension-function-type `invoke`'s receiver is the first argument.
+    const first: usize = if (cand.recv_arg_ty != .none) 1 else 0;
+    const extra = callSiteOf(ctx, id);
+    const decl = try sema_mod.diagnose.declarationText(s, s.arena, cand.sym);
+    var reported = false;
+    const slots = try s.arena.alloc(?Slot, args.len);
+    @memset(slots, null);
+    const filled = try s.arena.alloc(bool, params.len);
+    @memset(filled, false);
+    var pos: usize = 0;
+    for (args, 0..) |a, i| {
+        if (trailing and i + 1 == args.len and a.name == null) {
+            if (params.len != 0) {
+                const last: u16 = @intCast(params.len - 1);
+                if (!filled[last] or s.syms.flags(params[last]).vararg) {
+                    slots[i] = .{ .param = last };
+                    filled[last] = true;
+                    continue;
+                }
+            }
+            try problem(ctx, valueSpan(a), .TOO_MANY_ARGUMENTS, "Too many arguments for '{s}'.", .{decl});
+            reported = true;
+            continue;
+        }
+        if (a.name) |n| {
+            const name_at = if (extra) |x| (if (i >= first and i - first < x.arg_name_spans.len) x.arg_name_spans[i - first] else valueSpan(a)) else valueSpan(a);
+            var found: ?usize = null;
+            for (params, 0..) |p, pi| if (s.syms.name(p) == n) {
+                found = pi;
+            };
+            const pi = found orelse {
+                try problem(ctx, name_at, .NAMED_PARAMETER_NOT_FOUND, "No parameter with name '{s}' found.", .{s.str(n)});
+                reported = true;
+                continue;
+            };
+            const vararg = s.syms.flags(params[pi]).vararg;
+            if (filled[pi] and !vararg) {
+                try problem(ctx, name_at, .ARGUMENT_PASSED_TWICE, "Argument already passed for this parameter.", .{});
+                reported = true;
+                continue;
+            }
+            if (a.spread and !vararg) {
+                try problem(ctx, a.expr.span(), .NON_VARARG_SPREAD, "The spread operator (*foo) can only be applied in a vararg position.", .{});
+                reported = true;
+            }
+            filled[pi] = true;
+            slots[i] = .{ .param = @intCast(pi), .named_array = vararg and !a.spread };
+            if (pi >= pos) pos = pi + 1;
+            continue;
+        }
+        if (pos >= params.len) {
+            try problem(ctx, valueSpan(a), .TOO_MANY_ARGUMENTS, "Too many arguments for '{s}'.", .{decl});
+            reported = true;
+            continue;
+        }
+        if (s.syms.flags(params[pos]).vararg) {
+            slots[i] = .{ .param = @intCast(pos), .vararg_elem = !a.spread };
+            filled[pos] = true;
+            continue;
+        }
+        if (a.spread) {
+            try problem(ctx, a.expr.span(), .NON_VARARG_SPREAD, "The spread operator (*foo) can only be applied in a vararg position.", .{});
+            reported = true;
+        }
+        slots[i] = .{ .param = @intCast(pos) };
+        filled[pos] = true;
+        pos += 1;
+    }
+    for (params, filled) |p, f| {
+        if (f or s.syms.flags(p).vararg) continue;
+        if (try paramHasDefault(ctx, cand.sym, p)) continue;
+        if (try defaultIn(ctx, cand.defaults, s.syms.paramInfo(p).index)) continue;
+        try problem(ctx, id.span, .NO_VALUE_FOR_PARAMETER, "No value passed for parameter '{s}'.", .{s.str(s.syms.name(p))});
+        reported = true;
+    }
+
+    var sys = infer.System.init(s);
+    const tps = try candTypeParams(s, cand);
+    try sys.addTypeParams(tps);
+    _ = try sys.addDeclaredBounds(tps, cand.subst);
+    if (type_args.len != 0) {
+        const own = s.syms.functionInfo(cand.sym).type_params;
+        const pinned = if (s.syms.kind(cand.sym) == .constructor) tps else own;
+        if (type_args.len != pinned.len) return reported;
+        var violated = false;
+        for (pinned, type_args, 0..) |tp, ta, ti| {
+            if (ta == .none) continue;
+            const v = try sys.open(try s.types.param(tp, false));
+            var trial = try sys.clone();
+            defer trial.deinit();
+            if (try trial.constrain(ta, v) and try trial.constrain(v, ta)) {
+                _ = try sys.constrain(ta, v);
+                _ = try sys.constrain(v, ta);
+                continue;
+            }
+            violated = true;
+            const at = if (extra) |x| (if (ti < x.type_args.len) x.type_args[ti].span else id.span) else id.span;
+            const bound = for (try headers.typeParamBounds(s, tp)) |b| {
+                if (!try subtyping.isSubtype(s, ta, b)) break b;
+            } else s.t.any_q;
+            try problem(ctx, at, .UPPER_BOUND_VIOLATED, "Type argument is not within its bounds: type parameter '{s} (of {s})' must be subtype of '{s}', but actual: '{s}'.", .{
+                s.str(s.syms.name(tp)),
+                try typeParamOwnerText(s, tp),
+                try sema_mod.diagnose.typeText(s, s.arena, bound),
+                try sema_mod.diagnose.typeText(s, s.arena, ta),
+            });
+        }
+        if (violated) {
+            try problem(ctx, id.span, .INAPPLICABLE_CANDIDATE, "Inapplicable candidate(s): {s}", .{decl});
+            return true;
+        }
+    }
+    const info = s.syms.functionInfo(cand.sym);
+    if (cand.extension != .none and info.receiver != .none) {
+        _ = try sys.constrain(cand.ext_ty, try sys.open(try s.types.substitute(info.receiver, cand.subst)));
+    }
+    if (cand.outer_want != .none) _ = try sys.constrain(cand.outer_arg, try sys.open(cand.outer_want));
+    const Mismatch = struct { arg: usize, want: TypeId };
+    var mismatches: std.ArrayList(Mismatch) = .empty;
+    for (args, slots, 0..) |a, slot_or_null, ai| {
+        const slot = slot_or_null orelse continue;
+        if (ai < first or a.postponed or a.ty == .none or s.types.isErr(a.ty)) continue;
+        try sys.adopt(a.ty);
+        const p = params[slot.param];
+        var pt = try s.types.substitute(try headers.paramType(s, p), cand.subst);
+        if (s.syms.flags(p).vararg and !slot.vararg_elem and (a.spread or slot.named_array)) pt = try varargArrayType(ctx, pt);
+        const opened = try sys.open(pt);
+        var trial = try sys.clone();
+        defer trial.deinit();
+        if (try trial.constrain(a.ty, opened)) {
+            _ = try sys.constrain(a.ty, opened);
+            continue;
+        }
+        if (try convertedArg(ctx, &sys, a.ty, opened)) |_| continue;
+        try mismatches.append(s.arena, .{ .arg = ai, .want = opened });
+    }
+    if (mismatches.items.len == 0) return reported;
+    // What each parameter expects is what the other arguments make it.
+    var solved = try sys.clone();
+    defer solved.deinit();
+    _ = try solved.solve(false);
+    var uninferred: std.ArrayList(Sym) = .empty;
+    for (mismatches.items) |m| {
+        const a = args[m.arg];
+        const want = try shownExpected(&solved, m.want, &uninferred);
+        const got = try solved.closeKnown(try infer.zonk(s, a.ty));
+        if (a.expr.* == .NullLit and !try subtyping.admitsNull(s, want)) {
+            try problem(ctx, valueSpan(a), .NULL_FOR_NONNULL_TYPE, "Null cannot be a value of a non-null type '{s}'.", .{try sema_mod.diagnose.typeText(s, s.arena, want)});
+        } else {
+            try problem(ctx, valueSpan(a), .ARGUMENT_TYPE_MISMATCH, "Argument type mismatch: actual type is '{s}', but '{s}' was expected.", .{
+                try sema_mod.diagnose.typeText(s, s.arena, got),
+                try sema_mod.diagnose.typeText(s, s.arena, want),
+            });
+        }
+    }
+    for (uninferred.items) |tp| {
+        try problem(ctx, id.span, .CANNOT_INFER_PARAMETER_TYPE, "Cannot infer type for type parameter '{s}'. Specify it explicitly.", .{s.str(s.syms.name(tp))});
+    }
+    return true;
+}
+
+/// A parameter's type as a mismatch names it: each variable the call fixed
+/// replaced by its type, and one nothing fixed by its declared bound, its
+/// type parameter added to `uninferred`.
+fn shownExpected(sys: *const infer.System, t: TypeId, uninferred: *std.ArrayList(Sym)) Allocator.Error!TypeId {
+    const s = sys.s;
+    const k = try sys.closeKnown(try infer.zonk(s, t));
+    switch (s.types.get(k)) {
+        .variable => |v| {
+            const tp = for (sys.vars.items) |x| {
+                if (x.id == v.id) break x.tp;
+            } else return k;
+            if (tp == .none) return k;
+            if (std.mem.indexOfScalar(Sym, uninferred.items, tp) == null) try uninferred.append(s.arena, tp);
+            const bounds = try sys.declaredBoundsOf(k);
+            const shown = if (bounds.len != 0 and !sys.mentionsVar(try sys.closeKnown(bounds[0]))) try sys.closeKnown(bounds[0]) else try s.types.param(tp, false);
+            return if (v.nullable) s.types.makeNullable(shown) else shown;
+        },
+        .class => |c| {
+            if (!sys.mentionsVar(k)) return k;
+            const out = try s.arena.alloc(types.Arg, c.args.len);
+            for (c.args, out) |a, *o| {
+                o.* = a;
+                if (a.variance != .star) o.ty = try shownExpected(sys, a.ty, uninferred);
+            }
+            return s.types.classAttrs(c.sym, out, c.nullable, c.attrs);
+        },
+        else => return k,
+    }
+}
+
+/// `fun <T : Int> id`, `class Box<T>`: the declaration a type parameter
+/// belongs to, as kotlinc names it beside the parameter.
+fn typeParamOwnerText(s: *Sema, tp: Sym) Allocator.Error![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try sema_mod.diagnose.writeTypeParamOwner(s, s.arena, &buf, tp);
+    return buf.items;
+}
+
 
 /// The implicit value a context parameter of type `want` takes: in the
 /// innermost scope that has one, the receiver or context value whose type
@@ -2378,6 +2983,9 @@ fn complete(ctx: *Ctx, app_in: Applied, call_args: []Arg, trailing: bool, id: as
     const s = ctx.s;
     var app = app_in;
     const cand = app.cand;
+    if (cand.nullable_value != .none) try reportUnsafe(ctx, .{ .at = id.span, .factory = .UNSAFE_IMPLICIT_INVOKE_CALL }, cand.nullable_value);
+    if (s.syms.flags(cand.sym).suspend_) try checkSuspendCall(ctx, cand.sym, id.span);
+    try checkPublishedCall(ctx, cand.sym, id.span);
     if (ctx.delegate_expect) |de| if (de.anchor.start == id.span.start and de.anchor.end == id.span.end) {
         ctx.delegate_expect = null;
         try expectDelegateValue(ctx, &app.sys, try candReturn(ctx, cand, &app.sys), de);
@@ -2464,15 +3072,21 @@ fn checkReifiedArgs(ctx: *Ctx, app: *Applied, id: ast.Ident) Allocator.Error!voi
     const s = ctx.s;
     const fc = s.fileOf(ctx.file) orelse return;
     if (fc.origin != .program) return;
-    if (s.syms.kind(app.cand.sym) != .function) return;
-    for (try candTypeParams(s, app.cand)) |tp| {
-        if (!s.syms.flags(tp).reified) continue;
+    // `Array(n) { ... }` makes an array of its element class: its
+    // constructor reifies `T`.
+    const array_ctor = s.syms.kind(app.cand.sym) == .constructor and s.syms.owner(app.cand.sym) == s.builtins.array;
+    if (s.syms.kind(app.cand.sym) != .function and !array_ctor) return;
+    for (try candTypeParams(s, app.cand), 0..) |tp, i| {
+        if (!s.syms.flags(tp).reified and !array_ctor) continue;
         const t = app.sys.fixedFor(tp);
         if (t == .none) continue;
         const z = try s.types.makeNotNull(try infer.zonk(s, t));
         switch (s.types.get(z)) {
             .param => |p| if (!s.syms.flags(p.sym).reified) {
-                try ctx.reportFacts(.reified_param, id.span, .{ .name = id.name, .syms = try ctx.arena().dupe(Sym, &.{p.sym}) }, "{s}: {s}", .{ id.name, s.str(s.syms.name(p.sym)) });
+                // At the type argument when it is written, else the callee.
+                const written = if (callSiteOf(ctx, id)) |x| (if (i < x.type_args.len) x.type_args[i].span else null) else null;
+                const msg = try std.fmt.allocPrint(s.arena, "Cannot use '{s}' as reified type parameter. Use a class instead.", .{s.str(s.syms.name(p.sym))});
+                try ctx.reportFacts(.reified_param, written orelse id.span, .{ .name = id.name, .message = msg, .syms = try ctx.arena().dupe(Sym, &.{p.sym}) }, "{s}: {s}", .{ id.name, s.str(s.syms.name(p.sym)) });
                 return;
             },
             // An intersection has no class to reify; kotlinc refuses one
@@ -2642,11 +3256,30 @@ fn postponedArg(ctx: *Ctx, app: *Applied, a: *Arg, slot: Slot, label: Name) Allo
     if (inner.* == .Spread) inner = inner.Spread.expr;
     // A lambda passed to `f` is labeled `f` unless it names itself.
     if (inner.* == .Lambda) ctx.lambda_label = label;
+    ctx.lambda_result_inferred = try resultMentionsVar(ctx, opened);
+    ctx.lambda_in_place = s.syms.kind(cand.sym) == .function and s.syms.flags(cand.sym).inline_ and !cand.on_value and !s.syms.flags(p).crossinline and !s.syms.flags(p).no_inline;
     const at = try body.expr(ctx, inner, hint);
     ctx.lambda_label = .empty;
+    ctx.lambda_result_inferred = false;
+    ctx.lambda_in_place = false;
     a.ty = at;
     _ = try app.sys.constrain(at, opened);
     try noteSamLiteral(ctx, app, a, opened);
+}
+
+/// Whether function type `t` (or the SAM's) returns a type mentioning one of the call's
+/// variables, before they are fixed.
+fn resultMentionsVar(ctx: *Ctx, t: TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    var ft = try s.types.makeNotNull(t);
+    if (functionShape(s, ft) == null) {
+        if (s.types.get(ft) == .variable) return true;
+        const sam = (try samType(ctx, ft)) orelse return false;
+        ft = sam.fn_type;
+    }
+    const args = s.types.argsOf(ft);
+    if (args.len == 0) return false;
+    return infer.mentionsVar(s, args[args.len - 1].ty);
 }
 
 /// A lambda's written parameter types bound its expected inputs before it
@@ -2856,6 +3489,10 @@ fn lambdaExpectation(ctx: *Ctx, trial: *infer.System, sys: *infer.System, pt: Ty
 /// joined with every `return@label`.
 pub fn lambda(ctx: *Ctx, l: *const ast.LambdaExpr, expected_in: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
+    const result_inferred = ctx.lambda_result_inferred;
+    ctx.lambda_result_inferred = false;
+    const in_place = ctx.lambda_in_place;
+    ctx.lambda_in_place = false;
     var expected = if (expected_in != .none) try infer.zonk(s, expected_in) else .none;
     var shape: ?FnShape = null;
     var exp_args: []const types.Arg = &.{};
@@ -2887,6 +3524,9 @@ pub fn lambda(ctx: *Ctx, l: *const ast.LambdaExpr, expected_in: TypeId) Allocato
     const sc = try ctx.push(.lambda, fsym);
     defer ctx.pop(sc);
     sc.label = try lambdaLabel(ctx, l);
+    // With nothing expected it is a plain function type; with a type still
+    // being inferred, not known yet.
+    sc.runs = if (shape) |sh| (if (sh.is_suspend) .suspend_ else if (in_place) .in_place else .plain) else if (in_place) .in_place else if (expected == .none) .plain else .unknown;
     var returns: std.ArrayList(TypeId) = .empty;
     sc.lambda_returns = &returns;
     var recv: TypeId = .none;
@@ -2945,8 +3585,16 @@ pub fn lambda(ctx: *Ctx, l: *const ast.LambdaExpr, expected_in: TypeId) Allocato
         }
     }
     sc.ret = ret_expected;
+    sc.ret_inferred = result_inferred;
     const last = try lambdaBody(ctx, sc, &l.body, ret_expected);
     try returns.append(s.arena, last);
+    // The last statement is the result where the expected one is not `Unit`. A result
+    // type a call is still inferring (`getOrElse`'s `V`) takes the lambda's result into
+    // account, as kotlinc infers it after the lambda, so only a written one holds it.
+    if (!sc.unit_return and ret_expected != .none and l.body.stmts.len != 0 and !result_inferred) {
+        const tail = &l.body.stmts[l.body.stmts.len - 1];
+        if (tail.* == .Expr and (try infer.zonk(s, ret_expected)) != s.t.unit) try body.checkFits(ctx, tail.Expr.span(), last, ret_expected, .return_);
+    }
     const want_unit = sc.unit_return or (ret_expected != .none and (try infer.zonk(s, ret_expected)) == s.t.unit);
     const result = if (want_unit) s.t.unit else try body.join(ctx, returns.items, .none);
     const is_suspend = if (shape) |sh| sh.is_suspend else false;
@@ -3084,6 +3732,8 @@ fn samMethod(ctx: *Ctx, t: TypeId) Allocator.Error!?Sam {
 
 pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
+    const result_inferred = ctx.lambda_result_inferred;
+    ctx.lambda_result_inferred = false;
     const fsym = try s.syms.addFunction(.{
         .kind = .function,
         .name = wk.anonymous,
@@ -3094,6 +3744,8 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
         .detail = 0,
     }, .{ .state = .done });
     const sc = try ctx.push(.function, fsym);
+    sc.runs = if (f.is_suspend) .suspend_ else if (ctx.lambda_in_place) .in_place else .plain;
+    ctx.lambda_in_place = false;
     defer ctx.pop(sc);
     // `l@ fun T.() { this@l }`: a label names the function and its receiver.
     sc.label = ctx.lambda_label;
@@ -3101,10 +3753,12 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
     var exp_params: []const types.Arg = &.{};
     var exp_contexts: []const types.Arg = &.{};
     var exp_recv: TypeId = .none;
+    var exp_ret: TypeId = .none;
     if (expected != .none) {
         const nn = try s.types.makeNotNull(try infer.zonk(s, expected));
         if (functionShape(s, nn)) |sh| {
             const a = s.types.get(nn).class.args;
+            exp_ret = a[a.len - 1].ty;
             exp_contexts = a[0..sh.contexts];
             const first = sh.contexts + @intFromBool(sh.has_receiver);
             if (sh.has_receiver) exp_recv = a[sh.contexts].ty;
@@ -3151,7 +3805,14 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
             },
             .Expr => |*e| {
                 const t = try body.expr(ctx, e, ret);
-                if (ret == .none) ret = t else try infer.noteExpected(s, t, ret);
+                if (ret == .none) {
+                    // With no written return type, the body is what the expected type returns.
+                    if (!result_inferred and exp_ret != .none and (try infer.zonk(s, exp_ret)) != s.t.unit) try body.checkFits(ctx, e.span(), t, exp_ret, .return_);
+                    ret = t;
+                } else {
+                    try infer.noteExpected(s, t, ret);
+                    try body.checkFits(ctx, e.span(), t, ret, .return_);
+                }
             },
         }
     }
@@ -3300,7 +3961,9 @@ pub fn propertyContexts(ctx: *Ctx, p: Sym, subst: *const types.Subst) Allocator.
 
 /// `recv.name` on a value of type `t`: a member property, then an
 /// extension property. Records the reference.
-pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.Access, recv: Receiver) Allocator.Error!TypeId {
+/// `unsafe_at`: where the access's `.` is written, for a receiver that may
+/// be null; null where the receiver cannot be.
+pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.Access, recv: Receiver, unsafe_at: ?Span) Allocator.Error!TypeId {
     const s = ctx.s;
     const lit = try literalReceiver(s, t_in);
     const t = try s.types.makeNotNull(lit);
@@ -3318,14 +3981,19 @@ pub fn propertyAccess(ctx: *Ctx, t_in: TypeId, n: Name, sp: Span, access: body.A
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = kind, .target = ext.sym, .extension = recv, .dispatch = ext.dispatch, .contexts = ext.contexts });
         return ext.ty;
     };
+    // Without `?.`, a member or an extension of the non-null type is read
+    // on a receiver that may be null as kotlinc reads it, and reported.
+    const unsafe: ?Unsafe = if (unsafe_at) |at| (if (try subtyping.admitsNull(s, lit)) Unsafe{ .at = at, .factory = .UNSAFE_CALL } else null) else null;
     const ms = try members.withoutExtensionProperties(s, try members.lookup(s, t, n, .property));
     if (try firstVisible(ctx, ms)) |m| {
+        if (unsafe) |u| try reportUnsafe(ctx, u, lit);
         const cx = (try propertyContexts(ctx, m.sym, m.subst)) orelse &.{};
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = if (s.syms.kind(m.sym) == .enum_entry) .object else kind, .target = m.sym, .dispatch = recv, .contexts = cx });
         return members.memberType(s, m);
     }
     // A member the code cannot see does not hide an extension.
     if (try extensionProperty(ctx, t, n)) |ext| {
+        if (unsafe) |u| try reportUnsafe(ctx, u, lit);
         try ext.take();
         try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = kind, .target = ext.sym, .extension = recv, .dispatch = ext.dispatch, .contexts = ext.contexts });
         return ext.ty;
@@ -3355,7 +4023,7 @@ pub fn generatedFile(ctx: *const Ctx) bool {
 /// A member or extension property `n` on `t` read by a destructuring by
 /// name.
 pub fn propertyOn(ctx: *Ctx, t: TypeId, n: Name, sp: Span) Allocator.Error!TypeId {
-    return propertyAccess(ctx, t, n, sp, .read, .expr);
+    return propertyAccess(ctx, t, n, sp, .read, .expr, null);
 }
 
 // ----------------------------------------------------------- operators ----
@@ -3380,13 +4048,21 @@ pub fn operatorCall(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: [
 /// does: a delegate's `getValue` takes the property's type (`val n: Int by
 /// map` makes `Map.getValue`'s `V1` an `Int`).
 pub fn operatorCallExpecting(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: []const Arg, kind: RefKind, expected: TypeId) Allocator.Error!TypeId {
+    return operatorCallFull(ctx, anchor, rt_in, n, pre_args, kind, expected, null);
+}
+
+/// `operatorCall` written on an operand that may be null (`a + b`, `a[i]`,
+/// `-a`): where nothing applies on it as it is and the operator applies on
+/// its non-null type, kotlinc resolves it there and reports `u`.
+pub fn operatorCallUnsafe(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: []const Arg, kind: RefKind, u: Unsafe) Allocator.Error!TypeId {
+    return operatorCallFull(ctx, anchor, rt_in, n, pre_args, kind, .none, u);
+}
+
+/// The levels an operator named `n` on an operand of type `rt` takes its
+/// candidates from: the operand's `operator` members (none when it may be
+/// null), then the extensions.
+fn operatorLevels(ctx: *Ctx, rt: TypeId, n: Name) Allocator.Error!std.ArrayList(Level) {
     const s = ctx.s;
-    const rt = try literalReceiver(s, rt_in);
-    if (s.types.isErr(rt)) {
-        try ctx.failNode(anchor);
-        return s.types.errType();
-    }
-    const args = try s.arena.dupe(Arg, pre_args);
     var levels: std.ArrayList(Level) = .empty;
     var member_level = newLevel();
     // As for a call: a receiver that may be null reaches only extensions
@@ -3400,8 +4076,77 @@ pub fn operatorCallExpecting(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pr
     };
     if (member_level.items.len != 0) try levels.append(s.arena, member_level);
     try appendExtensionLevels(ctx, &levels, n, .expr, rt, true);
+    return levels;
+}
+
+fn operatorCallFull(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pre_args: []const Arg, kind: RefKind, expected: TypeId, unsafe: ?Unsafe) Allocator.Error!TypeId {
+    const s = ctx.s;
+    const rt = try literalReceiver(s, rt_in);
+    if (s.types.isErr(rt)) {
+        try ctx.failNode(anchor);
+        return s.types.errType();
+    }
+    const args = try s.arena.dupe(Arg, pre_args);
+    const levels = try operatorLevels(ctx, rt, n);
+    const members_apply = !try subtyping.admitsNull(s, rt);
+    if (try chooseOperator(ctx, levels.items, args, kind, expected)) |chosen| {
+        var app = chosen;
+        for (app.args, app.slots) |*a, slot| {
+            if (!a.postponed) continue;
+            try postponedArg(ctx, &app, a, slot, n);
+        }
+        _ = try app.sys.solve(false);
+        try app.sys.forwardForeign();
+        const ret = try app.sys.close(try candReturn(ctx, app.cand, &app.sys));
+        try ctx.addRef(.{ .file = ctx.file, .anchor = anchor, .kind = kind, .op = n, .target = app.cand.sym, .dispatch = app.cand.dispatch, .extension = app.cand.extension, .contexts = app.contexts, .detail = .{ .call = try callDetail(ctx, &app, .plain, app.cand.extension) } });
+        return ret;
+    }
+    if (unsafe) |u| if (!members_apply) {
+        const nn = try s.types.definitelyNotNull(rt);
+        if (nn != rt and !s.types.isErr(nn)) {
+            const nn_levels = try operatorLevels(ctx, nn, n);
+            // The operator is the non-null type's when it applies there, or
+            // takes the operand there and fails only for its arguments.
+            if (try someTakesReceiver(ctx, nn_levels.items, args, kind == .set)) {
+                try reportUnsafe(ctx, u, rt);
+                return operatorCallFull(ctx, anchor, nn, n, pre_args, kind, expected, .{ .at = u.at, .factory = .none });
+            }
+        }
+    };
+    for (args) |a| if (a.postponed) {
+        _ = try body.expr(ctx, a.expr, .none);
+    };
+    // Where the operator is written, a candidate that takes the operand but
+    // not the arguments is reported as a call's is.
+    if (unsafe) |u| {
+        if (try someTakesReceiver(ctx, levels.items, args, kind == .set) and try reportInapplicable(ctx, levels.items, .{ .name = s.str(n), .span = u.at }, args, kind == .set, &.{})) return s.types.errType();
+    }
+    // A member of the convention's name declared without `operator`:
+    // kotlinc asks for the modifier, and for a delegate reports that none
+    // of the functions applies.
+    const plain = if (members_apply) try plainMember(s, rt, n, args.len) else Sym.none;
+    const delegate = n == wk.getValue or n == wk.setValue or n == wk.provideDelegate;
+    if (plain != .none and !delegate) {
+        const msg = try std.fmt.allocPrint(s.arena, "'operator' modifier is required on '{s}' defined in '{s}'.", .{ try sema_mod.diagnose.declarationText(s, s.arena, plain), s.str(s.syms.name(s.syms.owner(plain))) });
+        try ctx.reportFacts(.modifier_required, anchor, .{ .name = s.str(n), .message = msg, .factory = .OPERATOR_MODIFIER_REQUIRED }, "{s}", .{s.str(n)});
+        return s.types.errType();
+    }
+    try ctx.reportFacts(.unresolved_operator, if (unsafe) |u| u.at else anchor, .{
+        .name = s.str(n),
+        .on = try sema_mod.diagnose.typeText(s, s.arena, rt),
+        .arg_types = try argTypes(ctx, args),
+        .factory = if (plain != .none) .DELEGATE_SPECIAL_FUNCTION_NONE_APPLICABLE else .none,
+    }, "{s}.{s}({s})", .{ try sema_mod.render.typeStr(s, s.arena, rt), s.str(n), try argTypesText(ctx, args) });
+    return s.types.errType();
+}
+
+/// The candidate an operator call takes from `levels`: the most specific
+/// of the first level where one applies, a low-priority one only when no
+/// level has another.
+fn chooseOperator(ctx: *Ctx, levels: []const Level, args: []Arg, kind: RefKind, expected: TypeId) Allocator.Error!?Applied {
+    const s = ctx.s;
     var low_level: ?[]Applied = null;
-    for (levels.items, 0..) |level, li| {
+    for (levels, 0..) |level, li| {
         var applicable: std.ArrayList(Applied) = .empty;
         for (level.items) |cand| {
             // An indexed assignment's value binds to `set`'s last
@@ -3416,43 +4161,15 @@ pub fn operatorCallExpecting(ctx: *Ctx, anchor: Span, rt_in: TypeId, n: Name, pr
                 applicable.clearRetainingCapacity();
             }
         }
-        const last = li + 1 == levels.items.len;
+        const last = li + 1 == levels.len;
         if (applicable.items.len == 0 and last) if (low_level) |l| {
             applicable = .fromOwnedSlice(l);
         };
         if (applicable.items.len == 0) continue;
         const chosen = try mostSpecific(ctx, applicable.items, args);
-        var app = applicable.items[chosen.index];
-        for (app.args, app.slots) |*a, slot| {
-            if (!a.postponed) continue;
-            try postponedArg(ctx, &app, a, slot, n);
-        }
-        _ = try app.sys.solve(false);
-        try app.sys.forwardForeign();
-        const ret = try app.sys.close(try candReturn(ctx, app.cand, &app.sys));
-        try ctx.addRef(.{ .file = ctx.file, .anchor = anchor, .kind = kind, .op = n, .target = app.cand.sym, .dispatch = app.cand.dispatch, .extension = app.cand.extension, .contexts = app.contexts, .detail = .{ .call = try callDetail(ctx, &app, .plain, app.cand.extension) } });
-        return ret;
+        return applicable.items[chosen.index];
     }
-    for (args) |a| if (a.postponed) {
-        _ = try body.expr(ctx, a.expr, .none);
-    };
-    // A member of the convention's name declared without `operator`:
-    // kotlinc asks for the modifier, and for a delegate reports that none
-    // of the functions applies.
-    const plain = if (members_apply) try plainMember(s, rt, n, args.len) else Sym.none;
-    const delegate = n == wk.getValue or n == wk.setValue or n == wk.provideDelegate;
-    if (plain != .none and !delegate) {
-        const msg = try std.fmt.allocPrint(s.arena, "'operator' modifier is required on '{s}' defined in '{s}'.", .{ try sema_mod.diagnose.declarationText(s, s.arena, plain), s.str(s.syms.name(s.syms.owner(plain))) });
-        try ctx.reportFacts(.modifier_required, anchor, .{ .name = s.str(n), .message = msg, .factory = .OPERATOR_MODIFIER_REQUIRED }, "{s}", .{s.str(n)});
-        return s.types.errType();
-    }
-    try ctx.reportFacts(.unresolved_operator, anchor, .{
-        .name = s.str(n),
-        .on = try sema_mod.diagnose.typeText(s, s.arena, rt),
-        .arg_types = try argTypes(ctx, args),
-        .factory = if (plain != .none) .DELEGATE_SPECIAL_FUNCTION_NONE_APPLICABLE else .none,
-    }, "{s}.{s}({s})", .{ try sema_mod.render.typeStr(s, s.arena, rt), s.str(n), try argTypesText(ctx, args) });
-    return s.types.errType();
+    return null;
 }
 
 /// A member function of `rt` named `n`, taking `arity` arguments, that is
@@ -3480,7 +4197,18 @@ pub fn lambdaCallOperand(ctx: *Ctx, rhs: *const Expr) Allocator.Error!?[]Arg {
 pub fn indexGet(ctx: *Ctx, e: *const Expr, recv: *const Expr, idx: []const Expr) Allocator.Error!TypeId {
     const rt = try body.receiverExpr(ctx, recv);
     const args = try prepareArgs(ctx, idx, &.{});
-    return operatorCall(ctx, e.span(), rt, wk.get, args, .get);
+    return operatorCallUnsafe(ctx, e.span(), rt, wk.get, args, .get, atStart(recv, .UNSAFE_CALL));
+}
+
+/// An unsafe operator reported where `e` starts.
+fn atStart(e: *const Expr, factory: census_mod.Factory) Unsafe {
+    const sp = e.span();
+    return .{ .at = Span.init(sp.file, sp.start, sp.start + 1), .factory = factory };
+}
+
+/// An unsafe operator reported at offset `at` of `like`'s file.
+pub fn unsafeAt(like: Span, at: u32, factory: census_mod.Factory) Unsafe {
+    return .{ .at = Span.init(like.file, at, at + 1), .factory = factory };
 }
 
 pub fn indexSet(ctx: *Ctx, target: *const Expr, recv: *const Expr, idx: []const Expr, value: *const Expr) Allocator.Error!TypeId {
@@ -3493,7 +4221,7 @@ pub fn indexSet(ctx: *Ctx, target: *const Expr, recv: *const Expr, idx: []const 
     const args = try s.arena.alloc(Arg, iargs.len + 1);
     @memcpy(args[0..iargs.len], iargs);
     args[iargs.len] = vargs[0];
-    return operatorCall(ctx, target.span(), rt, wk.set, args, .set);
+    return operatorCallUnsafe(ctx, target.span(), rt, wk.set, args, .set, atStart(recv, .UNSAFE_CALL));
 }
 
 /// `a op= b`: `opAssign` when the target's type declares it, else
@@ -3516,6 +4244,7 @@ pub fn compoundAssign(ctx: *Ctx, a: *const ast.AssignStmt) Allocator.Error!void 
         .Rem => wk.remAssign,
         .Assign => unreachable,
     };
+    const refs_before = ctx.refCount();
     const target = try readTarget(ctx, &a.target);
     // A lambda (`handlers += { x -> ... }`) waits for the operator's
     // parameter type, as a lambda argument does.
@@ -3532,13 +4261,70 @@ pub fn compoundAssign(ctx: *Ctx, a: *const ast.AssignStmt) Allocator.Error!void 
         },
     };
     // `plusAssign` wins when it exists.
-    if (try hasOperator(ctx, target.ty, assign_name)) {
-        _ = try operatorCall(ctx, a.span, target.ty, assign_name, args, .op_assign);
+    const unsafe = unsafeAt(a.span, if (a.op_at != 0) a.op_at else a.span.start, .UNSAFE_OPERATOR_CALL);
+    if (try hasOperator(ctx, target.ty, assign_name) or try hasOperator(ctx, try s.types.definitelyNotNull(target.ty), assign_name)) {
+        _ = try operatorCallUnsafe(ctx, a.span, target.ty, assign_name, args, .op_assign, unsafe);
+        try assignAmbiguity(ctx, a, target, refs_before, op_name, assign_name, args);
         return;
     }
-    const result = try operatorCall(ctx, a.span, target.ty, op_name, args, .op);
+    const result = try operatorCallUnsafe(ctx, a.span, target.ty, op_name, args, .op, unsafe);
     try writeTarget(ctx, &a.target, target, &a.value, result);
-    _ = s;
+}
+
+/// `a += b` where `a` is a `var` and both `plusAssign` and `plus` apply,
+/// `plus` giving a value `a` can hold: kotlinc cannot tell which is meant.
+/// For `a[i] += b` the other reading writes through `set`.
+fn assignAmbiguity(ctx: *Ctx, a: *const ast.AssignStmt, target: Target, refs_before: usize, op_name: Name, assign_name: Name, args: []const Arg) Allocator.Error!void {
+    const s = ctx.s;
+    if (s.census.muted != 0 or a.op_at == 0) return;
+    if (s.types.isErr(target.ty) or try subtyping.admitsNull(s, target.ty)) return;
+    for (args) |x| if (x.postponed) return;
+    const held: TypeId = switch (a.target) {
+        .Index => target.ty,
+        .Path => |p| if (p.segments.len == 1) try varType(ctx, refs_before, p.segments[0].span) else .none,
+        .Member => |m| try varType(ctx, refs_before, m.name.span),
+        else => .none,
+    };
+    if (held == .none) return;
+    const pair = blk: {
+        s.census.muted += 1;
+        defer s.census.muted -= 1;
+        const rt = try literalReceiver(s, target.ty);
+        const assign = (try chooseOperator(ctx, (try operatorLevels(ctx, rt, assign_name)).items, try s.arena.dupe(Arg, args), .op_assign, .none)) orelse return;
+        var op = (try chooseOperator(ctx, (try operatorLevels(ctx, rt, op_name)).items, try s.arena.dupe(Arg, args), .op, .none)) orelse return;
+        _ = try op.sys.solve(false);
+        const ret = try op.sys.close(try candReturn(ctx, op.cand, &op.sys));
+        if (s.types.isErr(ret) or !try subtyping.isSubtype(s, ret, held)) return;
+        if (a.target != .Index) break :blk [2]Sym{ op.cand.sym, assign.cand.sym };
+        const sargs = try s.arena.alloc(Arg, target.index_args.len + 1);
+        @memcpy(sargs[0..target.index_args.len], target.index_args);
+        sargs[target.index_args.len] = .{ .expr = &a.value, .ty = ret };
+        const set = (try chooseOperator(ctx, (try operatorLevels(ctx, target.recv_t, wk.set)).items, sargs, .set, .none)) orelse return;
+        break :blk [2]Sym{ assign.cand.sym, set.cand.sym };
+    };
+    var lines: [2][]const u8 = undefined;
+    for (pair, &lines) |sym, *l| l.* = try sema_mod.diagnose.declarationText(s, s.arena, sym);
+    if (std.mem.order(u8, lines[0], lines[1]) == .gt) std.mem.swap([]const u8, &lines[0], &lines[1]);
+    const msg = try std.fmt.allocPrint(s.arena, "Ambiguity between assign operator candidates:\n{s}\n{s}", .{ lines[0], lines[1] });
+    try ctx.reportFacts(.ambiguous, Span.init(a.span.file, a.op_at, a.op_at + 2), .{ .name = s.str(assign_name), .message = msg, .factory = .ASSIGN_OPERATOR_AMBIGUITY }, "{s}", .{s.str(assign_name)});
+}
+
+/// The declared type of the `var` a name written at `at` read since the
+/// reference list held `since`; none when it names no `var`.
+fn varType(ctx: *Ctx, since: usize, at: Span) Allocator.Error!TypeId {
+    const s = ctx.s;
+    const list = if (s.census.buffer) |b| b.refs.items else s.refs.items;
+    if (since > list.len) return .none;
+    for (list[since..]) |r| {
+        if (r.anchor.start != at.start or r.anchor.end != at.end) continue;
+        if (r.target == .none or !s.syms.flags(r.target).mutable) return .none;
+        return switch (s.syms.kind(r.target)) {
+            .local => s.syms.localInfo(r.target).ty,
+            .property => try headers.propertyType(s, r.target),
+            else => .none,
+        };
+    }
+    return .none;
 }
 
 /// An assignment target resolved once: its receiver, its index arguments,
@@ -3556,15 +4342,15 @@ fn readTarget(ctx: *Ctx, target: *const Expr) Allocator.Error!Target {
         .Index => |ix| {
             const rt = try body.receiverExpr(ctx, ix.receiver);
             const iargs = try prepareArgs(ctx, ix.args, &.{});
-            const t = try operatorCall(ctx, target.span(), rt, wk.get, iargs, .get);
-            return .{ .ty = t, .recv_t = rt, .index_args = iargs };
+            const t = try operatorCallUnsafe(ctx, target.span(), rt, wk.get, iargs, .get, atStart(ix.receiver, .UNSAFE_CALL));
+            return .{ .ty = t, .recv_t = try ctx.s.types.definitelyNotNull(rt), .index_args = iargs };
         },
         .Member => |m| {
             if (try body.asQualifier(ctx, m.receiver) == null and m.receiver.* != .Super) {
                 const recv_t = try body.receiverExpr(ctx, m.receiver);
                 const rt = if (m.safe) try ctx.s.types.makeNotNull(recv_t) else recv_t;
                 const n = try ctx.intern(m.name.name);
-                const t = try propertyAccess(ctx, rt, n, m.name.span, .read, .expr);
+                const t = try propertyAccess(ctx, rt, n, m.name.span, .read, .expr, if (m.safe) null else memberDot(target));
                 return .{ .ty = t, .recv_t = rt };
             }
             return .{ .ty = try body.expr(ctx, target, .none) };
@@ -3585,7 +4371,7 @@ fn writeTarget(ctx: *Ctx, target: *const Expr, read: Target, value: *const Expr,
         },
         .Member => |m| {
             if (read.recv_t != .none) {
-                _ = try propertyAccess(ctx, read.recv_t, try ctx.intern(m.name.name), m.name.span, .write, .expr);
+                _ = try propertyAccess(ctx, read.recv_t, try ctx.intern(m.name.name), m.name.span, .write, .expr, null);
             } else {
                 _ = try body.assignTarget(ctx, target);
             }
@@ -3631,19 +4417,21 @@ pub fn unary(ctx: *Ctx, e: *const Expr, op: ast.UnOp, operand: *const Expr, expe
         .Not => wk.not,
         else => unreachable,
     };
-    return operatorCall(ctx, e.span(), t, n, &.{}, .op);
+    return operatorCallUnsafe(ctx, e.span(), t, n, &.{}, .op, atStart(e, .UNSAFE_CALL));
 }
 
 /// `!x` in a condition, `x` of type `operand_t`: its `not`.
 pub fn notRef(ctx: *Ctx, e: *const Expr, operand_t: TypeId) Allocator.Error!TypeId {
-    return operatorCall(ctx, e.span(), operand_t, wk.not, &.{}, .op);
+    return operatorCallUnsafe(ctx, e.span(), operand_t, wk.not, &.{}, .op, atStart(e, .UNSAFE_CALL));
 }
 
 /// `x++`, `x--`, `++x`, `--x`: `inc`/`dec` on the operand, written back.
 pub fn incDec(ctx: *Ctx, e: *const Expr, operand: *const Expr, inc: bool, postfix: bool) Allocator.Error!TypeId {
-    _ = postfix;
     const target = try readTarget(ctx, operand);
-    const r = try operatorCall(ctx, e.span(), target.ty, if (inc) wk.inc else wk.dec, &.{}, if (inc) .inc else .dec);
+    // The operator is the expression's first two characters, or its last two.
+    const sp = e.span();
+    const unsafe = unsafeAt(sp, if (postfix) sp.end -| 2 else sp.start, .UNSAFE_CALL);
+    const r = try operatorCallUnsafe(ctx, e.span(), target.ty, if (inc) wk.inc else wk.dec, &.{}, if (inc) .inc else .dec, unsafe);
     try writeTarget(ctx, operand, target, operand, r);
     return target.ty;
 }
@@ -3657,8 +4445,8 @@ pub fn containsCall(ctx: *Ctx, anchor: Span, container_t: TypeId, elem_t: TypeId
 
 /// `elem in c` with `elem` written as an expression: `c.contains(elem)`,
 /// `elem` the argument, so a literal takes its parameter's type.
-pub fn containsArgCall(ctx: *Ctx, anchor: Span, container_t: TypeId, elem: *const Expr, elem_t: TypeId) Allocator.Error!TypeId {
-    return operatorCall(ctx, anchor, container_t, wk.contains, &.{.{ .expr = elem, .ty = elem_t }}, .contains);
+pub fn containsArgCall(ctx: *Ctx, anchor: Span, container_t: TypeId, elem: *const Expr, elem_t: TypeId, op_at: u32) Allocator.Error!TypeId {
+    return operatorCallUnsafe(ctx, anchor, container_t, wk.contains, &.{.{ .expr = elem, .ty = elem_t }}, .contains, unsafeAt(anchor, if (op_at != 0) op_at else anchor.start, .UNSAFE_OPERATOR_CALL));
 }
 
 /// `a == b` resolves to `equals` on `a`'s type.
@@ -3683,7 +4471,7 @@ pub fn equalsRef(ctx: *Ctx, anchor: Span, lhs_t: TypeId) Allocator.Error!void {
 /// iterator. Returns the element type.
 pub fn iteration(ctx: *Ctx, anchor: Span, t: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
-    const it_t = try operatorCall(ctx, anchor, t, wk.iterator, &.{}, .iterator);
+    const it_t = try operatorCallUnsafe(ctx, anchor, t, wk.iterator, &.{}, .iterator, .{ .at = anchor, .factory = .ITERATOR_ON_NULLABLE });
     if (s.types.isErr(it_t)) return it_t;
     _ = try operatorCall(ctx, anchor, it_t, wk.hasNext, &.{}, .has_next);
     return operatorCall(ctx, anchor, it_t, wk.next, &.{}, .next);
@@ -3959,6 +4747,10 @@ fn superTarget(ctx: *Ctx, sp: *const ast.SuperExpr) Allocator.Error!?struct { ty
         const qt = try body.resolveTypeInBody(ctx, q);
         const qc = s.types.classSym(qt);
         for (sts) |st| if (s.types.classSym(st) == qc) return .{ .ty = st, .owner = cls };
+        if (!s.types.isErr(qt)) {
+            const msg = "Not an immediate supertype.";
+            try ctx.reportFacts(.declaration, q.span, .{ .message = msg, .factory = .NOT_A_SUPERTYPE }, "{s}", .{msg});
+        }
         return .{ .ty = qt, .owner = cls };
     }
     // The class supertype when there is one, else the only interface.
@@ -3994,7 +4786,7 @@ pub fn superMember(ctx: *Ctx, sp: *const ast.SuperExpr, name: ast.Ident, access:
         }
         if (count == 1) ty = found;
     }
-    return propertyAccess(ctx, ty, n, name.span, access, .{ .implicit = .{ .kind = .super_, .owner = tgt.owner } });
+    return propertyAccess(ctx, ty, n, name.span, access, .{ .implicit = .{ .kind = .super_, .owner = tgt.owner } }, null);
 }
 
 /// The supertypes an unqualified `super` reaches: those `cls` names, and
@@ -5050,7 +5842,14 @@ fn classLiteral(ctx: *Ctx, recv: *const Expr, sp: Span) Allocator.Error!TypeId {
         if (body.lookupLocal(ctx, n) == null) {
             const tc = body.typeCtx(ctx);
             const c = try scope_mod.classifierInContext(s, tc.decl, ctx.file, n);
-            if (c != .none and s.syms.kind(c) == .type_param) t = try s.types.param(c, false);
+            if (c != .none and s.syms.kind(c) == .type_param) {
+                t = try s.types.param(c, false);
+                // Only a reified type parameter has a class at run time.
+                if (!s.syms.flags(c).reified) {
+                    const msg = try std.fmt.allocPrint(s.arena, "Cannot use '{s}' as reified type parameter. Use a class instead.", .{s.str(s.syms.name(c))});
+                    try ctx.reportFacts(.reified_param, recv.span(), .{ .name = s.str(s.syms.name(c)), .message = msg, .syms = try ctx.arena().dupe(Sym, &.{c}) }, "{s}", .{msg});
+                }
+            }
         }
     }
     if (t == .none) {
@@ -5059,7 +5858,14 @@ fn classLiteral(ctx: *Ctx, recv: *const Expr, sp: Span) Allocator.Error!TypeId {
         }
     }
     if (t == .none) {
-        t = try s.types.makeNotNull(try body.receiverExpr(ctx, recv));
+        const rt = try body.receiverExpr(ctx, recv);
+        if (!s.types.isErr(rt) and try subtyping.admitsNull(s, rt)) {
+            var buf: std.ArrayList(u8) = .empty;
+            try sema_mod.diagnose.writeTypeAs(s, s.arena, &buf, rt, true);
+            const msg = try std.fmt.allocPrint(s.arena, "Expression in class literal has nullable type '{s}'. Use '!!' to make the type non-nullable.", .{buf.items});
+            try ctx.reportFacts(.declaration, recv.span(), .{ .message = msg, .factory = .EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS }, "{s}", .{msg});
+        }
+        t = try s.types.makeNotNull(rt);
         bound = true;
     }
     if (s.types.isErr(t) or s.builtins.kclass == .none) return s.types.errType();

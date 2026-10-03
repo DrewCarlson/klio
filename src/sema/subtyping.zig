@@ -147,7 +147,7 @@ fn supertypeWalk(s: *Sema, t: TypeId, target: Sym, seen: *std.AutoHashMapUnmanag
         .class => |c| c,
         else => return null,
     };
-    if (c.sym == target) return t;
+    if (sameClass(s, c.sym, target)) return t;
     if ((try seen.getOrPut(s.arena, c.sym)).found_existing) return null;
     const subst = try classSubst(s, t);
     for (try headers.supertypes(s, c.sym)) |st| {
@@ -155,6 +155,18 @@ fn supertypeWalk(s: *Sema, t: TypeId, target: Sym, seen: *std.AutoHashMapUnmanag
         if (try supertypeWalk(s, inst, target, seen)) |hit| return hit;
     }
     return null;
+}
+
+/// Whether class symbols `a` and `b` are one class: the same symbol, or an `expect`
+/// class (a nested one included) and the `actual` that implements it, which share
+/// its name.
+fn sameClass(s: *Sema, a: Sym, b: Sym) bool {
+    if (a == b) return true;
+    if (s.syms.kind(a) != .class or s.syms.kind(b) != .class) return false;
+    const fa = s.syms.flags(a);
+    const fb = s.syms.flags(b);
+    if (!fa.expect and !fb.expect and !fa.actual and !fb.actual and !fa.superseded and !fb.superseded) return false;
+    return s.syms.classInfo(a).fqn == s.syms.classInfo(b).fqn;
 }
 
 /// The substitution a class type applies to its class's type parameters.
@@ -245,7 +257,7 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
     // join to `T`.
     const top: ?TypeId = for (non_nothing.items) |c| {
         if (try allFit(s, non_nothing.items, c)) break c;
-    } else null;
+    } else try sharedParamBound(s, non_nothing.items);
     if (top) |t| {
         result = t;
     } else {
@@ -305,6 +317,26 @@ fn commonSupertypeAt(s: *Sema, list: []const TypeId, depth: u8) Allocator.Error!
     return if (any_nullable) s.types.makeNullable(result) else result;
 }
 
+/// A type parameter that bounds the first of `items`, directly or through another's
+/// bound, and that every one of them fits: `R1 : T` and `R2 : T` join to `T`, which no
+/// class the inputs extend names.
+fn sharedParamBound(s: *Sema, items: []const TypeId) Allocator.Error!?TypeId {
+    var queue: std.ArrayList(TypeId) = .empty;
+    var t = items[0];
+    var qi: usize = 0;
+    while (true) {
+        if (s.types.get(t) == .param) {
+            for (try headers.typeParamBounds(s, s.types.get(t).param.sym)) |bound| {
+                if (s.types.get(try s.types.makeNotNull(bound)) == .param) try queue.append(s.arena, bound);
+            }
+        }
+        if (qi >= queue.items.len or qi >= 16) return null;
+        t = queue.items[qi];
+        qi += 1;
+        if (try allFit(s, items, t)) return t;
+    }
+}
+
 /// The classes a type is made of: its own, a type parameter's bounds', an
 /// intersection's parts'.
 fn classRoots(s: *Sema, t: TypeId, out: *std.ArrayList(Sym)) Allocator.Error!void {
@@ -341,7 +373,7 @@ fn viewAs(s: *Sema, t: TypeId, cls: Sym) Allocator.Error!?TypeId {
 /// Whether no class can be below every one of `parts`: two classes neither
 /// of which extends the other (one class has one superclass), or a final
 /// class and an interface it does not implement.
-fn emptyIntersection(s: *Sema, parts: []const TypeId) Allocator.Error!bool {
+pub fn emptyIntersection(s: *Sema, parts: []const TypeId) Allocator.Error!bool {
     for (parts, 0..) |x, i| for (parts[i + 1 ..]) |y| {
         const xc = s.types.classSym(try s.types.makeNotNull(x));
         const yc = s.types.classSym(try s.types.makeNotNull(y));

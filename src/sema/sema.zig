@@ -33,6 +33,7 @@ pub const suppress = @import("suppress.zig");
 pub const declcheck = @import("declcheck.zig");
 pub const annocheck = @import("annocheck.zig");
 pub const usecheck = @import("usecheck.zig");
+pub const optin = @import("optin.zig");
 
 const Allocator = std.mem.Allocator;
 pub const Name = names.Name;
@@ -91,6 +92,7 @@ pub const Builtins = struct {
     low_priority: Sym = .none,
     platform_dependent: Sym = .none,
     deprecated: Sym = .none,
+    dsl_marker: Sym = .none,
     kfunction: Sym = .none,
     any: Sym = .none,
     nothing: Sym = .none,
@@ -181,6 +183,12 @@ pub const Sema = struct {
     /// What a local `val` being not null says about the values its
     /// initializer read: `val a = b?.f()` makes `b` not null with `a`.
     nonnull_implies: std.AutoHashMapUnmanaged(Sym, []const @import("body.zig").Implied) = .empty,
+    /// What a local Boolean `val` holding a condition says on each outcome: `val ok =
+    /// x != null && y is A` makes `x` not null and `y` an `A` where `ok` is true.
+    bool_implies: std.AutoHashMapUnmanaged(Sym, @import("body.zig").ImpliedFacts) = .empty,
+    /// The `when`s with a subject and no `else` that match every subject,
+    /// by `flowcheck.whenKey`.
+    exhaustive_whens: std.AutoHashMapUnmanaged(u64, void) = .empty,
     /// How many writes to each local `var` have been analyzed: a write
     /// after a `val` read it ends what the `val` implied of it.
     local_writes: std.AutoHashMapUnmanaged(Sym, u32) = .empty,
@@ -211,10 +219,17 @@ pub const Sema = struct {
     /// `headers.annotationKey`: resolved on first use, and read back from a
     /// base image for the base's declarations, which have no AST.
     annotation_classes: std.AutoHashMapUnmanaged(u64, []const Sym) = .empty,
+    /// The `@DslMarker` annotation classes a class carries, on itself or a
+    /// supertype, by class.
+    dsl_markers: std.AutoHashMapUnmanaged(Sym, []const Sym) = .empty,
     /// How each declaration asked about is deprecated, by its own
     /// annotations (`usecheck.ownDeprecation`); read back from a base image
     /// for the base's.
     deprecations: std.AutoHashMapUnmanaged(Sym, ?usecheck.Deprecation) = .empty,
+    /// The level each annotation class asked about requires its opt-in at,
+    /// null for one that is no `@RequiresOptIn` marker
+    /// (`optin.markerLevel`); read back from a base image for the base's.
+    opt_in_markers: std.AutoHashMapUnmanaged(Sym, ?optin.Level) = .empty,
     /// The variables calls are inferring from the lambdas passed to them
     /// (builder inference), each to the system of the call inferring it.
     builder_owners: std.AutoHashMapUnmanaged(u32, *infer.System) = .empty,
@@ -376,6 +391,7 @@ pub const Sema = struct {
         b.low_priority = self.classByFqn("kotlin.internal.LowPriorityInOverloadResolution");
         b.platform_dependent = self.classByFqn("kotlin.internal.PlatformDependent");
         b.deprecated = self.classByFqn("kotlin.Deprecated");
+        b.dsl_marker = self.classByFqn("kotlin.DslMarker");
         b.kfunction = self.classByFqn("kotlin.reflect.KFunction");
         const t = &self.t;
         const ts = &self.types;

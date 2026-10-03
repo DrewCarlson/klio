@@ -22,6 +22,7 @@ const subtyping = @import("subtyping.zig");
 const members = @import("members.zig");
 const records = @import("records.zig");
 const infer = @import("infer.zig");
+const declcheck = @import("declcheck.zig");
 const calls = @import("calls.zig");
 const census_mod = @import("census.zig");
 const exhaustive = @import("exhaustive.zig");
@@ -62,6 +63,7 @@ pub const Narrow = struct {
 /// speaks of, `writes` is how many writes to the `var` came before the
 /// `val`: one after ends the fact.
 pub const Implied = struct { narrow: Narrow, writes: u32 = 0 };
+pub const ImpliedFacts = struct { when_true: []const Implied, when_false: []const Implied };
 
 pub const Excluded = union(enum) {
     none,
@@ -78,6 +80,11 @@ pub const ContextValue = struct { ty: TypeId, sym: Sym };
 
 pub const ScopeKind = enum { file, class, function, lambda, block };
 
+/// How a function literal runs: a suspend one, in place where its inline
+/// callee calls it (not `crossinline`, not `noinline`), plainly, or not
+/// known (its expected type is not a function type yet).
+pub const Runs = enum { plain, suspend_, in_place, unknown };
+
 pub const Scope = struct {
     parent: ?*Scope,
     kind: ScopeKind,
@@ -85,6 +92,9 @@ pub const Scope = struct {
     owner: Sym = .none,
     /// The label `return@l` and `this@l` use: a function's or lambda's name.
     label: Name = .empty,
+    /// For a lambda or anonymous function: how it runs, as a suspend call in
+    /// it asks.
+    runs: Runs = .plain,
     locals: std.ArrayList(Local) = .empty,
     receivers: std.ArrayList(Recv) = .empty,
     contexts: std.ArrayList(ContextValue) = .empty,
@@ -102,6 +112,9 @@ pub const Scope = struct {
     /// For a lambda: a `return@label` without a value was seen, which makes
     /// the lambda's result Unit.
     unit_return: bool = false,
+    /// For a lambda: the call it is passed to infers its result type
+    /// (`Ctx.lambda_result_inferred`), so `ret` does not hold its values.
+    ret_inferred: bool = false,
     /// For a function: its declared return type, for `return`.
     ret: TypeId = .none,
 };
@@ -149,9 +162,19 @@ pub const Ctx = struct {
     /// The label the next lambda literal takes: written (`lit@{ ... }`) or
     /// the name of the function it is passed to. Taken by `calls.lambda`.
     lambda_label: Name = .empty,
+    /// Set while a lambda or anonymous function is passed for an inline
+    /// function's parameter that runs it in place. Taken by `calls.lambda`.
+    lambda_in_place: bool = false,
+    /// Set while the call a lambda or anonymous function is passed to infers its result
+    /// type (`getOrElse`'s `V`): kotlinc fixes that type with the result in view, so the
+    /// result is not held to what the call fixed before it. Taken once, as the label is.
+    lambda_result_inferred: bool = false,
     /// Set when a lambda's parameter or receiver type was left to builder
     /// inference: its body gave it its type.
     builder_typed: bool = false,
+    /// The call `calls.call` is resolving, where a diagnosis of its
+    /// arguments finds their labels and type arguments.
+    call_site: ?calls.CallSite = null,
     /// Set when a lambda was analyzed with no function type expected of it
     /// (against a type variable or `Any`): its shape is its own header's, a
     /// guess the expected type may replace (`{ _ -> }` in `listOf` passed
@@ -207,6 +230,7 @@ pub const Ctx = struct {
 
     pub fn addRef(self: *Ctx, r: records.Ref) Allocator.Error!void {
         if (self.s.census.muted != 0) return;
+        if (r.dispatch == .implicit or r.extension == .implicit) try dslScope(self, r);
         var ref = r;
         ref.file = self.file;
         if (ref.node == .none) ref.node = self.node;
@@ -330,6 +354,8 @@ pub fn resolveAll(s: *Sema, origins: []const sema_mod.Origin) Allocator.Error!vo
         try @import("declcheck.zig").checkProgram(s);
         try @import("annocheck.zig").checkProgram(s);
         try @import("usecheck.zig").checkProgram(s);
+        try @import("optin.zig").checkProgram(s);
+        try @import("flowcheck.zig").checkProgram(s);
     };
 }
 
@@ -574,7 +600,7 @@ fn resolveFunction(ctx: *Ctx, f: Sym) Allocator.Error!void {
             .Block => |*blk| _ = try bodyBlock(ctx, blk),
             .Expr => |*e| {
                 const t = try expr(ctx, e, ret);
-                if (s.syms.functionInfo(f).ret == .none) s.syms.functionInfo(f).ret = try escapingType(s, f, t);
+                if (s.syms.functionInfo(f).ret == .none) s.syms.functionInfo(f).ret = try escapingType(s, f, t) else if (fd.return_type != null) try checkFits(ctx, e.span(), t, ret, .return_);
             },
         }
     }
@@ -636,9 +662,18 @@ fn resolveParamDefaults(ctx: *Ctx, params: []const Sym) Allocator.Error!void {
             .class_param => |cp| if (cp) |x| (if (x.default) |*d| d else null) else null,
             else => null,
         };
+        const eq: u32 = switch (sym.decl) {
+            .param => |pd| if (pd) |x| x.default_eq else 0,
+            .class_param => |cp| if (cp) |x| x.default_eq else 0,
+            else => 0,
+        };
         // A `vararg` parameter's default is the whole array (`vararg val
         // arg: String = []`).
-        if (default) |d| try typedValue(ctx, d, try symbolType(ctx, p));
+        if (default) |d| {
+            const declared = try symbolType(ctx, p);
+            const t = try typedValue(ctx, d, declared);
+            if (!s.syms.flags(p).vararg) try checkFits(ctx, d.span(), t, declared, .{ .initializer = eq });
+        }
     }
 }
 
@@ -646,9 +681,126 @@ fn resolveParamDefaults(ctx: *Ctx, params: []const Sym) Allocator.Error!void {
 /// expression body, an initializer. Its type is a subtype of the declared
 /// one, which a call inferring a variable from the enclosing lambda's body
 /// learns (`fun source(): Buildee<Target> = this` in a builder lambda).
-fn typedValue(ctx: *Ctx, e: *const Expr, declared: TypeId) Allocator.Error!void {
+fn typedValue(ctx: *Ctx, e: *const Expr, declared: TypeId) Allocator.Error!TypeId {
     const t = try expr(ctx, e, declared);
     try infer.noteExpected(ctx.s, t, declared);
+    return t;
+}
+
+/// Where a value meets the type its place declares, as kotlinc names the mismatch.
+/// Where a value meets its declared type. An initializer and an assignment
+/// carry where their `=` is written (0 when unknown), where kotlinc reports
+/// them; `component` is the `componentN` a destructuring entry with a
+/// written type reads.
+pub const FitSite = union(enum) { initializer: u32, return_, assignment: u32, other, component: usize };
+
+/// A value of type `got` where its place declares `declared`, reported as kotlinc reports
+/// one that does not fit, at `at`, the value. Judged only once both types are known: a
+/// type still being inferred (a variable a call or a lambda's body is fixing) or one the
+/// analysis could not make says nothing. Only a program's files are judged.
+pub fn checkFits(ctx: *Ctx, at: Span, got: TypeId, declared: TypeId, site: FitSite) Allocator.Error!void {
+    const s = ctx.s;
+    if (got == .none or declared == .none or s.types.isErr(got) or s.types.isErr(declared)) return;
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc)) return;
+    const g = try infer.zonk(s, got);
+    const d = try infer.zonk(s, declared);
+    if (s.types.isErr(g) or s.types.isErr(d) or infer.hasOpenVar(s, g) or infer.hasOpenVar(s, d)) return;
+    if (try subtyping.isSubtype(s, g, d)) return;
+    if (foreignParam(ctx, g) or foreignParam(ctx, d)) return;
+    // kotlinc names one mismatch a value makes, the innermost: a lambda's result
+    // reported, the call or the declaration taking the lambda is not. Each
+    // component of a destructured value is a value of its own.
+    if (site != .component and mismatchWithin(s, ctx.file, at)) return;
+    const gt = try sema_mod.diagnose.typeText(s, s.arena, g);
+    const dt = try sema_mod.diagnose.typeText(s, s.arena, d);
+    const report_at = switch (site) {
+        .initializer, .assignment => |eq| if (eq != 0) Span.init(at.file, eq, eq + 1) else at,
+        else => at,
+    };
+    const msg, const factory: census_mod.Factory = switch (site) {
+        .initializer => .{ try std.fmt.allocPrint(s.arena, "Initializer type mismatch: expected '{s}', actual '{s}'.", .{ dt, gt }), .INITIALIZER_TYPE_MISMATCH },
+        .return_ => .{ try std.fmt.allocPrint(s.arena, "Return type mismatch: expected '{s}', actual '{s}'.", .{ dt, gt }), .RETURN_TYPE_MISMATCH },
+        .assignment => .{ try std.fmt.allocPrint(s.arena, "Assignment type mismatch: actual type is '{s}', but '{s}' was expected.", .{ gt, dt }), .ASSIGNMENT_TYPE_MISMATCH },
+        .other => .{ try std.fmt.allocPrint(s.arena, "Type mismatch: inferred type is '{s}', but '{s}' was expected.", .{ gt, dt }), .TYPE_MISMATCH },
+        .component => |n| .{ try std.fmt.allocPrint(s.arena, "Operator call 'component{d}()' returns '{s}', but '{s}' is expected.", .{ n, gt, dt }), .COMPONENT_FUNCTION_RETURN_TYPE_MISMATCH },
+    };
+    try ctx.reportFacts(.type_mismatch, report_at, .{ .message = msg, .factory = factory }, "{s}", .{msg});
+}
+
+/// Whether `t` names a type parameter no declaration around the site declares: a
+/// generic declaration's type the analysis left uninstantiated, which says
+/// nothing about the value.
+fn foreignParam(ctx: *Ctx, t: TypeId) bool {
+    const s = ctx.s;
+    switch (s.types.get(t)) {
+        .param => |p| return !paramInScope(ctx, p.sym),
+        .class => |c| {
+            for (c.args) |a| if (a.variance != .star and a.ty != .none and foreignParam(ctx, a.ty)) return true;
+            return false;
+        },
+        .intersection => |parts| {
+            for (parts) |part| if (foreignParam(ctx, part)) return true;
+            return false;
+        },
+        else => return false,
+    }
+}
+
+/// Whether the declaration owning type parameter `param` encloses the scope
+/// being analyzed.
+fn paramInScope(ctx: *Ctx, param: Sym) bool {
+    const s = ctx.s;
+    const decl = s.syms.owner(param);
+    var sc: ?*Scope = ctx.scope;
+    while (sc) |c| : (sc = c.parent) {
+        var o = c.owner;
+        while (o != .none and s.syms.kind(o) != .package) : (o = s.syms.owner(o)) {
+            if (o == decl) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether a type mismatch inside `at` was reported already: the latest sites, in the
+/// buffers open now and the census, are the value's own, its resolution just done.
+fn mismatchWithin(s: *Sema, file: u32, at: Span) bool {
+    const within = struct {
+        fn in(sites: []const census_mod.Site, f: u32, sp: Span) bool {
+            var i = sites.len;
+            var seen: usize = 0;
+            while (i > 0 and seen < 32) : (seen += 1) {
+                i -= 1;
+                const st = sites[i];
+                if (st.reason == .type_mismatch and st.file == f and st.sp.start >= sp.start and st.sp.end <= sp.end) return true;
+            }
+            return false;
+        }
+    }.in;
+    var b = s.census.buffer;
+    while (b) |buf| : (b = buf.parent) {
+        if (within(buf.sites.items, file, at)) return true;
+    }
+    return within(s.census.sites.items, file, at);
+}
+
+/// A getter that writes its return type writes its property's.
+fn checkGetterType(ctx: *Ctx, rt: *const ast.TypeRef, prop_t: TypeId) Allocator.Error!void {
+    const s = ctx.s;
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc) or prop_t == .none or s.types.isErr(prop_t)) return;
+    const gt = try headers.resolveTypeRef(s, typeCtx(ctx), rt);
+    if (s.types.isErr(gt) or try subtyping.equivalent(s, gt, prop_t)) return;
+    const msg = try std.fmt.allocPrint(s.arena, "Getter return type must be equal to the type of the property, i.e. '{s}'.", .{try sema_mod.diagnose.typeText(s, s.arena, prop_t)});
+    try ctx.reportFacts(.type_mismatch, rt.span, .{ .message = msg, .factory = .WRONG_GETTER_RETURN_TYPE }, "{s}", .{msg});
+}
+
+/// `return value` against what its target gives: a function's or an accessor's declared
+/// type, a lambda's expected result, which a `Unit` one does not hold its values to.
+fn checkReturn(ctx: *Ctx, sc: *const Scope, at: Span, t: TypeId) Allocator.Error!void {
+    if (sc.ret == .none or sc.ret_inferred) return;
+    if (sc.kind == .lambda and (try infer.zonk(ctx.s, sc.ret)) == ctx.s.t.unit) return;
+    try checkFits(ctx, at, t, sc.ret, .return_);
 }
 
 /// A delegated property whose type is written takes what its delegate's
@@ -757,7 +909,10 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
     }
     if (pd.init) |i| {
         const t = try expr(ctx, i, declared);
-        if (s.syms.propertyInfo(p).ty == .none) s.syms.propertyInfo(p).ty = try escapingType(s, p, try widenForDecl(s, t)) else try infer.noteExpected(s, t, declared);
+        if (s.syms.propertyInfo(p).ty == .none) s.syms.propertyInfo(p).ty = try escapingType(s, p, try widenForDecl(s, t)) else {
+            try infer.noteExpected(s, t, declared);
+            if (pd.ty != null) try checkFits(ctx, i.span(), t, declared, .{ .initializer = pd.init_eq });
+        }
     }
     if (pd.explicit_field) |ef| {
         var ft: TypeId = if (ef.ty) |tr| try headers.resolveTypeRef(s, typeCtx(ctx), tr) else .none;
@@ -772,10 +927,14 @@ fn resolvePropertyIn(ctx: *Ctx, p: Sym) Allocator.Error!void {
         gsc.member_body = true;
         gsc.label = sym.name;
         const field_t = s.syms.propertyInfo(p).ty;
-        const t = try accessorBody(ctx, g, field_t);
+        const t = try accessorBody(ctx, g, field_t, field_t);
         if (s.syms.propertyInfo(p).ty == .none) {
             s.syms.propertyInfo(p).ty = t;
-        } else if (g.body == .Expr) try infer.noteExpected(s, t, field_t);
+        } else if (g.body == .Expr) {
+            try infer.noteExpected(s, t, field_t);
+            if (pd.ty != null and g.return_type == null) try checkFits(ctx, g.body.Expr.span(), t, field_t, .return_);
+        }
+        if (pd.ty != null) if (g.return_type) |rt| try checkGetterType(ctx, rt, field_t);
         ctx.pop(gsc);
     }
     if (pd.setter) |st| {
@@ -810,25 +969,29 @@ fn resolveSetter(ctx: *Ctx, p: Sym, st: *const ast.Accessor) Allocator.Error!voi
     try ctx.declareLocal(s.syms.name(vsym), vsym);
     // The setter's value parameter, found by the accessor's node.
     try ctx.addRef(.{ .file = ctx.file, .node = st.id, .anchor = if (st.params.len != 0) st.params[0].span else st.span, .kind = .decl, .target = vsym });
-    ssc.ret = s.t.unit;
-    _ = try accessorBody(ctx, st, vt);
+    _ = try accessorBody(ctx, st, vt, s.t.unit);
 }
 
-fn accessorBody(ctx: *Ctx, acc: *const ast.Accessor, field_t: TypeId) Allocator.Error!TypeId {
+/// An accessor's body, `field` typed `field_t`; `ret` is what it gives: a getter its
+/// property's type, a setter nothing (`Unit`, which an expression body is not held to).
+fn accessorBody(ctx: *Ctx, acc: *const ast.Accessor, field_t: TypeId, ret: TypeId) Allocator.Error!TypeId {
     const s = ctx.s;
-    // `field` is the backing field inside an accessor.
-    const fsym = try newLocal(ctx, wk.field, .{ .name = "field", .span = acc.span }, field_t, true);
-    try ctx.declareLocal(wk.field, fsym);
-    if (ctx.scope.owner != .none and s.syms.kind(ctx.scope.owner) == .property) {
-        try s.backing_fields.put(s.arena, fsym, ctx.scope.owner);
+    // `field` is the backing field inside an accessor; an extension
+    // property has none.
+    const owner = ctx.scope.owner;
+    const is_property = owner != .none and s.syms.kind(owner) == .property;
+    if (!is_property or s.syms.propertyInfo(owner).receiver == .none) {
+        const fsym = try newLocal(ctx, wk.field, .{ .name = "field", .span = acc.span }, field_t, true);
+        try ctx.declareLocal(wk.field, fsym);
+        if (is_property) try s.backing_fields.put(s.arena, fsym, owner);
     }
-    ctx.scope.ret = field_t;
+    ctx.scope.ret = ret;
     return switch (acc.body) {
         .Block => |*b| blk: {
             _ = try bodyBlock(ctx, b);
             break :blk if (field_t != .none) field_t else s.types.errType();
         },
-        .Expr => |*e| try expr(ctx, e, field_t),
+        .Expr => |*e| try expr(ctx, e, if (ret == s.t.unit) .none else ret),
     };
 }
 
@@ -1214,7 +1377,10 @@ fn superCalls(ctx: *Ctx, cls: Sym, supertypes: []const ast.TypeRef, args: []cons
         if (i < delegates.len) {
             // `: I<V> by Impl(x)`: the delegate is expected to be the
             // interface it implements.
-            if (delegates[i]) |*d| try typedValue(ctx, d, try headers.resolveTypeRef(s, tctx, tr));
+            if (delegates[i]) |*d| {
+                const iface = try headers.resolveTypeRef(s, tctx, tr);
+                try checkFits(ctx, d.span(), try typedValue(ctx, d, iface), iface, .other);
+            }
         }
     }
 }
@@ -1319,14 +1485,14 @@ fn stmt(ctx: *Ctx, st: *const ast.Stmt, expected: TypeId) Allocator.Error!TypeId
             const saved = ctx.enterNode(d.id);
             defer ctx.leaveNode(saved);
             const t = try expr(ctx, &d.init, .none);
-            try destructure(ctx, d.names, d.by_name, d.sources, t, d.init.span(), d.mutable);
+            try destructure(ctx, d.names, d.by_name, d.sources, d.types, t, d.init.span(), d.mutable);
             return s.t.unit;
         },
     }
 }
 
 /// `val (a, b) = x`: `componentN` on `x` for each name.
-pub fn destructure(ctx: *Ctx, idents: []const ast.Ident, by_name: bool, sources: []const ast.Ident, t: TypeId, anchor: Span, mutable: bool) Allocator.Error!void {
+pub fn destructure(ctx: *Ctx, idents: []const ast.Ident, by_name: bool, sources: []const ast.Ident, written: []const ?ast.TypeRef, t: TypeId, anchor: Span, mutable: bool) Allocator.Error!void {
     const s = ctx.s;
     for (idents, 0..) |id, i| {
         // `_` takes nothing: its `componentN` is not called. By name,
@@ -1343,6 +1509,16 @@ pub fn destructure(ctx: *Ctx, idents: []const ast.Ident, by_name: bool, sources:
         } else {
             et = try calls.componentCall(ctx, t, i + 1, id.span, anchor);
         }
+        // A written type is the local's: the component must fit it.
+        if (i < written.len) if (written[i]) |*tr| {
+            const declared = try resolveTypeInBody(ctx, tr);
+            if (by_name) {
+                try checkFits(ctx, tr.span, et, declared, .{ .initializer = 0 });
+            } else {
+                try checkFits(ctx, anchor, et, declared, .{ .component = i + 1 });
+            }
+            et = declared;
+        };
         const sym = try newLocal(ctx, try ctx.intern(id.name), id, et, mutable);
         try ctx.declareLocal(s.syms.name(sym), sym);
         try ctx.addRef(.{ .file = ctx.file, .anchor = id.span, .kind = .decl, .target = sym });
@@ -1370,9 +1546,30 @@ fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {
             var declared: TypeId = .none;
             if (p.ty) |tr| declared = try headers.resolveTypeRef(s, typeCtx(ctx), tr);
             var t = declared;
+            // A `var` initialized with a value a smart cast narrows takes the value's own
+            // type, as kotlinc does, and starts narrowed (`var e = node` after `node !=
+            // null` is a `Node?` that can be set back to null).
+            var narrowed: TypeId = .none;
+            var cond_facts: ?Facts = null;
             if (p.init) |i| {
-                const it = try expr(ctx, i, declared);
-                if (declared == .none) t = try widenForDecl(s, it) else try infer.noteExpected(s, it, declared);
+                // A `val` holding a condition keeps what each outcome implies, as kotlinc's
+                // smart casts through a local Boolean do.
+                const as_cond = !p.mutable and p.delegate == null and conditionForm(i) and (declared == .none or declared == s.t.boolean);
+                const it = if (as_cond) blk: {
+                    const r = try conditionTyped(ctx, i);
+                    cond_facts = r.facts;
+                    break :blk r.ty;
+                } else try expr(ctx, i, declared);
+                if (declared == .none) {
+                    t = try widenForDecl(s, it);
+                    if (p.mutable) if (try unnarrowedType(ctx, i, t)) |orig| {
+                        narrowed = t;
+                        t = orig;
+                    };
+                } else {
+                    try infer.noteExpected(s, it, declared);
+                    try checkFits(ctx, i.span(), it, declared, .{ .initializer = p.init_eq });
+                }
             }
             if (p.delegate) |del| {
                 const dt = try delegateExpr(ctx, del, declared, p.mutable, try calls.thisRefType(ctx));
@@ -1390,6 +1587,8 @@ fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {
             s.syms.getMut(sym).decl = .{ .local_prop = p };
             try ctx.addRef(.{ .file = ctx.file, .anchor = p.name.span, .kind = .decl, .target = sym });
             try ctx.declareLocal(s.syms.name(sym), sym);
+            if (narrowed != .none) try ctx.scope.narrow.append(s.arena, .{ .sym = sym, .ty = narrowed, .reset = true });
+            if (cond_facts) |f| try recordBoolImplies(ctx, sym, f);
             if (!p.mutable) if (p.init) |i| try recordNonNullImplies(ctx, sym, i);
         },
         .Function => |*f| {
@@ -1643,6 +1842,7 @@ fn assignment(ctx: *Ctx, a: *const ast.AssignStmt) Allocator.Error!void {
         const target_t = try assignTarget(ctx, &a.target);
         const vt = try expr(ctx, &a.value, target_t);
         try infer.noteExpected(s, vt, target_t);
+        try checkFits(ctx, a.value.span(), vt, target_t, .{ .assignment = a.op_at });
         try narrowAfterAssign(ctx, &a.target, vt);
         return;
     }
@@ -1689,6 +1889,15 @@ fn tryExpr(ctx: *Ctx, t: *const ast.TryExpr, expected: TypeId) Allocator.Error!T
         const sc = try ctx.push(.block, .none);
         try applyFacts(ctx, entry);
         const ct = try resolveTypeInBody(ctx, &c.ty);
+        // A catch cannot tell a type parameter's instances apart unless it
+        // is reified.
+        switch (s.types.get(ct)) {
+            .param => |p| if (!s.syms.flags(p.sym).reified) {
+                const msg = "Non-reified type parameters cannot be used by catch parameters.";
+                try ctx.reportFacts(.declaration, c.binding.span, .{ .message = msg, .factory = .TYPE_PARAMETER_IN_CATCH_CLAUSE }, "{s}", .{msg});
+            },
+            else => {},
+        }
         const sym = try newLocal(ctx, try ctx.intern(c.binding.name), c.binding, ct, false);
         try ctx.declareLocal(s.syms.name(sym), sym);
         {
@@ -1758,7 +1967,17 @@ fn narrowAfterAssign(ctx: *Ctx, target: *const Expr, vt_in: TypeId) Allocator.Er
     const s = ctx.s;
     if (target.* != .Path or target.Path.segments.len != 1) return;
     const n = s.names.lookup(target.Path.segments[0].name) orelse return;
-    const loc = lookupLocalValue(ctx, n) orelse return;
+    const loc = lookupLocalValue(ctx, n) orelse {
+        // A `val` property assigned in its class's initialization is that
+        // value from there on (`func = {}` then `func()`).
+        const subj = (try subjectOf(ctx, target)) orelse return;
+        const declared = try symbolType(ctx, subj.sym);
+        if (declared == .none or s.types.isErr(declared) or vt_in == .none or s.types.isErr(vt_in)) return;
+        const vt = try widenForDecl(s, try infer.zonk(s, vt_in));
+        if (infer.hasOpenVar(s, vt) or isNothingType(s, try s.types.makeNotNull(vt)) or !try subtyping.isSubtype(s, vt, declared)) return;
+        try ctx.scope.narrow.append(s.arena, .{ .sym = subj.sym, .ty = vt, .reset = true });
+        return;
+    };
     // A `var`, or a `val` declared without an initializer and assigned
     // once later.
     if (s.syms.kind(loc) != .local) return;
@@ -1771,6 +1990,18 @@ fn narrowAfterAssign(ctx: *Ctx, target: *const Expr, vt_in: TypeId) Allocator.Er
     try ctx.scope.narrow.append(s.arena, .{ .sym = loc, .ty = t, .reset = true });
     var log = ctx.try_log;
     while (log) |l| : (log = l.parent) try l.assigned.append(s.arena, .{ .sym = loc, .ty = t });
+}
+
+/// The type of the local or parameter `e` names before the smart cast that made it `t`;
+/// null where nothing narrows it.
+fn unnarrowedType(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!?TypeId {
+    const s = ctx.s;
+    if (e.* != .Path or e.Path.segments.len != 1) return null;
+    const n = s.names.lookup(e.Path.segments[0].name) orelse return null;
+    const sym = lookupLocalValue(ctx, n) orelse return null;
+    const declared = try widenForDecl(s, try symbolType(ctx, sym));
+    if (declared == .none or s.types.isErr(declared) or try subtyping.equivalent(s, declared, t)) return null;
+    return declared;
 }
 
 /// Resolves an assignment's left side as a write and returns its type.
@@ -1911,11 +2142,17 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
             return qualifiedAccess(ctx, e, .read);
         },
         .Member => |m| return memberAccess(ctx, e, m.receiver, m.name, m.safe, .read),
-        .Call => return calls.call(ctx, e, expected),
+        .Call => {
+            // An operator member on integer constants folds as `1 + 2` does.
+            if (constCall(e)) |cc| if (intConstValue(e) != null) {
+                return if (cc.arg) |x| constArithmetic(ctx, &.{ cc.recv, x }, expected) else constArithmetic(ctx, &.{cc.recv}, expected);
+            };
+            return calls.call(ctx, e, expected);
+        },
         .Index => |ix| return calls.indexGet(ctx, e, ix.receiver, ix.args),
         .Binary => |b| return binary(ctx, e, b.op, b.lhs, b.rhs, expected),
         .Unary => |u| {
-            if (u.expr.* != .IntLit) if (intConstValue(e)) |v| return constArithmetic(ctx, &.{u.expr}, v, expected);
+            if (u.expr.* != .IntLit) if (intConstValue(e) != null) return constArithmetic(ctx, &.{u.expr}, expected);
             return calls.unary(ctx, e, u.op, u.expr, expected);
         },
         .Postfix => |p| {
@@ -1937,6 +2174,9 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
             _ = try expr(ctx, w.body, .none);
             ctx.used = true;
             ctx.pop(sc);
+            // A loop that ends only when its condition is false leaves what that implies
+            // (`while (e == null) e = next()` leaves `e` not null).
+            if (!mayBreakOut(w.body, false)) try applyFacts(ctx, facts.when_false);
             return s.t.unit;
         },
         .DoWhile => |w| {
@@ -1950,8 +2190,9 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
                 }
                 ctx.used = true;
             }
-            _ = try condition(ctx, w.cond);
+            const facts = try condition(ctx, w.cond);
             ctx.pop(sc);
+            if (w.body == null or !mayBreakOut(w.body.?, false)) try applyFacts(ctx, facts.when_false);
             return s.t.unit;
         },
         .For => |f| return forLoop(ctx, f),
@@ -1963,6 +2204,7 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
                 const target = returnTarget(ctx, r.label);
                 const t = try expr(ctx, v, if (target) |sc| sc.ret else .none);
                 if (target) |sc| try infer.noteExpected(s, t, sc.ret);
+                if (target) |sc| try checkReturn(ctx, sc, v.span(), t);
                 if (target) |sc| if (sc.lambda_returns) |lr| try lr.append(s.arena, t);
             } else if (returnTarget(ctx, r.label)) |sc| {
                 if (sc.lambda_returns) |lr| try lr.append(s.arena, s.t.unit);
@@ -1982,7 +2224,7 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
             return block(ctx, b, expected);
         },
         .Throw => |t| {
-            _ = try expr(ctx, t.value, s.t.throwable);
+            try checkFits(ctx, t.value.span(), try expr(ctx, t.value, s.t.throwable), s.t.throwable, .other);
             return s.t.nothing;
         },
         .Try => |t| return tryExpr(ctx, t, expected),
@@ -1997,8 +2239,9 @@ fn exprInner(ctx: *Ctx, e: *const Expr, expected: TypeId) Allocator.Error!TypeId
         .MemberRef => |r| return calls.callableRef(ctx, e, r.receiver, r.name, expected),
         .When => |w| return whenExpr(ctx, w, expected),
         .IsCheck => |c| {
-            _ = try expr(ctx, c.expr, .none);
+            const subject = try expr(ctx, c.expr, .none);
             const t = try resolveTypeInBody(ctx, &c.ty);
+            try erasedTest(ctx, subject, t, c.ty.span);
             try typeTestRef(ctx, if (c.negated) .not_is else .is_, t, c.ty.span, .none);
             return s.t.boolean;
         },
@@ -2072,7 +2315,7 @@ fn intLiteral(ctx: *Ctx, value: i64, kind: ast.IntLitKind, expected: TypeId) All
 
 /// Arithmetic over integer literals, of value `v`: its operands are
 /// visited as the operands they are, and it is the literal of `v`.
-fn constArithmetic(ctx: *Ctx, operands: []const *const Expr, v: i64, expected: TypeId) Allocator.Error!TypeId {
+fn constArithmetic(ctx: *Ctx, operands: []const *const Expr, expected: TypeId) Allocator.Error!TypeId {
     const saved = ctx.in_arg;
     ctx.in_arg = .none;
     for (operands) |o| _ = expr(ctx, o, .none) catch |err| {
@@ -2081,21 +2324,20 @@ fn constArithmetic(ctx: *Ctx, operands: []const *const Expr, v: i64, expected: T
     };
     ctx.in_arg = saved;
     const s = ctx.s;
-    // An `Int` while every literal in it is one, wrapping as `Int`
-    // arithmetic does (`2147483647 + 1` is `-2147483648`); a `Short` or a
-    // `Byte` only where its value fits.
+    // An `Int` while every literal in it is one, computed and wrapping as `Int`
+    // arithmetic does (`2147483647 + 1` is `-2147483648`), which a `Long` takes
+    // widened; never a `Short` or a `Byte`, which kotlinc refuses an operator's
+    // result as, its value fitting or not.
     const lit: types.IntLit = .{
         .int = operandsFitInt(operands),
         .long = true,
-        .short = v >= std.math.minInt(i16) and v <= std.math.maxInt(i16),
-        .byte = v >= std.math.minInt(i8) and v <= std.math.maxInt(i8),
+        .short = false,
+        .byte = false,
     };
     if (expected != .none) {
         const exp_nn = try s.types.makeNotNull(try infer.zonk(s, expected));
         if (exp_nn == s.t.long) return s.t.long;
         if (exp_nn == s.t.int and lit.int) return s.t.int;
-        if (exp_nn == s.t.short and lit.short) return s.t.short;
-        if (exp_nn == s.t.byte and lit.byte) return s.t.byte;
         if (s.types.get(exp_nn) == .variable or s.types.get(exp_nn) == .param) return s.types.intern(.{ .int_lit = lit });
     }
     if (ctx.in_arg != .none) return s.types.intern(.{ .int_lit = lit });
@@ -2107,12 +2349,14 @@ fn operandsFitInt(operands: []const *const Expr) bool {
     return true;
 }
 
-/// Whether every integer literal in the constant expression `e` is an `Int`.
-fn literalsFitInt(e: *const Expr) bool {
+/// Whether every integer literal in the constant expression `e` is an `Int`, so it is
+/// computed as `Int` arithmetic.
+pub fn literalsFitInt(e: *const Expr) bool {
     return switch (e.*) {
         .IntLit => |l| l.value >= std.math.minInt(i32) and l.value <= std.math.maxInt(i32),
         .Unary => |u| literalsFitInt(u.expr),
         .Binary => |x| literalsFitInt(x.lhs) and literalsFitInt(x.rhs),
+        .Call => if (constCall(e)) |cc| literalsFitInt(cc.recv) and (if (cc.arg) |x| literalsFitInt(x) else true) else false,
         else => false,
     };
 }
@@ -2148,8 +2392,77 @@ pub fn intConstValue(e: *const Expr) ?i64 {
                 else => unreachable,
             };
         },
+        .Call => {
+            const cc = constCall(e) orelse return null;
+            const a = intConstValue(cc.recv) orelse return null;
+            const b: i64 = if (cc.arg) |x| intConstValue(x) orelse return null else 0;
+            return constOp(cc.name, a, b, 64);
+        },
         else => return null,
     }
+}
+
+/// An operator member called on an integer constant (`1 shl 2`, `0.inv()`,
+/// `1.plus(2)`), which kotlinc types and folds as it does `1 + 2`: its name, its
+/// receiver and its argument.
+const ConstCall = struct { name: []const u8, recv: *const Expr, arg: ?*const Expr };
+
+fn constCall(e: *const Expr) ?ConstCall {
+    if (e.* != .Call) return null;
+    const c = e.Call;
+    if (c.has_trailing_lambda) return null;
+    const unary_ops = [_][]const u8{ "inv", "unaryMinus", "unaryPlus" };
+    const binary_ops = [_][]const u8{ "plus", "minus", "times", "div", "rem", "shl", "shr", "ushr", "and", "or", "xor" };
+    // `a shl b`: the callee names the member, the arguments are both operands. Only the
+    // members declared `infix` are called so; `5 rem 2` names a program's infix `rem`.
+    if (c.is_infix) {
+        if (c.callee.* != .Path or c.callee.Path.segments.len != 1 or c.args.len != 2) return null;
+        const name = c.callee.Path.segments[0].name;
+        const infix_ops = [_][]const u8{ "shl", "shr", "ushr", "and", "or", "xor" };
+        for (infix_ops) |n| {
+            if (std.mem.eql(u8, n, name)) return .{ .name = n, .recv = &c.args[0], .arg = &c.args[1] };
+        }
+        return null;
+    }
+    if (c.callee.* != .Member or c.typeArgs().len != 0) return null;
+    for (c.argNames()) |n| if (n != null) return null;
+    const m = c.callee.Member;
+    if (m.safe) return null;
+    const names: []const []const u8 = if (c.args.len == 0) &unary_ops else if (c.args.len == 1) &binary_ops else return null;
+    for (names) |n| {
+        if (std.mem.eql(u8, n, m.name.name)) return .{ .name = n, .recv = m.receiver, .arg = if (c.args.len == 1) &c.args[0] else null };
+    }
+    return null;
+}
+
+/// Operator `name` of `a` and `b` in a `bits`-wide signed type (32 or 64), as that
+/// type's member computes it: a shift takes its count's low five or six bits. Null for a
+/// division by zero.
+fn constOp(name: []const u8, a: i64, b: i64, bits: u8) ?i64 {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "plus")) return a +% b;
+    if (eql(u8, name, "minus")) return a -% b;
+    if (eql(u8, name, "times")) return a *% b;
+    if (eql(u8, name, "div")) return if (b == 0) null else if (b == -1) -%a else @divTrunc(a, b);
+    if (eql(u8, name, "rem")) return if (b == 0) null else if (b == -1) 0 else @rem(a, b);
+    if (eql(u8, name, "unaryMinus")) return -%a;
+    if (eql(u8, name, "unaryPlus")) return a;
+    if (eql(u8, name, "and")) return a & b;
+    if (eql(u8, name, "or")) return a | b;
+    if (eql(u8, name, "xor")) return a ^ b;
+    if (eql(u8, name, "inv")) return ~a;
+    const ua: u64 = @bitCast(a);
+    const ub: u64 = @bitCast(b);
+    if (bits == 32) {
+        const x: u32 = @truncate(ua);
+        const n: u5 = @truncate(ub);
+        const r: u32 = if (eql(u8, name, "shl")) x << n else if (eql(u8, name, "ushr")) x >> n else @bitCast(@as(i32, @bitCast(x)) >> n);
+        return @as(i32, @bitCast(r));
+    }
+    const n: u6 = @truncate(ub);
+    if (eql(u8, name, "shl")) return @bitCast(ua << n);
+    if (eql(u8, name, "ushr")) return @bitCast(ua >> n);
+    return a >> n;
 }
 
 /// `intConstValue` computed in a `bits`-wide signed type, wrapping at every
@@ -2180,6 +2493,12 @@ pub fn intConstValueIn(e: *const Expr, bits: u8) ?i64 {
                 .Rem => if (b == 0) return null else if (b == -1) 0 else @rem(a, b),
                 else => unreachable,
             };
+        },
+        .Call => blk: {
+            const cc = constCall(e) orelse return null;
+            const a = intConstValueIn(cc.recv, bits) orelse return null;
+            const b: i64 = if (cc.arg) |x| intConstValueIn(x, bits) orelse return null else 0;
+            break :blk constOp(cc.name, a, b, if (bits == 64) 64 else 32) orelse return null;
         },
         else => return null,
     };
@@ -2425,7 +2744,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                 .Value => |*v| {
                     if (w.subject != null) {
                         const refs_before = ctx.refCount();
-                        _ = try expr(ctx, v, cur_t);
+                        const v_t = try expr(ctx, v, cur_t);
                         try covers.append(s.arena, switch (v.*) {
                             .NullLit => .null_,
                             .BoolLit => |b| .{ .bool_ = b.value },
@@ -2440,7 +2759,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                         // every later branch sees the subject not null.
                         if (v.* == .NullLit) {
                             try prior_false.appendSlice(s.arena, try subjectNonNullFacts(ctx, w, subject_sym, subject_t));
-                        } else if (br.patterns.len == 1 and try knownNonNull(ctx, v)) {
+                        } else if (br.patterns.len == 1 and try nonNullOperand(ctx, v, v_t)) {
                             // Equal to a value that is not null, it is not
                             // null either.
                             try applyFacts(ctx, try subjectNonNullFacts(ctx, w, subject_sym, subject_t));
@@ -2459,6 +2778,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                 },
                 .IsType => |*tr| {
                     const t = try isCheckType(ctx, tr, false);
+                    try erasedTest(ctx, cur_t, t, tr.span);
                     try typeTestRef(ctx, .is_, t, pat.span, .none);
                     try covers.append(s.arena, .{ .is_type = t });
                     if (br.patterns.len == 1) narrowed = t;
@@ -2471,6 +2791,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
                 },
                 .NotIsType => |*tr| {
                     const t = try resolveTypeInBody(ctx, tr);
+                    try erasedTest(ctx, cur_t, t, tr.span);
                     try typeTestRef(ctx, .not_is, t, pat.span, .none);
                     try covers.append(s.arena, .{ .not_is = t });
                     // A later branch runs only when the subject is a `t`.
@@ -2518,6 +2839,10 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
         if (missing) |names| {
             const msg = try exhaustive.message(s, names);
             try ctx.reportFacts(.non_exhaustive_when, Span.init(w.span.file, w.span.start, w.span.start + 4), .{ .message = msg }, "{s}", .{msg});
+        } else if (w.subject != null) {
+            // Matching every subject without `else`: the flow check takes no
+            // path past it.
+            try s.exhaustive_whens.put(s.arena, @import("flowcheck.zig").whenKey(ctx.file, w.id), {});
         }
     }
     // A `when` without `else` may match nothing and fall through.
@@ -2557,6 +2882,40 @@ fn recordNonNullImplies(ctx: *Ctx, sym: Sym, init: *const Expr) Allocator.Error!
     if (implied.items.len != 0) try s.nonnull_implies.put(s.arena, sym, implied.items);
 }
 
+fn recordBoolImplies(ctx: *Ctx, sym: Sym, f: Facts) Allocator.Error!void {
+    const s = ctx.s;
+    if (f.when_true.len == 0 and f.when_false.len == 0) return;
+    const keep = struct {
+        fn of(sm: *Sema, list: []const Narrow) Allocator.Error![]const Implied {
+            const out = try sm.arena.alloc(Implied, list.len);
+            for (list, out) |n, *o| o.* = .{ .narrow = n, .writes = sm.local_writes.get(pathRoot(sm, n.sym)) orelse 0 };
+            return out;
+        }
+    }.of;
+    try s.bool_implies.put(s.arena, sym, .{ .when_true = try keep(s, f.when_true), .when_false = try keep(s, f.when_false) });
+}
+
+/// The facts a local Boolean `val` named by `cond` holds on each outcome, those whose
+/// subject nothing wrote since; null where `cond` names no such `val`.
+fn boolValFacts(ctx: *Ctx, cond: *const Expr) Allocator.Error!?Facts {
+    const s = ctx.s;
+    if (cond.* != .Path or cond.Path.segments.len != 1 or s.bool_implies.count() == 0) return null;
+    const n = s.names.lookup(cond.Path.segments[0].name) orelse return null;
+    const sym = lookupLocalValue(ctx, n) orelse return null;
+    const implied = s.bool_implies.get(sym) orelse return null;
+    const still = struct {
+        fn of(sm: *Sema, list: []const Implied) Allocator.Error![]const Narrow {
+            var out: std.ArrayList(Narrow) = .empty;
+            for (list) |i| {
+                if ((sm.local_writes.get(pathRoot(sm, i.narrow.sym)) orelse 0) != i.writes) continue;
+                try out.append(sm.arena, i.narrow);
+            }
+            return out.items;
+        }
+    }.of;
+    return .{ .when_true = try still(s, implied.when_true), .when_false = try still(s, implied.when_false) };
+}
+
 /// What `sym` being not null implies that still holds: a fact on a local
 /// `var` written since `sym` was declared no longer does.
 fn appendImplied(s: *Sema, out: *std.ArrayList(Narrow), sym: Sym) Allocator.Error!void {
@@ -2586,7 +2945,7 @@ fn forLoop(ctx: *Ctx, f: *const ast.ForExpr) Allocator.Error!TypeId {
         try ctx.declareLocal(s.syms.name(sym), sym);
         try ctx.addRef(.{ .file = ctx.file, .anchor = f.vars[0].span, .kind = .decl, .target = sym });
     } else {
-        try destructure(ctx, f.vars, f.by_name, f.var_sources, elem, f.iter.span(), false);
+        try destructure(ctx, f.vars, f.by_name, f.var_sources, f.var_types, elem, f.iter.span(), false);
     }
     ctx.used = false;
     _ = try expr(ctx, f.body, .none);
@@ -2610,6 +2969,86 @@ fn thisExpr(ctx: *Ctx, qualifier: ?ast.Ident, sp: Span) Allocator.Error!TypeId {
     };
     try ctx.addRef(.{ .file = ctx.file, .anchor = sp, .kind = .this_, .target = r.owner, .dispatch = .{ .implicit = .{ .kind = r.kind, .owner = r.owner } } });
     return narrowedReceiver(ctx, r);
+}
+
+/// `x is C<A>` tests only what a run can see: a type parameter that is not
+/// reified, or a type argument the subject's type does not fix, cannot be
+/// checked.
+fn erasedTest(ctx: *Ctx, subject: TypeId, t: TypeId, at: Span) Allocator.Error!void {
+    const s = ctx.s;
+    if (subject == .none or s.types.isErr(subject) or s.types.isErr(t)) return;
+    const nn = try s.types.makeNotNull(t);
+    // Inside a class, its own type (`other is Box<T>` in `Box<T>`) is
+    // checked by its class alone.
+    if (s.types.classSym(nn) != .none and try inClass(ctx, s.types.classSym(nn)) and nn == try headers.selfType(s, s.types.classSym(nn))) return;
+    if (!try erased(s, subject, nn)) return;
+    var buf: std.ArrayList(u8) = .empty;
+    try sema_mod.diagnose.writeTypeAs(s, s.arena, &buf, t, true);
+    const msg = try std.fmt.allocPrint(s.arena, "Cannot check for instance of erased type '{s}'.", .{buf.items});
+    try ctx.reportFacts(.declaration, at, .{ .message = msg, .factory = .CANNOT_CHECK_FOR_ERASED }, "{s}", .{msg});
+}
+
+/// Whether the walk is inside the body of the class `cls`.
+fn inClass(ctx: *Ctx, cls: Sym) Allocator.Error!bool {
+    var sc: ?*Scope = ctx.scope;
+    while (sc) |c| : (sc = c.parent) {
+        if (c.kind == .class and c.owner == cls) return true;
+    }
+    return false;
+}
+
+fn erased(s: *Sema, subject: TypeId, t: TypeId) Allocator.Error!bool {
+    switch (s.types.get(t)) {
+        .param => |p| return !s.syms.flags(p.sym).reified,
+        .class => |c| {
+            for (c.args) |a| {
+                if (a.variance != .star) break;
+            } else return false;
+            // A test the subject already passes asks nothing of the run.
+            if (try subtyping.isSubtype(s, try s.types.makeNotNull(subject), t)) return false;
+            return !try argsFixedBy(s, subject, c.sym, c.args, 0);
+        },
+        else => return false,
+    }
+}
+
+/// Whether the subject's type fixes each type argument `args` gives the
+/// class `cls` that is not a star: through the supertype of `cls` that is
+/// the subject's class, the argument it holds there is that one.
+fn argsFixedBy(s: *Sema, subject: TypeId, cls: Sym, args: []const types.Arg, depth: u32) Allocator.Error!bool {
+    if (depth > 8) return false;
+    switch (s.types.get(subject)) {
+        .param => |p| {
+            for (try headers.typeParamBounds(s, p.sym)) |b| if (try argsFixedBy(s, b, cls, args, depth + 1)) return true;
+            return false;
+        },
+        .intersection => |parts| {
+            for (parts) |part| if (try argsFixedBy(s, part, cls, args, depth + 1)) return true;
+            return false;
+        },
+        .class => |sc| {
+            const st = (try subtyping.supertypeWithClass(s, try headers.selfType(s, cls), sc.sym)) orelse return false;
+            const held = switch (s.types.get(st)) {
+                .class => |x| x.args,
+                else => return false,
+            };
+            const tps = try headers.classTypeParams(s, cls);
+            for (args, 0..) |a, i| {
+                if (a.variance == .star) continue;
+                if (i >= tps.len) return false;
+                const fixed: ?types.Arg = for (held, 0..) |h, j| {
+                    switch (s.types.get(h.ty)) {
+                        .param => |hp| if (hp.sym == tps[i] and j < sc.args.len) break sc.args[j],
+                        else => {},
+                    }
+                } else null;
+                const f = fixed orelse return false;
+                if (f.variance == .star or f.ty != a.ty) return false;
+            }
+            return true;
+        },
+        else => return false,
+    }
 }
 
 /// Records a type test: `is`, `as`, a catch parameter, a class literal.
@@ -2708,8 +3147,9 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
     const b_t = s.t.boolean;
     switch (cond.*) {
         .IsCheck => |c| {
-            _ = try expr(ctx, c.expr, .none);
+            const subject = try expr(ctx, c.expr, .none);
             const t = try isCheckType(ctx, &c.ty, false);
+            try erasedTest(ctx, subject, t, c.ty.span);
             try typeTestRef(ctx, if (c.negated) .not_is else .is_, t, c.ty.span, .none);
             return .{ .facts = try isFacts(ctx, c.expr, t, c.negated), .ty = b_t };
         },
@@ -2727,12 +3167,18 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
                 const refs_before = ctx.refCount();
                 const lt = try expr(ctx, b.lhs, .none);
                 const refs_mid = ctx.refCount();
-                _ = try expr(ctx, b.rhs, .none);
+                const rt = try expr(ctx, b.rhs, .none);
+                try checkEquality(ctx, cond.span(), b.op, b.lhs, b.rhs, lt, rt);
                 // `x == null` is an identity test, not a call.
                 if ((b.op == .Eq or b.op == .Neq) and b.lhs.* != .NullLit and b.rhs.* != .NullLit) try calls.equalsRef(ctx, cond.span(), lt);
-                const nf = try nullFacts(ctx, b.op, b.lhs, b.rhs);
+                const nf = try nullFacts(ctx, b.op, b.lhs, b.rhs, lt, rt);
                 const vf = try valueFacts(ctx, b.op, b.lhs, b.rhs, objectNamedSince(ctx, refs_before, b.lhs), objectNamedSince(ctx, refs_mid, b.rhs));
-                return .{ .facts = .{ .when_true = try concat(ctx, nf.when_true, vf.when_true), .when_false = try concat(ctx, nf.when_false, vf.when_false) }, .ty = b_t };
+                var f: Facts = .{ .when_true = try concat(ctx, nf.when_true, vf.when_true), .when_false = try concat(ctx, nf.when_false, vf.when_false) };
+                if (b.op == .IdentEq or b.op == .IdentNeq) {
+                    const same = try concat(ctx, try identityFacts(ctx, b.lhs, b.rhs, rt), try identityFacts(ctx, b.rhs, b.lhs, lt));
+                    if (b.op == .IdentEq) f.when_true = try concat(ctx, f.when_true, same) else f.when_false = try concat(ctx, f.when_false, same);
+                }
+                return .{ .facts = f, .ty = b_t };
             },
             .And => {
                 const l = try condition(ctx, b.lhs);
@@ -2767,6 +3213,7 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
     }
     const refs_before = ctx.refCount();
     const t = try expr(ctx, cond, b_t);
+    if (try boolValFacts(ctx, cond)) |f| return .{ .facts = f, .ty = t };
     // `x.isNullOrEmpty()`: a contract's `returns(true)` and `returns(false)`
     // say what each outcome implies.
     if (cond.* == .Call) return .{ .facts = try contractFacts(ctx, cond, refs_before, .outcome), .ty = t };
@@ -2775,7 +3222,9 @@ fn conditionInner(ctx: *Ctx, cond: *const Expr) Allocator.Error!TypedFacts {
 
 // -------------------------------------------------------------- contracts --
 
-pub const EffectKind = enum { returns, returns_true, returns_false, returns_not_null };
+/// `returns(...) implies (...)`, and `callsInPlace(block, kind)`, whose
+/// condition is the operand the function-typed parameter is.
+pub const EffectKind = enum { returns, returns_true, returns_false, returns_not_null, in_place_exactly_once, in_place_at_least_once, in_place_at_most_once, in_place_unknown };
 
 /// What a contract's condition is written over: the function's receiver
 /// (`this`), or its parameter at an index.
@@ -2816,6 +3265,10 @@ pub fn contractOf(s: *Sema, f: Sym) Allocator.Error![]const Effect {
             if (c.callee.* == .Path and c.callee.Path.segments.len == 1 and std.mem.eql(u8, c.callee.Path.segments[0].name, "contract") and c.args.len == 1 and c.args[0] == .Lambda) {
                 for (c.args[0].Lambda.body.stmts) |*st| {
                     if (st.* != .Expr or st.Expr != .Call) continue;
+                    if (try inPlaceEffect(s, f, &st.Expr)) |eff| {
+                        try out.append(s.arena, eff);
+                        continue;
+                    }
                     const imp = st.Expr.Call;
                     if (!imp.is_infix or imp.args.len != 2) continue;
                     if (imp.callee.* != .Path or !std.mem.eql(u8, imp.callee.Path.segments[0].name, "implies")) continue;
@@ -2839,6 +3292,35 @@ pub fn contractOf(s: *Sema, f: Sym) Allocator.Error![]const Effect {
     };
     try s.contracts.put(s.arena, f, out.items);
     return out.items;
+}
+
+/// `callsInPlace(block, InvocationKind.EXACTLY_ONCE)` in `f`'s contract: how
+/// `f` runs the lambda passed for its parameter `block`.
+fn inPlaceEffect(s: *Sema, f: Sym, e: *const Expr) Allocator.Error!?Effect {
+    const c = e.Call;
+    if (c.callee.* != .Path or c.callee.Path.segments.len != 1 or !std.mem.eql(u8, c.callee.Path.segments[0].name, "callsInPlace")) return null;
+    if (c.args.len == 0 or c.args[0] != .Path or c.args[0].Path.segments.len != 1) return null;
+    const pname = c.args[0].Path.segments[0].name;
+    const params = s.syms.functionInfo(f).params;
+    const idx: u16 = for (params, 0..) |p, i| {
+        if (std.mem.eql(u8, s.str(s.syms.name(p)), pname)) break @intCast(i);
+    } else return null;
+    const kind_name: []const u8 = if (c.args.len < 2) "UNKNOWN" else switch (c.args[1]) {
+        .Member => |m| m.name.name,
+        .Path => |p| p.segments[p.segments.len - 1].name,
+        else => "UNKNOWN",
+    };
+    const kind: EffectKind = if (std.mem.eql(u8, kind_name, "EXACTLY_ONCE"))
+        .in_place_exactly_once
+    else if (std.mem.eql(u8, kind_name, "AT_LEAST_ONCE"))
+        .in_place_at_least_once
+    else if (std.mem.eql(u8, kind_name, "AT_MOST_ONCE"))
+        .in_place_at_most_once
+    else
+        .in_place_unknown;
+    const cond = try s.arena.create(Cond);
+    cond.* = .{ .operand = .{ .param = idx } };
+    return .{ .kind = kind, .cond = cond };
 }
 
 /// The condition `e` of `f`'s contract, resolved in `f`'s scope.
@@ -3298,7 +3780,9 @@ fn excludedEqual(a: Excluded, b: Excluded) bool {
 
 /// `x == null`, `x != null`, `x === null`, `x !== null`: the subject is
 /// not null on the outcome that rules null out.
-fn nullFacts(ctx: *Ctx, op: ast.BinOp, lhs: *const Expr, rhs: *const Expr) Allocator.Error!Facts {
+/// `lt` and `rt`: the operands' types, `.none` where not known; a side whose
+/// type is not nullable is a value that is not null.
+fn nullFacts(ctx: *Ctx, op: ast.BinOp, lhs: *const Expr, rhs: *const Expr, lt: TypeId, rt: TypeId) Allocator.Error!Facts {
     const eq = op == .Eq or op == .IdentEq;
     if (rhs.* == .NullLit or lhs.* == .NullLit) {
         const subj_expr = if (rhs.* == .NullLit) lhs else rhs;
@@ -3308,9 +3792,120 @@ fn nullFacts(ctx: *Ctx, op: ast.BinOp, lhs: *const Expr, rhs: *const Expr) Alloc
     }
     // `x?.isActive == true`, `descriptor === polyDescriptor`: equal to a
     // value that is not null, the side is not null either.
-    const subj_expr = if (try knownNonNull(ctx, rhs)) lhs else if (try knownNonNull(ctx, lhs)) rhs else return .{};
+    const subj_expr = if (try nonNullOperand(ctx, rhs, rt)) lhs else if (try nonNullOperand(ctx, lhs, lt)) rhs else return .{};
     const fact = try nonNullFacts(ctx, subj_expr);
     return if (eq) .{ .when_true = fact } else .{ .when_false = fact };
+}
+
+/// Whether an operand of type `t` (`.none` when not known) is a value that
+/// is not null: `Kind.Mouse`, a call returning a `String`, a literal.
+fn nonNullOperand(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    if (t != .none and !s.types.isErr(t)) {
+        const z = try infer.zonk(s, t);
+        if (!infer.hasOpenVar(s, z) and !try subtyping.admitsNull(s, z)) return true;
+    }
+    return knownNonNull(ctx, e);
+}
+
+/// `a == b` and `a === b` over types no value has both of, as kotlinc refuses
+/// them: two enums (`INCOMPATIBLE_ENUM_COMPARISON_ERROR`), an identity test
+/// (`EQUALITY_NOT_APPLICABLE`, or `FORBIDDEN_IDENTITY_EQUALS` with a
+/// primitive), and an equality where either side is a built-in value type
+/// (`EQUALITY_NOT_APPLICABLE`; between other classes kotlinc only warns). An
+/// integer literal is its `Int` (or `Long`, `UInt`, `ULong`) here, and a
+/// smart-cast value its declared type (kotlinc only warns of a smart cast's).
+fn checkEquality(ctx: *Ctx, at: Span, op: ast.BinOp, lhs: *const Expr, rhs: *const Expr, lt_in: TypeId, rt_in: TypeId) Allocator.Error!void {
+    const s = ctx.s;
+    const fc = s.fileOf(ctx.file) orelse return;
+    if (!declcheck.checked(fc)) return;
+    if (try smartCast(ctx, lhs, lt_in) or try smartCast(ctx, rhs, rt_in)) return;
+    const lt = (try equalityOperand(s, lt_in)) orelse return;
+    const rt = (try equalityOperand(s, rt_in)) orelse return;
+    const lc = s.types.classSym(try s.types.makeNotNull(lt));
+    const rc = s.types.classSym(try s.types.makeNotNull(rt));
+    if (lc == .none or rc == .none or lc == s.builtins.nothing or rc == s.builtins.nothing) return;
+    if (!try subtyping.emptyIntersection(s, &.{ lt, rt })) return;
+    const ltext = try sema_mod.diagnose.typeText(s, s.arena, lt);
+    const rtext = try sema_mod.diagnose.typeText(s, s.arena, rt);
+    const identity = op == .IdentEq or op == .IdentNeq;
+    const op_text: []const u8 = switch (op) {
+        .Eq => "==",
+        .Neq => "!=",
+        .IdentEq => "===",
+        else => "!==",
+    };
+    const enums = s.syms.classInfo(lc).kind == .enum_class and s.syms.classInfo(rc).kind == .enum_class;
+    const builtin = struct {
+        fn is(sm: *Sema, c: Sym) bool {
+            return declcheck.primitive(sm, c) or declcheck.unsigned(sm, c) or c == sm.builtins.string;
+        }
+    }.is;
+    const msg: []const u8, const factory: census_mod.Factory = if (enums)
+        .{ try std.fmt.allocPrint(s.arena, "Comparison of incompatible enums '{s}' and '{s}' is always unsuccessful.", .{ ltext, rtext }), .INCOMPATIBLE_ENUM_COMPARISON_ERROR }
+    else if (identity and (declcheck.primitive(s, lc) or declcheck.primitive(s, rc)))
+        .{ try std.fmt.allocPrint(s.arena, "Identity equality for arguments of types '{s}' and '{s}' is prohibited.", .{ ltext, rtext }), .FORBIDDEN_IDENTITY_EQUALS }
+    else if (identity or builtin(s, lc) or builtin(s, rc))
+        .{ try std.fmt.allocPrint(s.arena, "Operator '{s}' cannot be applied to '{s}' and '{s}'.", .{ op_text, ltext, rtext }), .EQUALITY_NOT_APPLICABLE }
+    else
+        return;
+    try ctx.reportFacts(.type_mismatch, at, .{ .message = msg, .factory = factory }, "{s}", .{msg});
+}
+
+/// Whether `e`, of type `t` here, is a stable value a smart cast narrowed.
+fn smartCast(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!bool {
+    const s = ctx.s;
+    const sym = stableSubject(ctx, e);
+    if (sym == .none or e.* == .This) return false;
+    const declared = try symbolType(ctx, sym);
+    if (declared == .none or s.types.isErr(declared) or t == .none) return false;
+    return !try subtyping.equivalent(s, declared, t);
+}
+
+/// An equality operand's type as kotlinc compares it: a class type, an
+/// integer literal as its own type; null for anything that says nothing
+/// (an error, a type still inferred, a type parameter).
+fn equalityOperand(s: *Sema, t_in: TypeId) Allocator.Error!?TypeId {
+    if (t_in == .none or s.types.isErr(t_in)) return null;
+    const t = try infer.zonk(s, t_in);
+    if (s.types.isErr(t) or infer.hasOpenVar(s, t)) return null;
+    return switch (s.types.get(t)) {
+        .int_lit => |l| try infer.intLitDefault(s, l),
+        .class => t,
+        else => null,
+    };
+}
+
+/// What `e` being the very object a value of type `other` is says of a stable `e`: it is
+/// an `other` too, not null where it was not (`p === this` makes `p` this class).
+fn identityFacts(ctx: *Ctx, e: *const Expr, other_e: *const Expr, other: TypeId) Allocator.Error![]const Narrow {
+    const s = ctx.s;
+    // kotlinc learns nothing of a type from a comparison with a constant.
+    if (other == .none or s.types.isErr(other) or e.* == .NullLit or constantOperand(other_e)) return &.{};
+    const o = try infer.zonk(s, other);
+    if (infer.hasOpenVar(s, o) or isNothingType(s, try s.types.makeNotNull(o))) return &.{};
+    const subj = (try subjectOf(ctx, e)) orelse return &.{};
+    if (s.types.isErr(subj.ty) or try subtyping.isSubtype(s, subj.ty, o)) return &.{};
+    const nullable = try subtyping.admitsNull(s, subj.ty);
+    const t = if (try subtyping.isSubtype(s, o, subj.ty))
+        (if (nullable) o else try s.types.makeNotNull(o))
+    else
+        try s.types.intern(.{ .intersection = try s.arena.dupe(TypeId, &.{ subj.ty, if (nullable) o else try s.types.makeNotNull(o) }) });
+    const out = try s.arena.alloc(Narrow, 1);
+    out[0] = .{ .sym = subj.sym, .ty = t };
+    return out;
+}
+
+/// A literal constant: `1`, `-1`, `'c'`, `true`, or a string with no template entries.
+fn constantOperand(e: *const Expr) bool {
+    return switch (e.*) {
+        .BoolLit, .IntLit, .FloatLit, .CharLit => true,
+        .Unary => |u| (u.op == .Neg or u.op == .Pos) and (u.expr.* == .IntLit or u.expr.* == .FloatLit),
+        .StringTemplate => |t| for (t.parts) |part| {
+            if (part != .Text) break false;
+        } else true,
+        else => false,
+    };
 }
 
 /// What knowing a stable `e` is null says: it is a `Nothing?` as well as
@@ -3620,7 +4215,7 @@ fn conditionFactsOnly(ctx: *Ctx, cond: *const Expr) Allocator.Error!Facts {
     switch (cond.*) {
         .IsCheck => |c| return isFacts(ctx, c.expr, try isCheckType(ctx, &c.ty, true), c.negated),
         .Binary => |b| switch (b.op) {
-            .Eq, .Neq, .IdentEq, .IdentNeq => return nullFacts(ctx, b.op, b.lhs, b.rhs),
+            .Eq, .Neq, .IdentEq, .IdentNeq => return nullFacts(ctx, b.op, b.lhs, b.rhs, .none, .none),
             .Or => {
                 const l = try conditionFactsOnly(ctx, b.lhs);
                 const r = try conditionFactsOnly(ctx, b.rhs);
@@ -3666,6 +4261,67 @@ pub fn resolveTypeInBodyQuiet(ctx: *Ctx, tr: *const ast.TypeRef) Allocator.Error
 }
 
 /// Whether an expression always leaves the enclosing block.
+/// Whether a `break` in `e`, the body of a loop, may leave that loop: any labeled one, and
+/// an unlabeled one outside a loop nested in it (`inner`) or a function declared in it. A
+/// lambda's counts, as an inline one breaks out of the loop around it.
+fn mayBreakOut(e: *const Expr, inner: bool) bool {
+    const in = struct {
+        fn stmts(list: []const ast.Stmt, nested: bool) bool {
+            for (list) |*st| switch (st.*) {
+                .Expr => |*x| if (mayBreakOut(x, nested)) return true,
+                .Decl => |d| switch (d.*) {
+                    .Property => |pr| if (pr.init) |x| if (mayBreakOut(x, nested)) return true,
+                    else => {},
+                },
+                .Assign => |a| if (mayBreakOut(&a.target, nested) or mayBreakOut(&a.value, nested)) return true,
+                .DestructuringDecl => |dd| if (mayBreakOut(&dd.init, nested)) return true,
+            };
+            return false;
+        }
+        fn opt(x: ?*const Expr, nested: bool) bool {
+            return if (x) |y| mayBreakOut(y, nested) else false;
+        }
+    };
+    return switch (e.*) {
+        .Break => |b| b.label != null or !inner,
+        .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit, .Path, .This, .Super, .PropertyRef, .Continue => false,
+        .AnonFun, .ObjectExpr => false,
+        .StringTemplate => |*x| for (x.parts) |*part| switch (part.*) {
+            .Interp => |ie| if (mayBreakOut(ie, inner)) break true,
+            .Text, .ShortInterp => {},
+        } else false,
+        .Member => |*x| mayBreakOut(x.receiver, inner),
+        .Call => |*x| mayBreakOut(x.callee, inner) or for (x.args) |*a| {
+            if (mayBreakOut(a, inner)) break true;
+        } else false,
+        .Index => |*x| mayBreakOut(x.receiver, inner) or for (x.args) |*a| {
+            if (mayBreakOut(a, inner)) break true;
+        } else false,
+        .Binary => |*x| mayBreakOut(x.lhs, inner) or mayBreakOut(x.rhs, inner),
+        .Unary => |*x| mayBreakOut(x.expr, inner),
+        .Postfix => |*x| mayBreakOut(x.expr, inner),
+        .Spread => |*x| mayBreakOut(x.expr, inner),
+        .Throw => |*x| mayBreakOut(x.value, inner),
+        .Return => |*x| in.opt(x.value, inner),
+        .Labeled => |*x| mayBreakOut(x.expr, inner),
+        .If => |*x| mayBreakOut(x.cond, inner) or mayBreakOut(x.then_branch, inner) or in.opt(x.else_branch, inner),
+        .While => |*x| mayBreakOut(x.cond, inner) or mayBreakOut(x.body, true),
+        .DoWhile => |*x| in.opt(x.body, true) or mayBreakOut(x.cond, inner),
+        .For => |x| mayBreakOut(x.iter, inner) or mayBreakOut(x.body, true),
+        .Block => |*b| in.stmts(b.stmts, inner),
+        .Lambda => |l| in.stmts(l.body.stmts, inner),
+        .Try => |t| in.stmts(t.body.stmts, inner) or for (t.catches) |*c| {
+            if (in.stmts(c.body.stmts, inner)) break true;
+        } else false or (if (t.finally) |*f| in.stmts(f.stmts, inner) else false),
+        .When => |w| in.opt(w.subject, inner) or for (w.branches) |*br| {
+            if (mayBreakOut(&br.body, inner)) break true;
+        } else false,
+        .IsCheck => |x| mayBreakOut(x.expr, inner),
+        .As => |x| mayBreakOut(x.expr, inner),
+        .MemberRef => |x| mayBreakOut(x.receiver, inner),
+    };
+}
+
 pub fn jumps(e: *const Expr) bool {
     return switch (e.*) {
         .Return, .Throw, .Break, .Continue => true,
@@ -3727,6 +4383,65 @@ pub fn lookupLocalValue(ctx: *const Ctx, n: Name) ?Sym {
         }
     }
     return null;
+}
+
+/// A call or property reached through an implicit receiver when a closer
+/// implicit receiver carries one of its `@DslMarker` annotations: a DSL
+/// block cannot reach the blocks around it without naming their receiver.
+fn dslScope(ctx: *Ctx, r: records.Ref) Allocator.Error!void {
+    const s = ctx.s;
+    if (s.builtins.dsl_marker == .none) return;
+    switch (r.kind) {
+        .call, .read, .write, .invoke, .op, .op_assign, .get, .set, .inc, .dec, .contains, .compare_to, .iterator => {},
+        else => return,
+    }
+    for ([_]records.Receiver{ r.dispatch, r.extension }) |used| {
+        if (used != .implicit) continue;
+        var closer: std.ArrayList(TypeId) = .empty;
+        const at: ?Recv = found: {
+            var sc: ?*Scope = ctx.scope;
+            while (sc) |c| : (sc = c.parent) {
+                for (c.receivers.items) |x| {
+                    if (x.owner == used.implicit.owner and x.kind == used.implicit.kind) break :found x;
+                    try closer.append(ctx.arena(), x.ty);
+                }
+            }
+            break :found null;
+        };
+        const recv = at orelse continue;
+        if (closer.items.len == 0) continue;
+        const marks = try dslMarkers(s, recv.ty);
+        if (marks.len == 0) continue;
+        for (closer.items) |ct| {
+            for (try dslMarkers(s, ct)) |m| {
+                if (std.mem.indexOfScalar(Sym, marks, m) == null) continue;
+                const msg = try std.fmt.allocPrint(s.arena, "'{s}' cannot be called in this context with an implicit receiver. Use an explicit receiver if necessary.", .{try sema_mod.diagnose.declarationText(s, s.arena, r.target)});
+                try ctx.reportFacts(.declaration, r.anchor, .{ .message = msg, .factory = .DSL_SCOPE_VIOLATION }, "{s}", .{msg});
+                return;
+            }
+        }
+    }
+}
+
+/// The `@DslMarker` annotation classes on the class of `t` or one of its
+/// supertypes.
+fn dslMarkers(s: *Sema, t: TypeId) Allocator.Error![]const Sym {
+    const cls = s.types.classSym(t);
+    if (cls == .none or s.syms.kind(cls) != .class) return &.{};
+    if (s.dsl_markers.get(cls)) |hit| return hit;
+    // A supertype cycle reads as no markers while it is being answered.
+    try s.dsl_markers.put(s.arena, cls, &.{});
+    var out: std.ArrayList(Sym) = .empty;
+    for (try headers.annotationClasses(s, cls, .decl)) |a| {
+        if (a != .none and try headers.hasAnnotation(s, a, .decl, s.builtins.dsl_marker)) try out.append(s.arena, a);
+    }
+    for (try headers.supertypes(s, cls)) |st| {
+        for (try dslMarkers(s, st)) |m| {
+            if (std.mem.indexOfScalar(Sym, out.items, m) == null) try out.append(s.arena, m);
+        }
+    }
+    try s.dsl_markers.put(s.arena, cls, out.items);
+    return out.items;
 }
 
 /// Every implicit receiver in scope, innermost first.
@@ -3807,6 +4522,18 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
         if (v != .none) cls = if (s.syms.kind(v) == .type_alias) s.types.classSym(try s.types.makeNotNull(try headers.aliasTarget(s, v))) else v;
     }
     if (cls != .none and s.syms.kind(cls) == .class and (hidden == null or isValueClass(s, cls))) return classifierAsValue(ctx, cls, id.span);
+    // A member of an implicit receiver that may be null (`this` in `fun
+    // K?.f()`) is read only unsafely: kotlinc reads it and reports it.
+    if (hidden == null) for (try implicitReceivers(ctx)) |r| {
+        const rt = try narrowedReceiver(ctx, r);
+        if (!try subtyping.admitsNull(s, rt) or s.types.isErr(rt)) continue;
+        const nn = try s.types.definitelyNotNull(rt);
+        const ms = try receiverProperties(ctx, nn, n);
+        if (try calls.firstVisible(ctx, ms)) |m| {
+            try calls.reportUnsafe(ctx, .{ .at = id.span, .factory = .UNSAFE_CALL }, rt);
+            return implicitMemberRead(ctx, id, access, .{ .m = m, .r = r, .rt = nn });
+        }
+    };
     // Only a member the code cannot see is named: it is read, and invisible.
     if (hidden) |h| {
         if (!calls.generatedFile(ctx)) try ctx.reportFacts(.invisible, id.span, .{ .name = id.name, .syms = try ctx.arena().dupe(Sym, &.{h.m.sym}) }, "{s}", .{id.name});
@@ -3818,6 +4545,17 @@ pub fn nameAccess(ctx: *Ctx, id: ast.Ident, access: Access) Allocator.Error!Type
 
 /// A member property of an implicit receiver, of that receiver's type.
 const ImplicitMember = struct { m: members.Member, r: Recv, rt: TypeId };
+
+/// The type property `m` of implicit receiver `r` (of type `rt`) reads as
+/// here: its member type, smart cast where it is stable and a check
+/// narrowed it (`if (calculate !== null) calculate(d)`).
+pub fn implicitPropertyType(ctx: *Ctx, r: Recv, rt: TypeId, m: members.Member) Allocator.Error!TypeId {
+    const s = ctx.s;
+    const t = try members.memberType(s, m);
+    if (s.syms.kind(m.sym) != .property) return t;
+    const subj: Sym = if (stableProperty(s, m.sym)) try pathSubjectOn(ctx, r.owner, rt, s.str(s.syms.name(m.sym))) else .none;
+    return narrowedType(ctx, if (subj == .none) m.sym else subj, t);
+}
 
 /// The member properties named `n` an implicit receiver of type `rt` gives
 /// a bare name: none when it may be null, as the extensions on its nullable
@@ -4049,7 +4787,7 @@ fn valueNamed(ctx: *Ctx, n: Name) Allocator.Error!bool {
 fn memberOnType(ctx: *Ctx, t: TypeId, seg: ast.Ident, access: Access, on_classifier: bool, cls: Sym, qual: Span) Allocator.Error!TypeId {
     const n = try ctx.intern(seg.name);
     if (on_classifier) return staticMember(ctx, cls, qual, .none, seg, n, access);
-    return calls.propertyAccess(ctx, t, n, seg.span, access, .expr);
+    return calls.propertyAccess(ctx, t, n, seg.span, access, .expr, calls.dotBefore(seg));
 }
 
 /// `Cls.name`: an enum entry, a nested object, a companion member, or a
@@ -4087,7 +4825,7 @@ pub fn staticMember(ctx: *Ctx, cls: Sym, qual: Span, qual_node: ast.NodeId, seg:
         const ht = try headers.selfType(s, holder);
         const node: ast.NodeId = if (access == .write) qual_node else .none;
         try ctx.addRef(.{ .file = ctx.file, .node = node, .anchor = qual, .kind = .object, .target = holder });
-        return calls.propertyAccess(ctx, ht, n, seg.span, access, .expr);
+        return calls.propertyAccess(ctx, ht, n, seg.span, access, .expr, null);
     }
     try ctx.reportFacts(.unresolved_member, seg.span, .{ .name = seg.name, .on = s.str(s.syms.name(cls)) }, "{s}.{s}", .{ s.str(s.syms.name(cls)), seg.name });
     return s.types.errType();
@@ -4117,7 +4855,7 @@ pub fn memberAccess(ctx: *Ctx, e: *const Expr, recv: *const Expr, name: ast.Iden
     if (recv.* == .Super) return calls.superMember(ctx, recv.Super, name, access);
     const recv_t = try receiverExpr(ctx, recv);
     const rt = if (safe) try s.types.makeNotNull(recv_t) else recv_t;
-    var t = try calls.propertyAccess(ctx, rt, n, name.span, access, .expr);
+    var t = try calls.propertyAccess(ctx, rt, n, name.span, access, .expr, if (safe or e.* != .Member) null else calls.memberDot(e));
     if (access == .read and !safe) t = try narrowRead(ctx, e, t);
     return if (safe) s.types.makeNullable(t) else t;
 }
@@ -4183,8 +4921,9 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             return s.t.boolean;
         },
         .IdentEq, .IdentNeq => {
-            _ = try expr(ctx, lhs, .none);
-            _ = try expr(ctx, rhs, .none);
+            const lt = try expr(ctx, lhs, .none);
+            const rt = try expr(ctx, rhs, .none);
+            try checkEquality(ctx, e.span(), op, lhs, rhs, lt, rt);
             return s.t.boolean;
         },
         .Elvis => {
@@ -4234,7 +4973,7 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             };
             ctx.in_arg = saved_arg;
             const rt = try receiverExpr(ctx, rhs);
-            _ = try calls.containsArgCall(ctx, e.span(), rt, lhs, lt);
+            _ = try calls.containsArgCall(ctx, e.span(), rt, lhs, lt, e.Binary.op_at);
             return s.t.boolean;
         },
         .Lt, .Le, .Gt, .Ge => {
@@ -4243,7 +4982,7 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             ctx.in_arg = .branch;
             const rt = try expr(ctx, rhs, .none);
             ctx.in_arg = saved_arg;
-            _ = try calls.operatorCall(ctx, e.span(), lt, wk.compareTo, &.{.{ .expr = rhs, .ty = rt }}, .compare_to);
+            _ = try calls.operatorCallUnsafe(ctx, e.span(), lt, wk.compareTo, &.{.{ .expr = rhs, .ty = rt }}, .compare_to, calls.unsafeAt(e.span(), e.Binary.op_at, .UNSAFE_OPERATOR_CALL));
             return s.t.boolean;
         },
         else => {
@@ -4265,14 +5004,15 @@ fn binary(ctx: *Ctx, e: *const Expr, op: ast.BinOp, lhs: *const Expr, rhs: *cons
             // Arithmetic over integer literals is an integer literal of
             // its value, typed as one where it is used (`8192 * 2` passed
             // for a `Long`); lowering folds it.
-            if (intConstValue(e)) |v| return constArithmetic(ctx, &.{ lhs, rhs }, v, expected);
+            if (intConstValue(e) != null) return constArithmetic(ctx, &.{ lhs, rhs }, expected);
             const lt = try receiverExpr(ctx, lhs);
-            if (try calls.lambdaCallOperand(ctx, rhs)) |args| return calls.operatorCall(ctx, e.span(), lt, n, args, kind);
+            const unsafe = calls.unsafeAt(e.span(), e.Binary.op_at, .UNSAFE_OPERATOR_CALL);
+            if (try calls.lambdaCallOperand(ctx, rhs)) |args| return calls.operatorCallUnsafe(ctx, e.span(), lt, n, args, kind, unsafe);
             const saved_arg = ctx.in_arg;
             ctx.in_arg = .branch;
             const rt = try expr(ctx, rhs, .none);
             ctx.in_arg = saved_arg;
-            return calls.operatorCall(ctx, e.span(), lt, n, &.{.{ .expr = rhs, .ty = rt }}, kind);
+            return calls.operatorCallUnsafe(ctx, e.span(), lt, n, &.{.{ .expr = rhs, .ty = rt }}, kind, unsafe);
         },
     }
 }

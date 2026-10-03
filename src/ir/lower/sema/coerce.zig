@@ -44,8 +44,8 @@ pub fn scalarOf(b: *Builder, t: TypeId) Error!?Scalar {
 }
 
 /// Whether `cls` is held as its number: a final value class declared
-/// outside `kotlin.*`, extending no class, whose one field holds a primitive
-/// other than `String`, or an unsigned number.
+/// outside `kotlin.*`, extending no class and delegating no interface, whose
+/// one field holds a primitive other than `String`, or an unsigned number.
 pub fn scalarClass(b: *Builder, cls: Sym) Error!?Scalar {
     if (cls == .none) return null;
     const p = b.p;
@@ -71,6 +71,9 @@ fn decide(b: *Builder, cls: Sym) Error!?Scalar {
     const prop = classes.valueProperty(b, cls) orelse return null;
     const slot = b.p.br.fieldOf(prop) orelse return null;
     const id = b.p.br.classOfOpt(cls) orelse return null;
+    // An instance that implements an interface `by` a delegate keeps the
+    // delegate beside its number (`value class D(val x: Int) : Comparable<Int> by x`).
+    if (b.p.br.hasDelegates(id)) return null;
     const t = try sema.headers.propertyType(s, prop);
     if (s.types.isNullable(t)) return null;
     const number = if (operator.primOf(s, t)) |prim| prim != .string else operator.unsignedOf(s, t) != null;

@@ -129,13 +129,14 @@ pub fn parseControlStructureBody(p: *Parser) ?Expr {
         else => null,
     };
     if (op) |o| {
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseExpr(p) orelse return null;
         const sp = expr.span().join(rhs.span());
         const st = Stmt{ .Assign = support.boxed(p, ast.AssignStmt{
             .target = expr,
             .op = o,
+            .op_at = op_at,
             .value = rhs,
             .span = sp,
         }) };
@@ -277,6 +278,8 @@ pub const DestructEntries = struct {
     names: []Ident,
     /// The property each name reads in the name-based form; empty otherwise.
     sources: []Ident,
+    /// The type each entry writes; empty when none writes one.
+    types: []?TypeRef,
     by_name: bool,
     any_var: bool,
     /// Where an entry carries its own `val`/`var`, the first such keyword.
@@ -290,6 +293,8 @@ pub const DestructEntries = struct {
 pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what: []const u8) ?DestructEntries {
     var names: std.ArrayList(Ident) = .empty;
     var sources: std.ArrayList(Ident) = .empty;
+    var types: std.ArrayList(?TypeRef) = .empty;
+    var any_type = false;
     // Under `+NameBasedDestructuring` the parenthesized short form binds by
     // name too; `[a, b]` stays positional.
     var by_name = !positional and root.language.name_based_short_form;
@@ -314,9 +319,11 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
             _ = support.bump(p);
             break :blk Ident{ .name = "_", .span = id_span };
         } else (support.parseIdent(p, what) orelse return null);
+        var ty: ?TypeRef = null;
         if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
             _ = support.bump(p);
-            _ = parseType(p);
+            ty = parseType(p);
+            any_type = true;
         }
         var source = id;
         if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
@@ -330,6 +337,7 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
         }
         names.append(p.allocator, id) catch @panic("OOM in parser");
         sources.append(p.allocator, source) catch @panic("OOM in parser");
+        types.append(p.allocator, ty) catch @panic("OOM in parser");
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
             _ = support.bump(p);
@@ -341,6 +349,7 @@ pub fn parseDestructEntries(p: *Parser, close: TokenKind, positional: bool, what
     return .{
         .names = names.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
         .sources = sources.toOwnedSlice(p.allocator) catch @panic("OOM in parser"),
+        .types = if (any_type) types.toOwnedSlice(p.allocator) catch @panic("OOM in parser") else &.{},
         .by_name = by_name,
         .any_var = any_var,
         .keyword_at = keyword_at,
@@ -355,6 +364,7 @@ pub fn parseFor(p: *Parser) ?Expr {
     var vars: []Ident = undefined;
     var for_by_name = false;
     var var_sources: []Ident = &.{};
+    var var_types: []?TypeRef = &.{};
     var destructured = false;
     const opener = std.meta.activeTag(support.peekKind(p).*);
     if (opener == .LParen or opener == .LBracket) {
@@ -369,6 +379,7 @@ pub fn parseFor(p: *Parser) ?Expr {
         vars = entries.names;
         for_by_name = entries.by_name;
         var_sources = entries.sources;
+        var_types = entries.types;
     } else {
         const id = support.parseIdent(p, "loop variable") orelse return null;
         vars = singleIdent(p, id);
@@ -393,6 +404,7 @@ pub fn parseFor(p: *Parser) ?Expr {
         .by_name = for_by_name,
         .destructured = destructured,
         .var_sources = var_sources,
+        .var_types = var_types,
         .var_ty = var_ty,
         .iter = box(p, iter),
         .body = box(p, body),
@@ -942,6 +954,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
             idx: usize,
             names: []Ident,
             sources: []Ident,
+            types: []?TypeRef,
             by_name: bool,
             span: Span,
         };
@@ -993,6 +1006,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                         .idx = local.items.len - 1,
                         .names = entries.names,
                         .sources = entries.sources,
+                        .types = entries.types,
                         .by_name = entries.by_name,
                         .span = sp,
                     }) catch @panic("OOM in parser");
@@ -1023,6 +1037,7 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     .names = pd.names,
                     .by_name = pd.by_name,
                     .sources = pd.sources,
+                    .types = pd.types,
                     .init = init,
                     .span = pd.span,
                 }) }) catch @panic("OOM in parser");

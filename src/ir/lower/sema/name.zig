@@ -186,7 +186,8 @@ pub fn heldType(b: *Builder, rec: *const NameRec) Error!sema.TypeId {
     const s = b.p.s;
     return switch (rec.kind) {
         .local => s.syms.localInfo(rec.target).ty,
-        .param => try sema.headers.paramType(s, rec.target),
+        // A vararg parameter holds the array of its elements.
+        .param => if (s.syms.flags(rec.target).vararg) .none else try sema.headers.paramType(s, rec.target),
         .property, .backing_field => try sema.headers.propertyType(s, rec.target),
         .object, .enum_entry => .none,
     };

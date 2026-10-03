@@ -51,8 +51,9 @@ pub const Reason = enum(u8) {
     invisible,
     /// A type parameter that is not reified passed for a reified one.
     reified_param,
-    /// A value whose type does not fit the type its place declares: a
-    /// delegate's `getValue` returning what its property cannot hold.
+    /// A value whose type does not fit the type its place declares: an
+    /// initializer, a returned value or a lambda's result, an assigned value,
+    /// a delegate's `getValue` returning what its property cannot hold.
     type_mismatch,
     /// A `when` whose value is used, or whose subject is an enum, a sealed
     /// type or a `Boolean`, that a subject's value can fall through.
@@ -75,6 +76,9 @@ pub const Reason = enum(u8) {
     /// A use of a declaration kotlinc reports: a deprecated one. The site
     /// names kotlinc's diagnostic.
     use,
+    /// A member, operator, `invoke` or iteration reached on a value that may
+    /// be null without `?.`. The site names kotlinc's diagnostic.
+    null_safety,
 };
 
 /// What one tentative resolution recorded. `refs` holds the analysis's
@@ -106,16 +110,24 @@ pub const Factory = enum {
     AMBIGUOUS_ANONYMOUS_TYPE_INFERRED,
     ANNOTATION_CLASS_MEMBER,
     ANNOTATION_PARAMETER_DEFAULT_VALUE_MUST_BE_CONSTANT,
+    ARGUMENT_PASSED_TWICE,
+    ARGUMENT_TYPE_MISMATCH,
+    ASSIGNMENT_TYPE_MISMATCH,
+    ASSIGN_OPERATOR_AMBIGUITY,
     BACKING_FIELD_FOR_DELEGATED_PROPERTY,
+    BREAK_OR_CONTINUE_JUMPS_ACROSS_FUNCTION_BOUNDARY,
     CANNOT_CHANGE_ACCESS_PRIVILEGE,
+    CANNOT_CHECK_FOR_ERASED,
     CANNOT_INFER_PARAMETER_TYPE,
     CANNOT_WEAKEN_ACCESS_PRIVILEGE,
     CLASSIFIER_REDECLARATION,
     COMMA_IN_WHEN_CONDITION_WITH_WHEN_GUARD,
     COMPONENT_FUNCTION_MISSING,
+    COMPONENT_FUNCTION_RETURN_TYPE_MISMATCH,
     CONFLICTING_OVERLOADS,
     CONST_VAL_NOT_TOP_LEVEL_OR_OBJECT,
     CYCLE_IN_ANNOTATION_PARAMETER_ERROR,
+    CYCLIC_GENERIC_UPPER_BOUND,
     CYCLIC_CONSTRUCTOR_DELEGATION_CALL,
     CONST_VAL_WITHOUT_INITIALIZER,
     CONST_VAL_WITH_DELEGATE,
@@ -131,26 +143,37 @@ pub const Factory = enum {
     DELEGATE_SPECIAL_FUNCTION_NONE_APPLICABLE,
     DELEGATE_SPECIAL_FUNCTION_RETURN_TYPE_MISMATCH,
     DELEGATION_NOT_TO_INTERFACE,
+    DSL_SCOPE_VIOLATION,
+    EQUALITY_NOT_APPLICABLE,
     EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_DIFFERENT,
     EXPECT_ACTUAL_INCOMPATIBLE_FUNCTION_MODIFIERS_NOT_SUBSET,
     EXPLICIT_BACKING_FIELD_IN_INTERFACE,
     EXPLICIT_FIELD_MUST_BE_INITIALIZED,
     EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE,
+    EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS,
     EXTENSION_PROPERTY_MUST_HAVE_ACCESSORS_OR_BE_ABSTRACT,
     EXTENSION_PROPERTY_WITH_BACKING_FIELD,
     FINAL_SUPERTYPE,
+    FORBIDDEN_IDENTITY_EQUALS,
+    FORBIDDEN_VARARG_PARAMETER_TYPE,
     GENERIC_THROWABLE_SUBCLASS,
     HAS_NEXT_MISSING,
     ILLEGAL_INLINE_PARAMETER_MODIFIER,
+    ILLEGAL_SUSPEND_FUNCTION_CALL,
+    INAPPLICABLE_CANDIDATE,
     INAPPLICABLE_INFIX_MODIFIER,
     INAPPLICABLE_LATEINIT_MODIFIER,
     INAPPLICABLE_OPERATOR_MODIFIER,
+    INCOMPATIBLE_ENUM_COMPARISON_ERROR,
     INCOMPATIBLE_MODIFIERS,
+    INCORRECT_LEFT_COMPONENT_OF_INTERSECTION,
     INCONSISTENT_BACKING_FIELD_TYPE,
     INLINE_PROPERTY_WITH_BACKING_FIELD,
     INFIX_MODIFIER_REQUIRED,
+    INITIALIZER_TYPE_MISMATCH,
     INVALID_TYPE_OF_ANNOTATION_MEMBER,
     INVISIBLE_REFERENCE,
+    ITERATOR_ON_NULLABLE,
     MANY_IMPL_MEMBER_NOT_IMPLEMENTED,
     MANY_INTERFACES_MEMBER_NOT_IMPLEMENTED,
     ITERATOR_MISSING,
@@ -158,15 +181,31 @@ pub const Factory = enum {
     KLIO_UNRECORDED,
     KLIO_UNSUPPORTED,
     MULTIPLE_VARARG_PARAMETERS,
+    NAMED_PARAMETER_NOT_FOUND,
     NEXT_MISSING,
     NONE_APPLICABLE,
+    NON_LOCAL_RETURN_NOT_ALLOWED,
+    NON_LOCAL_SUSPENSION_POINT,
+    NON_PUBLIC_CALL_FROM_PUBLIC_INLINE,
+    NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE,
     NON_SUSPEND_OVERRIDDEN_BY_SUSPEND,
     MISSING_VAL_ON_ANNOTATION_PARAMETER,
     NON_FINAL_PROPERTY_WITH_EXPLICIT_BACKING_FIELD,
+    NON_VARARG_SPREAD,
     NOTHING_TO_INLINE,
+    NOT_A_LOOP_LABEL,
+    NOT_A_SUPERTYPE,
     NOTHING_TO_OVERRIDE,
+    NO_RETURN_IN_FUNCTION_WITH_BLOCK_BODY,
+    NO_VALUE_FOR_PARAMETER,
+    NULLABLE_INLINE_PARAMETER,
     NULLABLE_TYPE_OF_ANNOTATION_MEMBER,
+    NULL_FOR_NONNULL_TYPE,
     OPERATOR_MODIFIER_REQUIRED,
+    OPT_IN_OVERRIDE,
+    OPT_IN_OVERRIDE_ERROR,
+    OPT_IN_USAGE,
+    OPT_IN_USAGE_ERROR,
     OVERRIDE_DEPRECATION,
     PARAMETER_NAME_CHANGED_ON_OVERRIDE,
     NO_ACTUAL_FOR_EXPECT,
@@ -179,19 +218,38 @@ pub const Factory = enum {
     PROPERTY_INITIALIZER_NO_BACKING_FIELD,
     PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS,
     PROPERTY_TYPE_MISMATCH_ON_OVERRIDE,
+    RECURSIVE_TYPEALIAS_EXPANSION,
     REDECLARATION,
     REDUNDANT_EXPLICIT_BACKING_FIELD,
     REPEATED_ANNOTATION,
+    RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR,
     REIFIED_TYPE_PARAMETER_NO_INLINE,
+    RETURN_TYPE_MISMATCH,
     RETURN_TYPE_MISMATCH_ON_OVERRIDE,
     SEALED_SUPERTYPE_IN_LOCAL_CLASS,
     SINGLETON_IN_SUPERTYPE,
     SUPERTYPE_NOT_INITIALIZED,
     SUPER_NOT_AVAILABLE,
     SUSPEND_OVERRIDDEN_BY_NON_SUSPEND,
+    TAILREC_ON_VIRTUAL_MEMBER_ERROR,
+    TOO_MANY_ARGUMENTS,
     TYPE_CANT_BE_USED_FOR_CONST_VAL,
     TYPE_MISMATCH,
+    TYPE_VARIANCE_CONFLICT_ERROR,
+    TYPE_VARIANCE_CONFLICT_IN_EXPANDED_TYPE,
+    UNINITIALIZED_VARIABLE,
+    UNRESOLVED_REFERENCE_WRONG_RECEIVER,
+    UNSAFE_CALL,
+    UNSAFE_IMPLICIT_INVOKE_CALL,
+    UNSAFE_OPERATOR_CALL,
+    UPPER_BOUND_VIOLATED,
+    USAGE_IS_NOT_INLINABLE,
+    VAL_REASSIGNMENT,
+    WRONG_ANNOTATION_TARGET,
+    WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET,
+    WRONG_GETTER_RETURN_TYPE,
     TYPE_PARAMETER_AS_REIFIED,
+    TYPE_PARAMETER_IN_CATCH_CLAUSE,
     UNCHECKED_CAST,
     UNRESOLVED_IMPORT,
     UNRESOLVED_LABEL,
@@ -293,6 +351,7 @@ fn factoryEnum(site: Site) Factory {
         .modifier_required => .OPERATOR_MODIFIER_REQUIRED,
         // Always named by the site.
         .annotation, .use => .KLIO_UNSUPPORTED,
+        .null_safety => .UNSAFE_CALL,
     };
 }
 
@@ -344,6 +403,15 @@ pub const Census = struct {
         if (site.severity == .warning) return self.warnings.append(self.arena, site);
         self.counts[@intFromEnum(site.reason)] += 1;
         try self.sites.append(self.arena, site);
+    }
+
+    /// Whether a site of `factory` starting where `sp` does is reported.
+    pub fn reportedAt(self: *const Census, file: u32, sp: span.Span, factory: Factory) bool {
+        const lists = [_][]const Site{ self.sites.items, if (self.buffer) |b| b.sites.items else &.{} };
+        for (lists) |list| for (list) |site| {
+            if (site.file == file and site.sp.start == sp.start and site.factory == factory) return true;
+        };
+        return false;
     }
 
     pub fn reportFmt(self: *Census, reason: Reason, file: u32, sp: span.Span, comptime fmt: []const u8, args: anytype) Allocator.Error!void {

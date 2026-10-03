@@ -71,42 +71,236 @@ unit tests; `typeck_negative` is the acceptance list.
   unimplemented abstract members and members several supertypes implement;
   operator and infix shapes, and `OPERATOR_MODIFIER_REQUIRED` /
   `INFIX_MODIFIER_REQUIRED` at the call; constructor cycles; an escaping
-  object expression's type. Warnings `NOTHING_TO_INLINE`,
+  object expression's type; a vararg of a value class without
+  `FullValueClasses` (`FORBIDDEN_VARARG_PARAMETER_TYPE`). Warnings `NOTHING_TO_INLINE`,
   `PARAMETER_NAME_CHANGED_ON_OVERRIDE`, `REDUNDANT_EXPLICIT_BACKING_FIELD`.
 - B2. Annotations, targets, opt-in and deprecation. Partly done:
   - done: annotation class shape (members, parameter types, `val`, constant
     defaults, cycles), `REPEATED_ANNOTATION`, `DEPRECATION`,
     `DEPRECATION_ERROR` (with `@DeprecatedSinceKotlin` against 2.4) at calls,
     reads, constructors and header types, `OVERRIDE_DEPRECATION`;
-  - not done: `WRONG_ANNOTATION_TARGET` and its use-site-target forms (the
-    `@all:` and defaulting rules are in `ast.annotation_targets`; the 13
-    diagnostic rows of the `annotation_targets` itest define them);
-    `ANNOTATION_ARGUMENT_MUST_BE_CONST`;
-  - opt-in (`OPT_IN_USAGE`, `OPT_IN_USAGE_ERROR`, `OPT_IN_OVERRIDE*`) was
-    written and taken out before landing, for two regressions it caused in
-    examples that run. What kotlinc does (probed): a declaration's markers
-    are its own and its containing classes' (a member of a marked class
-    needs the opt-in, a constructor its class's), the use is reported at the
-    call, read, constructor or header type, a site is opted in by `@M` or
-    `@OptIn(M::class)` on any enclosing declaration or the file, and an
-    override of a marked member is `OPT_IN_OVERRIDE`; the message says
-    "must" for an error and "should" for a warning. The two things to solve
-    first: the kotlinx.serialization plugin's generated serializers sit in
-    the program's file and use `@InternalSerializationApi` members, so code
-    the plugin generates must be exempt; and whether kotlinc 2.4 still marks
-    `kotlin.time.Instant` `@ExperimentalTime` (examples/
-    instant_component_serializer.kt uses it without an opt-in; the oracle has
-    no kotlinx-datetime jar to say).
-- B3. Visibility and names, context parameters. Not started.
-- B4. Types. Not started. It also fixes the wrong factory for a call no
-  candidate accepts: sema says `NONE_APPLICABLE` where kotlinc, with a single
-  candidate, names its problem (`TOO_MANY_ARGUMENTS`, `ARGUMENT_TYPE_MISMATCH`,
-  `NO_VALUE_FOR_PARAMETER`, `NON_VARARG_SPREAD`, `INAPPLICABLE_CANDIDATE` with
-  `UPPER_BOUND_VIOLATED`) — five typeck_negative fixtures.
-- B5. Null safety and casts. Not started.
+  - done (`annocheck.targets`): `WRONG_ANNOTATION_TARGET` where an
+    annotation's class does not admit its place: a classifier (named as
+    kotlinc names it: class, interface, enum class, standalone or
+    companion object, local class, annotation class), a function (top
+    level, member, local), a property (with a backing field it admits
+    `FIELD` too; kotlinc names whether it has one or a delegate), a getter
+    or setter, a value parameter (a `val` one admits `PROPERTY` and
+    `FIELD`), a constructor, an enum entry, a type alias, a type parameter,
+    a local variable, a lambda (`FUNCTION` or `EXPRESSION`), a type usage,
+    a file; `WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET` for a use-site
+    target (`@get:`, `@field:`, `@file:`, ...) its class does not admit;
+    `RESTRICTED_RETENTION_FOR_EXPRESSION_ANNOTATION_ERROR` for an
+    `EXPRESSION` annotation class not kept `SOURCE`. A class's targets are
+    its `@Target`'s or the default set.
+  - not done: the targets of an annotation class read from an
+    image, whose `@Target` is not baked; the `@all:` expansion
+    (`ast.annotation_targets`, the 13 diagnostic rows of the
+    `annotation_targets` itest); `ANNOTATION_ARGUMENT_MUST_BE_CONST`;
+  - done (`optin.zig`): opt-in. A `@RequiresOptIn` class is a marker at
+    its level (`ERROR` unless it says `WARNING`; the base's are baked into
+    its image, format 110). A use is reported where the used declaration
+    carries a marker (a constructor its class's; `EC.make()` names the
+    class of the companion it reaches) or where it gives a value whose
+    class carries one (`e` read as an `EC`, a call returning one), and a
+    header type naming a marked class: `OPT_IN_USAGE_ERROR`, or
+    `OPT_IN_USAGE` for a warning marker, naming the marker by its qualified
+    name. A member of a marked class is not reported itself: its receiver
+    is (kotlinc reports `e` in `e.m()`, and nothing more in `EC().m()`). A
+    use opts in under a declaration, a file (`@file:OptIn`) or an
+    expression annotated with the marker or `@OptIn(M::class)` (qualified
+    names too), and everywhere under `--opt-in=` (kotlinc's `-opt-in`; the
+    box runner passes its `OPT_IN` directive). An override of a marked
+    member is `OPT_IN_OVERRIDE_ERROR` / `OPT_IN_OVERRIDE`. Code a compiler
+    plugin adds is exempt (a node numbered from the file's
+    `parsed_node_count` on: the serialization pass's splices), as are
+    packs' sources, which their builds opt in by compiler flag. Two
+    examples used marked library API without the opt-in kotlinc requires
+    (`InstantComponentSerializer` is `@ExperimentalTime`,
+    `buildSerialDescriptor` `@InternalSerializationApi`) and now opt in;
+    `kotlin.time.Instant` itself is stable in 2.4.
+  - annotations on an expression are kept (`KotlinFile.annotated_exprs`,
+    the whole postfix expression they stand on) for these checks: an
+    `@OptIn` there opts the expression in, and its targets are checked
+    (`EXPRESSION`; an anonymous function's admits `FUNCTION` too).
+- B3. Visibility and names, context parameters. Partly done:
+  `RECURSIVE_TYPEALIAS_EXPANSION` (an alias whose expansion reaches it
+  again, every alias of the cycle at its target; one that only names a
+  cyclic alias is not reported) and `DSL_SCOPE_VIOLATION` (a call, read or
+  operator reaching an implicit receiver when a closer one carries one of
+  its `@DslMarker` annotations, on its class or a supertype; checked as
+  the reference is recorded, cheaply when the receiver used is the
+  innermost); `NOT_A_SUPERTYPE` for `super<X>` naming a class that is not
+  a direct supertype (`Any` is not, when the class names only interfaces);
+  `NOT_A_LOOP_LABEL` for a labeled `break` or `continue` no enclosing loop
+  carries, and `BREAK_OR_CONTINUE_JUMPS_ACROSS_FUNCTION_BOUNDARY` for one
+  whose loop is outside a function, class or lambda that is not inlined (a
+  lambda or anonymous function passed to an inline function is). Not done:
+  the marker written on a function type's receiver (`fun q(b: @M Q.() ->
+  Unit)`), which needs the annotation carried on the lambda's receiver
+  type. Done too: an extension property's accessor has no `field`
+  (`UNRESOLVED_REFERENCE`).
+- B4. Types. Partly done:
+  - done (`body.checkFits`): a value against the type its place declares,
+    `INITIALIZER_TYPE_MISMATCH` (property, local, parameter default,
+    name-based destructuring entry), `RETURN_TYPE_MISMATCH` (`return`,
+    expression body, getter, a lambda's last expression when the call does
+    not infer its result), `ASSIGNMENT_TYPE_MISMATCH`, `TYPE_MISMATCH`
+    (`throw`, `by` delegation), `WRONG_GETTER_RETURN_TYPE`,
+    `COMPONENT_FUNCTION_RETURN_TYPE_MISMATCH`. `klio run` refuses these as
+    kotlinc does. They needed sema to infer as K2 does: integer literal
+    operators (`+ - * / %`, `shl shr ushr and or xor inv`, unary minus and
+    plus) give `Int` or `Long`, computed in `Int` and widened; a `var`
+    initialized from a smart-cast value takes the declared type; a Boolean
+    `val` holding a condition smart-casts where it is tested; a `while` or
+    `do-while` without a `break` leaves its condition false; `===` and `!==`
+    narrow to the other side's type unless that side is a constant; a
+    destructured entry with a written type takes it.
+  - the checks judge only known types: a type still being inferred, an error
+    type, or one naming a type parameter no enclosing declaration declares
+    (sema left a generic declaration's type uninstantiated) says nothing.
+    Three box tests reach the last: a context-parameter property read bare
+    (`contextParameters/inferGenericPropertyType`), an inner class's
+    constructor reference (`callableReference/function/constructorFromInnerClassWithTypeParam`)
+    and a generic member reference through an inner class
+    (`innerClass/inCallableReferenceLHSwithGenericFun`); sema's inference
+    there is the work.
+  - done (`calls.reportInapplicable`): a call no candidate accepts is
+    reported as kotlinc reports it. The candidates are ranked by how far
+    each gets (a receiver that does not fit, below it one a default import
+    brings, which is a plain `UNRESOLVED_REFERENCE`; then arguments that do
+    not map; then an argument that does not fit); of the latest group the
+    most specific is taken when there is one; several are
+    `NONE_APPLICABLE`, listing that group; one names its problems:
+    `ARGUMENT_TYPE_MISMATCH` per argument (the expected type as the other
+    arguments fix it, a type parameter nothing fixed shown as its bound and
+    reported `CANNOT_INFER_PARAMETER_TYPE`), `NULL_FOR_NONNULL_TYPE`,
+    `TOO_MANY_ARGUMENTS` per extra argument, `NO_VALUE_FOR_PARAMETER`,
+    `NAMED_PARAMETER_NOT_FOUND`, `ARGUMENT_PASSED_TWICE`, `NON_VARARG_SPREAD`,
+    `UNRESOLVED_REFERENCE_WRONG_RECEIVER`, and `INAPPLICABLE_CANDIDATE` with
+    `UPPER_BOUND_VIOLATED` for a written type argument. Positions are
+    kotlinc's: the AST keeps a named argument's label and the `=` of an
+    initializer, a default and an assignment.
+  - not done: a lambda whose parameter count does not fit
+    (`ARGUMENT_TYPE_MISMATCH` naming the lambda's type, and
+    `CANNOT_INFER_VALUE_PARAMETER_TYPE`), which stays `NONE_APPLICABLE`;
+    `@OnlyInputTypes` (`TYPE_INFERENCE_ONLY_INPUT_TYPES_ERROR`, sema says
+    `ARGUMENT_TYPE_MISMATCH` for `m.getOrDefault("k", 1)` on a
+    `Map<Int, String>`).
+  - done (`declcheck.memberVariance`): `TYPE_VARIANCE_CONFLICT_ERROR` where
+    a class's `in` or `out` type parameter stands in a member's type, a
+    supertype or an inner class's member against its variance (parameter,
+    receiver and bound types read `in`, a return type and a `val`'s type
+    `out`, a `var`'s both; a private member is exempt; `@UnsafeVariance`
+    skips its place). Through a type alias, kotlinc walks the expansion and
+    places a finding by the expansion's argument index among the written
+    arguments (read from its bytecode); a parameter standing directly in
+    the expansion is `TYPE_VARIANCE_CONFLICT_IN_EXPANDED_TYPE`. The alias's
+    written target is walked for its `@UnsafeVariance` places. Alias
+    expansion now keeps a projected argument (`ML<out T>` for
+    `MutableList<K>` is `MutableList<out T>`), which it dropped before.
+  - done: `CYCLIC_GENERIC_UPPER_BOUND` (type parameters bounded by each
+    other in a circle, at a function's parameter names and at a class's
+    closing bounds); `TYPE_PARAMETER_IN_CATCH_CLAUSE` (at the catch
+    parameter); `TYPE_PARAMETER_AS_REIFIED` for `T::class` and at a written
+    type argument (the `Array` constructor reifies its `T`);
+    `EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS`;
+    `INCORRECT_LEFT_COMPONENT_OF_INTERSECTION` (`X & Any` where `X` is not a
+    type parameter whose bound admits null); `CANNOT_CHECK_FOR_ERASED` for an
+    `is` (and a `when` branch's) on a type parameter that is not reified or
+    a class whose non-star type arguments the subject's type does not fix
+    through the class's supertype.
+  - done (`calls.assignAmbiguity`): `ASSIGN_OPERATOR_AMBIGUITY` for `a += b`
+    when `a` is a `var` (a setter's visibility does not matter), both
+    `plusAssign` and `plus` apply and `plus`'s result fits `a`'s declared
+    type; for `a[i] += b` the other reading is `set`. The message lists the
+    two candidates in order.
+  - done (`body.checkEquality`): `==` and `===` over types no value has both
+    of (`subtyping.emptyIntersection`): two enums are
+    `INCOMPATIBLE_ENUM_COMPARISON_ERROR`; an identity test is
+    `FORBIDDEN_IDENTITY_EQUALS` when a side is a primitive, else
+    `EQUALITY_NOT_APPLICABLE`; an equality is `EQUALITY_NOT_APPLICABLE` when
+    a side is a built-in value type (a primitive, `String`, an unsigned
+    type), and between other classes only a warning kotlinc gives
+    (`INCOMPATIBLE_TYPES`, not reported yet). An integer literal is its
+    `Int` there (`l == 1` for a `Long` is refused); a smart-cast value is
+    judged by its declared type, as kotlinc only warns of a smart cast's.
+- B5. Null safety and casts. Partly done:
+  - done: a member, operator, `invoke` or iteration reached on a value that
+    may be null without `?.` is resolved on its non-null type, as kotlinc
+    resolves it, and reported: `UNSAFE_CALL` for a property read or a call
+    (at the `.`; for an implicit receiver of nullable type, at the name),
+    an index (at the receiver), a unary operator and `++`/`--` (at the
+    operator); `UNSAFE_OPERATOR_CALL` for a binary operator, `in`, a
+    comparison and a compound assignment (at the operator);
+    `UNSAFE_IMPLICIT_INVOKE_CALL` for `f()` on a nullable value;
+    `ITERATOR_ON_NULLABLE`. A call is unsafe only when nothing applies on
+    the receiver as it is (an extension on the nullable type, as
+    `Any?.toString()`, wins) and some candidate takes the non-null
+    receiver. Before this, sema accepted `b.v` on a `Box?` and `f()` on an
+    `(() -> Int)?`, so `klio run` ran programs kotlinc rejects. An
+    operator whose candidates take the operand but not the arguments is
+    diagnosed as a call is, at the operator. It needed two smart casts
+    kotlinc makes: an equality with an operand whose type is not nullable
+    (`pointer?.type == Kind.Mouse`) makes the other side not null, and a
+    smart cast of a stable property reaches its `invoke`
+    (`if (calculate !== null) calculate(d)`).
+  - not done: `UNSAFE_INFIX_CALL`; `UNCHECKED_CAST`, `CANNOT_CHECK_FOR_ERASED`,
+    `USELESS_CAST`, `UNNECESSARY_SAFE_CALL`, `UNNECESSARY_NOT_NULL_ASSERTION`.
 - B6. Control flow: a structured flow pass over the syntax and sema's
-  records, not cfa. Not started.
-- B7. suspend, inline, tailrec. Not started.
+  records, not cfa. Partly done (`flowcheck.zig`, a program's bodies):
+  `UNINITIALIZED_VARIABLE` for a local read where some path reaches it
+  unassigned, `VAL_REASSIGNMENT` for a `val` (local, parameter, loop or
+  catch variable, a property with an initializer) assigned where it may be
+  assigned already (a second time, again round a loop, in a lambda that
+  does not run in place), and `NO_RETURN_IN_FUNCTION_WITH_BLOCK_BODY` where
+  a block body with a result can reach its end. Paths end at `return`,
+  `throw`, a jump, an expression of type `Nothing` and an exhaustive `when`
+  whose branches all end (sema records which `when`s without `else` match
+  every subject); a lambda passed for a parameter its callee's contract
+  `callsInPlace` runs where the call is (sema reads `callsInPlace` with the
+  `returns` contracts; klio's `synchronized` declares it as the JVM's
+  does); a `finally` that never completes takes over the jumps through it.
+  A loop or a repeatable in-place lambda is walked once: a write in it to
+  a `val` declared before it, maybe assigned where the body goes round
+  again, is the reassignment. A pack's or the base's bodies are left out:
+  sema resolves them only where the program reaches them. A file's, a
+  class's, an object's (an object expression's too) property initializers
+  and `init` blocks are one path in the order they run, each property with
+  a backing field (not `const`, not `lateinit`) tracked as a local is: a
+  read before its initializer, delegate or an `init` block's assignment
+  runs is `UNINITIALIZED_VARIABLE`, directly, through `this.x` or in a
+  lambda run in place (an inline function's too), but not in a lambda,
+  function or accessor, which may run later. A local class or object
+  expression is initialized on its own after the file's walks. Not done:
+  `INSTANCE_ACCESS_BEFORE_SUPER_CALL` (a constructor default reading a
+  member), `INITIALIZATION_BEFORE_DECLARATION`,
+  `CAPTURED_MEMBER_VAL_INITIALIZATION`, `CAPTURED_VAL_INITIALIZATION`,
+  `UNREACHABLE_CODE` and the other warnings.
+- B7. suspend, inline, tailrec. Partly done: a suspend call where it is
+  written (`calls.checkSuspendCall`) stands in a suspend function or
+  suspend lambda, through lambdas an inline function runs in place;
+  elsewhere it is `NON_LOCAL_SUSPENSION_POINT` when a suspend function or
+  lambda encloses the literal or local function it is in, and
+  `ILLEGAL_SUSPEND_FUNCTION_CALL` otherwise. A lambda's scope records how
+  it runs (suspend, in place, plain, or not known while its expected type
+  is a variable, which says nothing). Done too: an inline parameter used
+  other than called or passed on to be inlined is `USAGE_IS_NOT_INLINABLE`,
+  and called in a body that is not inlined (a lambda passed to a function
+  that does not inline it, or to a `crossinline` parameter, a local
+  function or class) `NON_LOCAL_RETURN_NOT_ALLOWED` unless `crossinline`
+  (`flowcheck.zig`; `inline constructor` is kept, so `Array(n) { ... }`
+  inlines its lambda); `NULLABLE_INLINE_PARAMETER`;
+  `TAILREC_ON_VIRTUAL_MEMBER_ERROR` (at the name, where kotlinc places it at
+  the modifier: the parser keeps no modifier positions, as for the other
+  modifier diagnostics); `NON_PUBLIC_CALL_FROM_PUBLIC_INLINE` for a call of
+  a private or internal function that is not `@PublishedApi` from an
+  effectively public inline function, `NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE`
+  when that function is inline; an `actual` is published where its
+  `expect` is (Compose's `synchronized`, the stdlib's `mapCapacity`). Not done: `NO_TAIL_CALLS_FOUND`,
+  `NON_TAIL_RECURSIVE_CALL`, a non-public property or class read from a
+  public inline function, a suspend operator or a suspend `invoke` of a
+  value.
 
 C. Switch: `klio check` defaults to sema; `typeck_negative` asserts kotlinc
 factory names from `klio check` (its 8 inline cases become fixtures); the 46
@@ -150,61 +344,49 @@ pinned kotlinc does not ship and are taken as valid):
 | rule 3: sema misses | 9 | 6 | 6 |
 | rule 4: wrong severity | 0 | 0 | 0 |
 
-Sema reports no error in the examples kotlinc judges. The 6 rule-3 misses are
-the five `NONE_APPLICABLE` (B4) and a `NOTHING_TO_INLINE` warning kotlinc
-leaves out beside the `NON_PUBLIC_CALL_FROM_PUBLIC_INLINE` error sema does
-not report yet (B3).
+Sema reports no error in the examples kotlinc judges. After B4's value and
+call checks, of typeck_negative's 133 kotlinc diagnostics sema reports 98
+and matches 97; kotlinc reports 36 sema does not (44 before them). The one
+rule-3 miss is a `NOTHING_TO_INLINE` warning kotlinc leaves out beside the
+`NON_PUBLIC_CALL_FROM_PUBLIC_INLINE` error sema does not report yet (B3).
 
-What rule 1 still misses, by the category that will cover it:
+The typeck_negative files `klio run` still runs though kotlinc rejects them
+(2026-10-03): none. The examples kotlinc rejects use klio's JVM-only API
+or a library's internals, as intended.
 
-- B2: neg_annotation_target_class_only_on_function (`WRONG_ANNOTATION_TARGET`),
-  neg_opt_in_missing (`OPT_IN_USAGE_ERROR`); in the examples,
-  select_and_semaphore and select_on_timeout_loses (`OPT_IN_USAGE`).
-- B3: neg_dsl_marker_nested_shadow (`DSL_SCOPE_VIOLATION`, twice),
-  neg_field_in_extension_property (`UNRESOLVED_REFERENCE` of `field`),
-  neg_published_api_missing (`NON_PUBLIC_CALL_FROM_PUBLIC_INLINE`),
-  neg_recursive_typealias (`RECURSIVE_TYPEALIAS_EXPANSION`),
-  neg_super_qualifier_not_supertype (`NOT_A_SUPERTYPE`),
-  neg_unresolved_label (`NOT_A_LOOP_LABEL`).
-- B4: neg_accessor_return_type_mismatch (`WRONG_GETTER_RETURN_TYPE`),
-  neg_arity (`TOO_MANY_ARGUMENTS`), neg_catch_type_param
-  (`TYPE_PARAMETER_IN_CATCH_CLAUSE`), neg_circular_type_bound and
-  neg_circular_type_bound_self (`CYCLIC_GENERIC_UPPER_BOUND`),
-  neg_class_literal_nullable (`EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS`),
-  neg_class_literal_type_param (`TYPE_PARAMETER_AS_REIFIED`),
-  neg_compound_assign_ambiguity (`ASSIGN_OPERATOR_AMBIGUITY`),
-  neg_declaration_variance_violation (`TYPE_VARIANCE_CONFLICT_ERROR`),
-  neg_definitely_non_null (`INCORRECT_LEFT_COMPONENT_OF_INTERSECTION`),
-  neg_delegation_type_mismatch and neg_throw_non_throwable (`TYPE_MISMATCH`),
-  neg_reference_equality_distinct (`FORBIDDEN_IDENTITY_EQUALS`),
-  neg_spread_requires_vararg (`ARGUMENT_TYPE_MISMATCH`, `NON_VARARG_SPREAD`,
-  `NO_VALUE_FOR_PARAMETER`, twice), neg_spread_type_mismatch and
-  neg_wrong_arg_type (`ARGUMENT_TYPE_MISMATCH`), neg_type_bound_not_satisfied
-  (`INAPPLICABLE_CANDIDATE`, `UPPER_BOUND_VIOLATED`), neg_type_mismatch
-  (`INITIALIZER_TYPE_MISMATCH`), neg_value_equality_distinct
-  (`EQUALITY_NOT_APPLICABLE`).
-- B5: neg_as_safe_type_param, neg_as_unchecked_type_param and
-  neg_unchecked_cast twice (`UNCHECKED_CAST`), neg_is_type_param
-  (`CANNOT_CHECK_FOR_ERASED`), neg_null_deref (`UNSAFE_CALL`); in the
-  examples, annotated_function_types and as_cast (`USELESS_CAST`),
-  cast_null_and_erasure twice, collection_bridges_and_throwable_cause and
-  ieee754_comparisons twice (`UNCHECKED_CAST`), stdlib_taste
-  (`UNNECESSARY_SAFE_CALL`).
-- B6: neg_val_reassign (`VAL_REASSIGNMENT`), neg_var_not_definitely_assigned
-  (`UNINITIALIZED_VARIABLE`).
-- B7: neg_crossinline_param_leak and neg_inline_param_leak
-  (`USAGE_IS_NOT_INLINABLE`), neg_suspend_call_from_non_suspend
-  (`ILLEGAL_SUSPEND_FUNCTION_CALL`), neg_tailrec_no_calls and
-  neg_tailrec_non_tail (`NO_TAIL_CALLS_FOUND`), neg_tailrec_non_tail
-  (`NON_TAIL_RECURSIVE_CALL`); in the examples, tailrec_forms
-  (`NON_TAIL_RECURSIVE_CALL`).
+What sema still misses of kotlinc's diagnostics over the inputs
+(2026-10-03, by the category that will cover it):
 
-kotlinc also reports warnings in the examples neither engine does
-(`USELESS_IS_CHECK` 36, `NOTHING_TO_INLINE` now matched, and a few more),
-which parity will want after the categories.
+- errors in typeck_negative: `NO_VALUE_FOR_PARAMETER` beside `DELEGATION_NOT_TO_INTERFACE` for
+  `class B : A by a` naming a class without its constructor call (B4; the
+  file is refused for the other two).
+- errors in examples, intended: klio's JVM-only API (`native_identity_hash`,
+  `weak_references`, `thread_handle_values`) and kotlinx.coroutines
+  internals (`channel_undelivered_element`, `INVISIBLE_REFERENCE`).
+- warnings (B5 and the rest): `USELESS_IS_CHECK` (32), `UNCHECKED_CAST` (9),
+  `USELESS_CAST`, `UNUSED_EXPRESSION`, `CAST_NEVER_SUCCEEDS`,
+  `DIVISION_BY_ZERO`, `EXTENSION_SHADOWED_BY_MEMBER`,
+  `REDUNDANT_CALL_OF_CONVERSION_METHOD`,
+  `REDUNDANT_SPREAD_OPERATOR_IN_NAMED_FORM_IN_FUNCTION`,
+  `NON_TAIL_RECURSIVE_CALL` and `NO_TAIL_CALLS_FOUND` (B7),
+  `EQUALITY_NOT_APPLICABLE_WARNING`,
+  `MULTIPLE_DEFAULTS_INHERITED_FROM_SUPERTYPES_DEPRECATION_WARNING`,
+  `FINAL_UPPER_BOUND`, `REDUNDANT_ELSE_IN_WHEN`, `UNNECESSARY_SAFE_CALL`,
+  `UNNECESSARY_NOT_NULL_ASSERTION`.
 
-The pack-source check (`KLIO_CHECK_PACKS=1`) finds no declaration or
-annotation site in any pack. The klio glue it once flagged
+The pack-source check (`KLIO_CHECK_PACKS=1`) finds no declaration,
+annotation or type-mismatch site in any pack. The base check
+(`KLIO_CHECK_BASE=1`, the stdlib and klio's actuals) finds no type mismatch
+and 13 declaration sites a program does not reproduce: `@Suppress` on an
+`expect` function and on a constructor parameter not honored
+(`REIFIED_TYPE_PARAMETER_NO_INLINE` twice, `DEPRECATION_ERROR`), the
+unsigned types' `const val MIN_VALUE: UByte = UByte(0)` and its kin (8), the
+annotation default `ReplaceWith("")` in `Deprecated`, and klio's
+`external val Throwable.stackTrace`; besides them klio's coroutine
+intrinsics (`Intrinsics.kt`) call a suspend `invoke` from functions that are
+not suspend (6), where the JVM's are compiler intrinsics. klio's own inline
+helpers reach their natives through `@PublishedApi` declarations, as
+kotlinc requires. The klio glue it once flagged
 (`KlioComposeOwner`, `KlioPointerIconService`) is gone: ui's host is
 upstream's RootNodeOwner and scene now.
 

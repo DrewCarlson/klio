@@ -47,8 +47,8 @@ pub fn message(s: *Sema, a: Allocator, site: Site) Allocator.Error![]const u8 {
         .conflicting_overloads => conflicting(s, a, site.syms),
         .expect_no_actual => std.fmt.allocPrint(a, "`{s}` is an `expect` with no `actual`", .{n}),
         .invisible => invisible(s, a, n, site.syms),
-        .reified_param => std.fmt.allocPrint(a, "cannot use `{s}` as a reified type argument of `{s}`; use a class instead", .{ if (site.syms.len != 0) s.str(s.syms.name(site.syms[0])) else "?", n }),
-        .type_mismatch, .non_exhaustive_when, .when_guard, .member_hidden, .declaration, .modifier_required, .annotation, .use => site.detail,
+        .reified_param => std.fmt.allocPrint(a, "Cannot use '{s}' as reified type parameter. Use a class instead.", .{if (site.syms.len != 0) s.str(s.syms.name(site.syms[0])) else "?"}),
+        .type_mismatch, .non_exhaustive_when, .when_guard, .member_hidden, .declaration, .modifier_required, .annotation, .use, .null_safety => site.detail,
     };
 }
 
@@ -163,6 +163,10 @@ pub fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym)
             } else {
                 if (s.syms.flags(m).suspend_) try buf.appendSlice(a, "suspend ");
                 try buf.appendSlice(a, "fun ");
+                if (info.type_params.len != 0) {
+                    try writeTypeParams(s, a, buf, info.type_params);
+                    try buf.append(a, ' ');
+                }
                 if (info.receiver != .none) {
                     try writeType(s, a, buf, info.receiver);
                     try buf.append(a, '.');
@@ -183,6 +187,49 @@ pub fn writeDeclaration(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), m: Sym)
             }
         },
         else => try buf.appendSlice(a, s.str(s.syms.name(m))),
+    }
+}
+
+/// `<T : Int, R>`: type parameters as kotlinc writes them in a declaration,
+/// a single bound other than `Any?` after the name.
+pub fn writeTypeParams(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), tps: []const Sym) Allocator.Error!void {
+    if (tps.len == 0) return;
+    try buf.append(a, '<');
+    for (tps, 0..) |tp, i| {
+        if (i != 0) try buf.appendSlice(a, ", ");
+        switch (s.syms.typeParamInfo(tp).variance) {
+            .in => try buf.appendSlice(a, "in "),
+            .out => try buf.appendSlice(a, "out "),
+            else => {},
+        }
+        try buf.appendSlice(a, s.str(s.syms.name(tp)));
+        const bounds = try headers.typeParamBounds(s, tp);
+        if (bounds.len == 1 and bounds[0] != s.t.any_q) {
+            try buf.appendSlice(a, " : ");
+            try writeType(s, a, buf, bounds[0]);
+        }
+    }
+    try buf.append(a, '>');
+}
+
+/// The declaration a type parameter belongs to, as kotlinc names it after
+/// the parameter: `class Box<out T>`, `fun <T : Int> id`.
+pub fn writeTypeParamOwner(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), tp: Sym) Allocator.Error!void {
+    const owner = s.syms.owner(tp);
+    switch (s.syms.kind(owner)) {
+        .class => {
+            try buf.appendSlice(a, if (s.syms.classInfo(owner).kind == .interface) "interface " else "class ");
+            try buf.appendSlice(a, s.str(s.syms.name(owner)));
+            try writeTypeParams(s, a, buf, s.syms.classInfo(owner).type_params);
+        },
+        .function, .constructor => {
+            const own = s.syms.functionInfo(owner).type_params;
+            try buf.appendSlice(a, "fun ");
+            try writeTypeParams(s, a, buf, own);
+            if (own.len != 0) try buf.append(a, ' ');
+            try buf.appendSlice(a, s.str(s.syms.name(owner)));
+        },
+        else => try buf.appendSlice(a, s.str(s.syms.name(owner))),
     }
 }
 
@@ -329,6 +376,12 @@ pub fn typeText(s: *Sema, a: Allocator, t: TypeId) Allocator.Error![]const u8 {
 }
 
 pub fn writeType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), t: TypeId) Allocator.Error!void {
+    return writeTypeAs(s, a, buf, t, false);
+}
+
+/// `writeType`, a type parameter followed by the declaration that owns it
+/// when `owners`: `T? (of class Box<out T>)`.
+pub fn writeTypeAs(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), t: TypeId, comptime owners: bool) Allocator.Error!void {
     switch (s.types.get(t)) {
         .none, .err => try buf.appendSlice(a, "?"),
         .variable => try buf.appendSlice(a, "?"),
@@ -337,18 +390,23 @@ pub fn writeType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), t: TypeId) All
             try buf.appendSlice(a, s.str(s.syms.name(p.sym)));
             if (p.dnn) try buf.appendSlice(a, " & Any");
             if (p.nullable) try buf.append(a, '?');
+            if (owners) {
+                try buf.appendSlice(a, " (of ");
+                try writeTypeParamOwner(s, a, buf, p.sym);
+                try buf.append(a, ')');
+            }
         },
         .intersection => |parts| {
             for (parts, 0..) |p, i| {
                 if (i != 0) try buf.appendSlice(a, " & ");
-                try writeType(s, a, buf, p);
+                try writeTypeAs(s, a, buf, p, owners);
             }
         },
         .class => |c| {
             if (calls.functionShape(s, t)) |shape| {
                 if (shape.params + @intFromBool(shape.has_receiver) + shape.contexts + 1 == c.args.len) {
                     if (c.nullable) try buf.append(a, '(');
-                    try writeFunctionType(s, a, buf, c.args, shape);
+                    try writeFunctionType(s, a, buf, c.args, shape, owners);
                     if (c.nullable) try buf.appendSlice(a, ")?");
                     return;
                 }
@@ -367,7 +425,7 @@ pub fn writeType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), t: TypeId) All
                         .out => try buf.appendSlice(a, "out "),
                         .inv => {},
                     }
-                    try writeType(s, a, buf, arg.ty);
+                    try writeTypeAs(s, a, buf, arg.ty, owners);
                 }
                 try buf.append(a, '>');
             }
@@ -376,19 +434,19 @@ pub fn writeType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), t: TypeId) All
     }
 }
 
-fn writeFunctionType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), args: []const types.Arg, shape: calls.FnShape) Allocator.Error!void {
+fn writeFunctionType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), args: []const types.Arg, shape: calls.FnShape, comptime owners: bool) Allocator.Error!void {
     if (shape.is_suspend) try buf.appendSlice(a, "suspend ");
     var i: usize = 0;
     if (shape.contexts != 0) {
         try buf.appendSlice(a, "context(");
         while (i < shape.contexts) : (i += 1) {
             if (i != 0) try buf.appendSlice(a, ", ");
-            try writeType(s, a, buf, args[i].ty);
+            try writeTypeAs(s, a, buf, args[i].ty, owners);
         }
         try buf.appendSlice(a, ") ");
     }
     if (shape.has_receiver) {
-        try writeType(s, a, buf, args[i].ty);
+        try writeTypeAs(s, a, buf, args[i].ty, owners);
         try buf.append(a, '.');
         i += 1;
     }
@@ -396,8 +454,8 @@ fn writeFunctionType(s: *Sema, a: Allocator, buf: *std.ArrayList(u8), args: []co
     const first = i;
     while (i < args.len - 1) : (i += 1) {
         if (i != first) try buf.appendSlice(a, ", ");
-        try writeType(s, a, buf, args[i].ty);
+        try writeTypeAs(s, a, buf, args[i].ty, owners);
     }
     try buf.appendSlice(a, ") -> ");
-    try writeType(s, a, buf, args[args.len - 1].ty);
+    try writeTypeAs(s, a, buf, args[args.len - 1].ty, owners);
 }

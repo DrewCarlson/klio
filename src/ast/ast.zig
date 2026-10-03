@@ -161,12 +161,25 @@ pub const LanguageFeatures = struct {
     full_value_classes: bool = false,
 };
 
+/// `@A expr`: the annotations and the expression they stand on.
+pub const AnnotatedExpr = struct {
+    annotations: []Annotation,
+    span: Span,
+    /// The expression is an anonymous function, where an annotation stands
+    /// on a function as well.
+    function: bool = false,
+};
+
 pub const KotlinFile = struct {
     package: ?PackageHeader,
     imports: []ImportDecl,
     decls: []Decl,
     span: Span,
     file_annotations: []Annotation = &.{},
+    /// Annotations written on an expression other than a function literal,
+    /// which keeps its own: the expression carries none, and only the
+    /// checks (opt-in, targets) read them.
+    annotated_exprs: []AnnotatedExpr = &.{},
     /// The language features the file was parsed with.
     language: LanguageFeatures = .{},
     /// The parser saw a `@Composable` annotation somewhere in the file, so the
@@ -174,6 +187,10 @@ pub const KotlinFile = struct {
     has_composable: bool = false,
     /// The next free `NodeId`; every numbered node in the file is below it.
     node_count: u32 = 0,
+    /// `node_count` as the parse left it: a node numbered from it on was
+    /// added by a later pass, a compiler plugin's (the serialization
+    /// pass's splices), which kotlinc's checks do not see.
+    parsed_node_count: u32 = 0,
 };
 
 fn rewriteAliasedTypeName(ty: *TypeRef, aliases: *const std.StringHashMap([]const u8)) void {
@@ -335,6 +352,8 @@ pub const Param = struct {
     ty: TypeRef,
     /// Boxed so an absent default costs a pointer, not an inline `Expr`.
     default: ?*Expr,
+    /// Where the default's `=` is written; 0 with no default.
+    default_eq: u32 = 0,
     is_vararg: bool,
     is_crossinline: bool,
     is_noinline: bool,
@@ -351,6 +370,8 @@ pub const Property = struct {
     receiver_type: ?*TypeRef,
     ty: ?*TypeRef,
     init: ?*Expr,
+    /// Where the initializer's `=` is written; 0 with no initializer.
+    init_eq: u32 = 0,
     /// `init` is `None` when set. Boxed.
     delegate: ?*Expr,
     /// Boxed; the shared-graph codec resolves `PropertyDef.getter` to this node.
@@ -513,6 +534,8 @@ pub const ClassParam = struct {
     name: Ident,
     ty: TypeRef,
     default: ?Expr,
+    /// Where the default's `=` is written; 0 with no default.
+    default_eq: u32 = 0,
     visibility: Visibility,
     is_vararg: bool,
     annotations: []Annotation,
@@ -525,6 +548,8 @@ pub const ClassParam = struct {
 
 pub const SecondaryCtor = struct {
     params: []Param,
+    /// `inline constructor`: the standard arrays' (`Array(n) { ... }`).
+    is_inline: bool = false,
     delegation: CtorDelegation,
     /// Per argument, the parameter a named argument binds; `null` when positional.
     delegation_arg_names: []const ?[]const u8 = &.{},
@@ -635,6 +660,8 @@ pub const Block = struct {
 pub const AssignStmt = struct {
     target: Expr,
     op: AssignOp,
+    /// Where the operator is written.
+    op_at: u32 = 0,
     value: Expr,
     span: Span,
     id: NodeId = .none,
@@ -649,6 +676,9 @@ pub const DestructuringDeclStmt = struct {
     /// positional forms read `componentN`.
     by_name: bool = false,
     sources: []Ident = &.{},
+    /// The type each entry writes (`val (a: Int, b) = x`), null where none is
+    /// written; empty when no entry writes one.
+    types: []?TypeRef = &.{},
     init: Expr,
     span: Span,
     id: NodeId = .none,
@@ -699,6 +729,8 @@ pub const ForExpr = struct {
 /// `for (x in xs)` binds the element.
     destructured: bool = false,
     var_sources: []Ident = &.{},
+    /// The type each destructured entry writes, as `DestructuringDeclStmt.types`.
+    var_types: []?TypeRef = &.{},
     var_ty: ?TypeRef,
     iter: *Expr,
     body: *Expr,
@@ -822,6 +854,9 @@ pub const CallExtra = struct {
     /// Parallel to the call's `args`, `null` per positional argument; empty
     /// on a call built without labels.
     arg_names: []const ?[]const u8 = &.{},
+    /// Where each label is written, parallel to `arg_names` (a positional
+    /// argument's is empty); empty when every argument is positional.
+    arg_name_spans: []const Span = &.{},
     type_args: []TypeRef = &.{},
 
     pub fn isDefault(self: *const CallExtra) bool {
@@ -915,6 +950,8 @@ pub const Expr = union(enum) {
         receiver: *Expr,
         name: Ident,
         safe: bool,
+        /// Where the `.` or `?.` is written.
+        dot: u32 = 0,
         span: Span,
         id: NodeId = .none,
     },
@@ -969,6 +1006,8 @@ pub const Expr = union(enum) {
     },
     Binary: struct {
         op: BinOp,
+        /// Where the operator is written.
+        op_at: u32 = 0,
         lhs: *Expr,
         rhs: *Expr,
         span: Span,

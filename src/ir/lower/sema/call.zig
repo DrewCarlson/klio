@@ -14,6 +14,7 @@
 const std = @import("std");
 const span = @import("span");
 const sema = @import("sema");
+const operator = @import("operator.zig");
 const ast = @import("ast");
 
 const ir = @import("../../ir.zig");
@@ -283,6 +284,8 @@ fn hasDefaults(a: Allocator, s: *sema.Sema, params: []const Sym) Allocator.Error
 
 /// An `Expr.Call`.
 pub fn lowerCall(b: *Builder, e: *const ast.Expr) Error!Reg {
+    // An operator member on integer constants (`1 shl 2`) folds as `1 + 2` does.
+    if (sema.body.intConstValue(e) != null) return operator.foldedArithmetic(b, e);
     const c = &e.Call;
     const rec = b.call(c.id) catch |err| return missing(b, err, c.span, "call");
     const written: []const ast.Expr = if (c.is_infix and c.args.len != 0) c.args[1..] else c.args;
@@ -431,11 +434,17 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
     // override inherits is its supertype's to evaluate: that call is no
     // tail call, as kotlinc has it.
     const tail_defaults = ops.tail and masks.len != 0 and (how == .static or how == .virtual) and ownDefaults(s, rec.args, params, has_default);
+    // The function whose receiver the call passes: the callee's, or through
+    // a defaults bridge an override inherits, the declaration the bridge
+    // belongs to (a value class's override of `I.f` passes `I.f$default`
+    // the instance).
+    var receiver_of = rec.callee;
     if (masks.len != 0 and !tail_defaults) {
         if (rec.form == .super_) {
             return b.fail(ops.sp, "super calls with default arguments are prohibited; pass every argument of `{s}`", .{calleeName(s, rec.callee)});
         }
         how = try throughDefaults(b, rec, how, ops.sp);
+        receiver_of = defaultsTarget(b, rec.callee);
     }
     const in_place = if (how == .inline_) try inPlaceLambdas(b, rec, ops, params) else &.{};
     const groups = if (how == .inline_) try inlineGroups(b, rec, ops, in_place, params) else compose.InlineGroups{};
@@ -455,7 +464,7 @@ pub fn emitCall(b: *Builder, rec: *const CallRec, ops_in: Operands) Error!Reg {
             const lay = layoutOf(b.p, rec.callee);
             if (lay.this) {
                 const r = try receiverFor(b, rec.dispatch, ops.receiver, ops.sp);
-                try run.push(a, try coerce.convert(b, r, try receiverScalar(b, rec.dispatch, ops), try coerce.dispatchHeld(b, rec.callee)));
+                try run.push(a, try coerce.convert(b, r, try receiverScalar(b, rec.dispatch, ops), try coerce.dispatchHeld(b, receiver_of)));
             }
             if (localCaptures(b.p, rec.callee)) |keys| {
                 for (try env.materializeCaptures(b, keys)) |r| try run.push(a, r);
@@ -772,6 +781,18 @@ fn tailDefaults(b: *Builder, rec: *const CallRec, params: []const Sym, values: [
     for (params, saved) |p, h| {
         if (h) |home| try b.locals.put(a, p, home) else _ = b.locals.remove(p);
     }
+}
+
+/// The declaration whose defaults `callee`'s defaults bridge evaluates: the
+/// callee's own, or the one it inherits them from.
+fn defaultsTarget(b: *Builder, callee: Sym) Sym {
+    const br = b.p.br;
+    const d = br.defaultsOf(callee) orelse return callee;
+    if (d.int() >= br.origin.len) return callee;
+    return switch (br.origin[d.int()]) {
+        .defaults => |t| t,
+        else => callee,
+    };
 }
 
 fn throughDefaults(b: *Builder, rec: *const CallRec, how: How, sp: span.Span) Error!How {

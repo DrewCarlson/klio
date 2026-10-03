@@ -105,6 +105,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
     var kf: KotlinFile = .{
         .package = package,
         .file_annotations = file_annotations,
+        .annotated_exprs = p.annotated_exprs.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
         .imports = imports,
         .decls = decls.toOwnedSlice(p.allocator) catch @panic("OOM in parseFile"),
         .has_composable = p.saw_composable,
@@ -113,6 +114,7 @@ pub fn parseFile(p: *Parser) KotlinFile {
         .node_count = p.first_node_id,
     };
     ast.assignIds(&kf);
+    kf.parsed_node_count = kf.node_count;
     ast.node_ids.assertValid(&kf, "parse");
     return kf;
 }

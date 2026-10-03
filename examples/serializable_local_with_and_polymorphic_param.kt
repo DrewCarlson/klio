@@ -12,6 +12,8 @@ import kotlinx.serialization.json.*
 import kotlinx.serialization.modules.*
 
 object NullSerializer : KSerializer<Any?> {
+    // `buildSerialDescriptor` is the library's internal API.
+    @OptIn(InternalSerializationApi::class)
     override val descriptor: SerialDescriptor = buildSerialDescriptor("tmp", PrimitiveKind.INT)
     override fun serialize(encoder: Encoder, value: Any?) { encoder.encodeNull() }
     override fun deserialize(decoder: Decoder): Any? = decoder.decodeNull()

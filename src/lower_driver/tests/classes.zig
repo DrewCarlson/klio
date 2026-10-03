@@ -1114,7 +1114,7 @@ test "a collection override taking a narrower type answers a value of another ty
         \\    val list: List<Any?> = Names()
         \\    println(list.indexOf(3))
         \\    println(list.indexOf("xyz"))
-        \\    val map: Map<Any?, Int> = Lengths()
+        \\    val map = Lengths() as Map<Any?, Int>
         \\    println(map.get("four"))
         \\    println(map.get(4))
         \\}

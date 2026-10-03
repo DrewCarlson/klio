@@ -367,7 +367,8 @@ fn storeDelegates(b: *Builder, cls: Sym, cd: ClassDecl, this: Reg) Error!void {
     for (cd.delegates, 0..) |*d, i| {
         const ex: *const ast.Expr = if (d.*) |*x| x else continue;
         const slot = b.p.br.delegateSlot(cls, @intCast(i)) orelse return b.fail(ex.span(), "a `by` delegate without a slot", .{});
-        const v = try body.lowerExpr(b, ex);
+        // The slot is read through the interface: it holds the instance.
+        const v = try coerce.coerce(b, try body.lowerExpr(b, ex), b.exprType(ex.id()), .none);
         try b.emit(.{ .SetFieldSlot = .{ .obj = this, .slot = slot, .value = v } });
     }
 }

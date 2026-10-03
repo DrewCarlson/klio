@@ -674,10 +674,9 @@ test "local_extension_bound_applicability" {
     );
 }
 
-// kotlinc 2.4.20: "cannot use 'T' as reified type parameter. Use a class
-// instead." `arrayOf` needs the element class at run time.
+// `arrayOf` needs the element class at run time.
 test "generic_factory_return_extension" {
-    try checkErr("generic_factory_return_extension", "cannot use `T` as a reified type argument of `arrayOf`");
+    try checkErr("generic_factory_return_extension", "Cannot use 'T' as reified type parameter. Use a class instead.");
 }
 
 test "unsigned_array_sort_descending_range" {
@@ -3123,6 +3122,19 @@ test "null_and_identity_tests" {
         \\not below true true false
         \\data true false false true
         \\strings true false
+        \\
+    );
+}
+
+test "value_class_boxed_edges" {
+    try check("value_class_boxed_edges",
+        \\5
+        \\14
+        \\32
+        \\6
+        \\ababab
+        \\xx
+        \\Rank(r=14) true true true
         \\
     );
 }

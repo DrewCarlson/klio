@@ -132,7 +132,7 @@ pub fn typeRefExtra(p: *Parser, e: ast.TypeRefExtra) ?*const ast.TypeRefExtra {
 
 /// A call's boxed labels and type arguments. An all-positional label list
 /// is the shared one, and with no type arguments so is the box.
-pub fn callExtra(p: *Parser, arg_names: []const ?[]const u8, type_args: []ast.TypeRef) ?*const ast.CallExtra {
+pub fn callExtra(p: *Parser, arg_names: []const ?[]const u8, name_spans: []const Span, type_args: []ast.TypeRef) ?*const ast.CallExtra {
     const positional = for (arg_names) |n| {
         if (n != null) break false;
     } else true;
@@ -141,7 +141,11 @@ pub fn callExtra(p: *Parser, arg_names: []const ?[]const u8, type_args: []ast.Ty
         if (type_args.len == 0) if (ast.positionalExtra(arg_names.len)) |shared| return shared;
         if (ast.positionalNames(arg_names.len)) |shared| names = shared;
     }
-    return ast.callExtra(p.allocator, .{ .arg_names = names, .type_args = type_args }) catch @panic("OOM in parser");
+    return ast.callExtra(p.allocator, .{
+        .arg_names = names,
+        .arg_name_spans = if (positional) &.{} else name_spans,
+        .type_args = type_args,
+    }) catch @panic("OOM in parser");
 }
 
 /// The extras of a call of `n` positional arguments and no type arguments.
@@ -150,7 +154,7 @@ pub fn positionalCallExtra(p: *Parser, n: usize) ?*const ast.CallExtra {
     if (ast.positionalExtra(n)) |shared| return shared;
     const names = p.allocator.alloc(?[]const u8, n) catch @panic("OOM in parser");
     @memset(names, null);
-    return callExtra(p, names, &.{});
+    return callExtra(p, names, &.{}, &.{});
 }
 
 pub fn classExtra(p: *Parser, e: ast.ClassExtra) ?*const ast.ClassExtra {

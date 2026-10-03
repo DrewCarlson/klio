@@ -157,6 +157,8 @@ test "Attributes computeIfAbsent runs its block once under contention" {
 
 test "ktor locks hold real mutual exclusion across threads" {
     try runProgram("ktor_locks_mutex",
+        \\@file:OptIn(io.ktor.utils.io.InternalAPI::class)
+        \\
         \\import io.ktor.utils.io.locks.*
         \\import kotlin.concurrent.thread
         \\

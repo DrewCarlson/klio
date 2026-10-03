@@ -816,7 +816,7 @@ pub fn lowerUnary(b: *Builder, e: *const ast.Expr) Error!Reg {
 
 /// Arithmetic over integer literals, folded in the width of the type sema
 /// gave it.
-fn foldedArithmetic(b: *Builder, e: *const ast.Expr) Error!Reg {
+pub fn foldedArithmetic(b: *Builder, e: *const ast.Expr) Error!Reg {
     const s = b.p.s;
     var t = b.exprType(e.id());
     if (t == .none) return b.fail(e.span(), "integer literal arithmetic with no type", .{});
@@ -826,7 +826,9 @@ fn foldedArithmetic(b: *Builder, e: *const ast.Expr) Error!Reg {
     }
     t = try s.types.makeNotNull(t);
     const c = s.t;
-    const bits: u8 = if (t == c.long or t == c.ulong) 64 else if (t == c.short or t == c.ushort) 16 else if (t == c.byte or t == c.ubyte) 8 else 32;
+    // Computed as `Int` arithmetic while every literal is an `Int`, as kotlinc does,
+    // then widened to a `Long` the value is wanted as (`val x: Long = 1 shl 40` is 256).
+    const bits: u8 = if (t == c.short or t == c.ushort) 16 else if (t == c.byte or t == c.ubyte) 8 else if (sema.body.literalsFitInt(e)) 32 else 64;
     const v = sema.body.intConstValueIn(e, bits) orelse return b.fail(e.span(), "integer literal arithmetic that does not fold", .{});
     return b.emitConst(try intConst(b, e, v));
 }

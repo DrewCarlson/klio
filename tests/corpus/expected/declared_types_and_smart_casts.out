@@ -1,0 +1,13 @@
+a=1 b=2.0
+c=3 d=4
+c=null
+x=5 y=6
+x=7 y=8
+px>0 true py=10
+same object, length 5
+text of length 5
+copy is now 42
+text of length 5
+copy is now 42
+THIRD
+shifted=256 wrapped=-2147483648 big=2147483649

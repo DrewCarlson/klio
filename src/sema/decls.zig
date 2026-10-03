@@ -364,7 +364,7 @@ fn collectClass(ctx: Ctx, c: *const ast.Class, owner: Sym) Allocator.Error!Sym {
             .name = wk.init,
             .owner = sym,
             .file = ctx.file,
-            .flags = .{ .visibility = visibility(sc.visibility), .has_body = true },
+            .flags = .{ .visibility = visibility(sc.visibility), .has_body = true, .inline_ = sc.is_inline },
             .decl = .{ .secondary_ctor = sc },
             .detail = 0,
         }, .{});
@@ -995,7 +995,7 @@ fn linkClassDefaults(s: *Sema, e: Sym, a: Sym) Allocator.Error!void {
 /// Whether two top-level declarations have the same erased signature:
 /// receiver and parameter classes (or type-parameter positions), and the
 /// same number of type parameters.
-fn sameErasedSignature(s: *Sema, a: Sym, b: Sym) Allocator.Error!bool {
+pub fn sameErasedSignature(s: *Sema, a: Sym, b: Sym) Allocator.Error!bool {
     const headers = @import("headers.zig");
     if (s.syms.kind(a) == .property) {
         try headers.propertyHeader(s, a);

@@ -3,7 +3,10 @@
 // kotlinx.serialization.builtins) encodes a `kotlin.time.Instant` as its
 // second and nanosecond components, at top level and as a property's
 // `@Serializable(with = …)` — a pack object named in `with =` is referenced,
-// never constructed.
+// never constructed. The serializer is `@ExperimentalTime`, so the file
+// opts in.
+@file:OptIn(kotlin.time.ExperimentalTime::class)
+
 import kotlinx.serialization.*
 import kotlinx.serialization.builtins.*
 import kotlinx.serialization.json.*

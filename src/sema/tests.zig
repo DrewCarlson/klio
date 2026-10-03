@@ -61,6 +61,16 @@ pub const mini_kotlin =
     \\
 ;
 
+/// `@Target` and `@Retention`, as the stdlib declares them; a fixture
+/// that annotates with targets adds it.
+pub const mini_annotation =
+    \\package kotlin.annotation
+    \\enum class AnnotationTarget { CLASS, ANNOTATION_CLASS, TYPE_PARAMETER, PROPERTY, FIELD, LOCAL_VARIABLE, VALUE_PARAMETER, CONSTRUCTOR, FUNCTION, PROPERTY_GETTER, PROPERTY_SETTER, TYPE, EXPRESSION, FILE, TYPEALIAS }
+    \\enum class AnnotationRetention { SOURCE, BINARY, RUNTIME }
+    \\annotation class Target(vararg val allowedTargets: AnnotationTarget)
+    \\annotation class Retention(val value: AnnotationRetention = AnnotationRetention.RUNTIME)
+;
+
 /// Scope functions and a few generic extensions, as the stdlib declares
 /// them.
 pub const mini_standard =
@@ -2075,7 +2085,12 @@ test "a member typed before its class body reaches it sees the scope the class r
     });
     defer fx.deinit();
     try fx.resolve();
-    try fx.expectClean();
+    // Each `init` reads a property not yet initialized, as kotlinc says.
+    try expectFactories(&fx, &.{
+        "6 UNINITIALIZED_VARIABLE",
+        "11 UNINITIALIZED_VARIABLE",
+        "18 UNINITIALIZED_VARIABLE",
+    });
     const d = try fx.refAt("= ^discount + 1", .read);
     try std.testing.expectEqual(sema_mod.symbols.Kind.local, fx.s.syms.kind(d.target));
 }
@@ -3386,12 +3401,13 @@ test "a val not null implies a var it read is not null until the var is written"
     });
     defer fx.deinit();
     try fx.resolve();
-    var n: usize = 0;
-    for (fx.s.census.sites.items) |site| {
-        if (site.file == 3) n += 1;
-    }
-    // Past the write, neither `credentials` nor `credentials.qop` is known.
-    try std.testing.expectEqual(@as(usize, 2), n);
+    // Past the write, neither `credentials` nor `credentials.qop` is known
+    // not null: each `.` on them is unsafe, as kotlinc reports.
+    try expectFactories(&fx, &.{
+        "31 UNSAFE_CALL",
+        "38 UNSAFE_CALL",
+        "38 UNSAFE_CALL",
+    });
     try fx.expectTarget("credentials.^info(\"unwritten\")", "demo/info");
     try fx.expectTarget("credentials.^info(\"before\")", "demo/info");
     try fx.expectTarget("return credentials.qop.^shout()\n    return \"none\"\n}\nfun writtenAfter", "demo/shout");
@@ -5229,6 +5245,7 @@ test "@Suppress silences the diagnostics it names over what it annotates" {
         \\fun self() = this
     ,
         \\package app
+        \\@Target(AnnotationTarget.FILE, AnnotationTarget.FUNCTION, AnnotationTarget.PROPERTY)
         \\annotation class Suppress(vararg val names: String)
         \\@Suppress("UNRESOLVED_REFERENCE")
         \\fun quiet(): Int = missing1
@@ -5237,7 +5254,7 @@ test "@Suppress silences the diagnostics it names over what it annotates" {
         \\    @Suppress("warnings", "unresolved_reference") val p: Int = missing3
         \\    fun m(): Int = missing4
         \\}
-    });
+    , mini_annotation });
     defer fx.deinit();
     try fx.resolve();
     var sup = sema_mod.suppress.Suppressions.init(fx.arena.allocator());
@@ -5340,8 +5357,8 @@ test "a type parameter that is not reified cannot be a reified type argument" {
     defer fx.deinit();
     try fx.resolve();
     try expectMessages(&fx, &.{
-        "cannot use `T` as a reified type argument of `make`; use a class instead",
-        "cannot use `T` as a reified type argument of `make`; use a class instead",
+        "Cannot use 'T' as reified type parameter. Use a class instead.",
+        "Cannot use 'T' as reified type parameter. Use a class instead.",
     });
 }
 
@@ -5458,8 +5475,8 @@ test "a catch and a finally see what the try may have assigned before it threw" 
 test "a finally does not see what the body and catches leave when they complete" {
     var fx = try fixture(&.{
         \\package app
-        \\open class Exception
-        \\class Error
+        \\open class Exception : Throwable()
+        \\class Error : Throwable()
         \\fun test1(): Int {
         \\    var x: Any = "OK"
         \\    try {
@@ -6685,7 +6702,7 @@ test "a delegate's call takes the property's type before its references are reso
 test "a delegate's provideDelegate is inferred through to its getValue" {
     var fx = try fixture(&.{
         \\package app
-        \\class Lz<T>(val v: T)
+        \\class Lz<out T>(val v: T)
         \\operator fun <T> Lz<T>.getValue(thisRef: Any?, p: Any?): T = v
         \\interface DelegateProvider<out T> {
         \\    operator fun provideDelegate(receiver: Any?, prop: Any?): Lz<T>
@@ -7183,6 +7200,7 @@ test "a call no candidate accepts lists them, and an ambiguous one names both" {
         \\package app
         \\fun f(a: String): Int = 1
         \\fun f(a: Int, b: Int): Int = 2
+        \\fun f(a: Long): Int = 3
         \\fun g(a: Int, b: Long = 0L): Int = 1
         \\fun g(a: Int, c: Int = 0): Int = 2
         \\fun <T> make(): List<T> = TODO()
@@ -7195,7 +7213,7 @@ test "a call no candidate accepts lists them, and an ambiguous one names both" {
     defer fx.deinit();
     try fx.resolve();
     try expectMessages(&fx, &.{
-        "none of the candidates for `f` accept (Boolean):\n    fun f(a: String): Int\n    fun f(a: Int, b: Int): Int",
+        "none of the candidates for `f` accept (Boolean):\n    fun f(a: String): Int\n    fun f(a: Long): Int",
         "`g` is ambiguous: `fun g(a: Int, b: Long): Int`, `fun g(a: Int, c: Int): Int`",
         "cannot infer the type argument `T` of `make`; write it explicitly",
     });
@@ -7780,7 +7798,8 @@ test "an inline function with nothing to inline and a renamed override parameter
     });
     defer fx.deinit();
     try fx.resolve();
-    try expectFactories(&fx, &.{});
+    // An inline parameter of a nullable function type is kotlinc's error too.
+    try expectFactories(&fx, &.{"5 NULLABLE_INLINE_PARAMETER"});
     try expectWarnings(&fx, &.{
         "2 NOTHING_TO_INLINE",
         "5 NOTHING_TO_INLINE",
@@ -8030,4 +8049,785 @@ test "a deprecated expect is left to its platform's actual" {
     defer fx.deinit();
     try fx.resolve();
     for (fx.s.census.sites.items) |site| try std.testing.expect(site.reason != .use);
+}
+
+test "a value that does not fit the type its place declares is reported as kotlinc reports it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Box(val v: Int)
+        \\val top: String = 1
+        \\fun ret(): String = 2
+        \\fun block(): Int { return "s" }
+        \\fun assign() { var x: Int = 1; x = "s" }
+        \\fun defaults(p: String = 3) {}
+        \\val getter: Int get() = "s"
+        \\fun thrown() { throw Box(1) }
+        \\fun fine(): Long = 1
+        \\val lambda: () -> Int = { "s" }
+        \\val small: Byte = 1 + 1
+        \\val wide: Long = 1 + 1
+        \\fun nothingOut(): Int = TODO()
+        \\fun nullable(): String? = null
+        \\val typedGetter: Int get(): String = "s"
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 INITIALIZER_TYPE_MISMATCH",
+        "4 RETURN_TYPE_MISMATCH",
+        "5 RETURN_TYPE_MISMATCH",
+        "6 ASSIGNMENT_TYPE_MISMATCH",
+        "7 INITIALIZER_TYPE_MISMATCH",
+        "8 RETURN_TYPE_MISMATCH",
+        "9 TYPE_MISMATCH",
+        "11 RETURN_TYPE_MISMATCH",
+        "12 INITIALIZER_TYPE_MISMATCH",
+        "16 WRONG_GETTER_RETURN_TYPE",
+    });
+}
+
+test "a destructured entry with a written type takes it, and its component must fit" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class P(val x: Int, val y: Int) {
+        \\    operator fun component1(): Int = x
+        \\    operator fun component2(): Int = y
+        \\}
+        \\fun use() {
+        \\    val (a: String, b: Long) = P(1, 2)
+        \\    var (c: Int?, d) = P(1, 2)
+        \\    c = null
+        \\    for ((e: Any, f) in listOf(P(1, 2))) {}
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "7 COMPONENT_FUNCTION_RETURN_TYPE_MISMATCH",
+        "7 COMPONENT_FUNCTION_RETURN_TYPE_MISMATCH",
+    });
+}
+
+test "smart casts through a Boolean val, a loop's exit and an identity test, not a constant" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun f(o: Any, s: String, q: Any, r: Any) {
+        \\    if (o is String) {
+        \\        var w = o
+        \\        w = 1
+        \\    }
+        \\    val isStr = o is String
+        \\    if (isStr) o.length
+        \\    var n: String? = null
+        \\    while (n == null) n = "x"
+        \\    n.length
+        \\    if (q === s) q.length
+        \\    if (r === "s") r.length
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectRef("o.^length", .read, "kotlin/String.length");
+    try fx.expectRef("n.^length", .read, "kotlin/String.length");
+    try fx.expectRef("q.^length", .read, "kotlin/String.length");
+    try expectFactories(&fx, &.{"13 UNRESOLVED_REFERENCE"});
+}
+
+test "a call no candidate accepts names the problems of the one that fails latest" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun f(s: String) {}
+        \\fun f(a: Int, b: Int) {}
+        \\fun g(s: String) {}
+        \\fun g(b: Boolean) {}
+        \\fun h(s: String, t: String) {}
+        \\fun k(s: String) {}
+        \\fun named(a: Int) {}
+        \\fun Int.ext(s: String) {}
+        \\fun two(a: Int, b: String) {}
+        \\fun add(a: Int, b: Int): Int = a
+        \\fun <T : Int> id(x: T): T = x
+        \\fun dflt(a: Int, b: String = "") {}
+        \\fun one(x: Int) {}
+        \\fun one(vararg xs: Int) {}
+        \\fun Long.ext(s: String) {}
+        \\fun test(xs: Array<Int>, o: Any) {
+        \\    f(1)
+        \\    g(1)
+        \\    h(1, 2)
+        \\    k(null)
+        \\    named(b = 1)
+        \\    1.ext(2)
+        \\    two("x", 1)
+        \\    "s".ext("t")
+        \\    k()
+        \\    k("a", "b", "c")
+        \\    add(*xs)
+        \\    id<String>("hi")
+        \\    dflt(1, a = 2)
+        \\    o.plus(1)
+        \\    one("s")
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "18 ARGUMENT_TYPE_MISMATCH",
+        "19 NONE_APPLICABLE",
+        "20 ARGUMENT_TYPE_MISMATCH",
+        "20 ARGUMENT_TYPE_MISMATCH",
+        "21 NULL_FOR_NONNULL_TYPE",
+        "22 NAMED_PARAMETER_NOT_FOUND",
+        "22 NO_VALUE_FOR_PARAMETER",
+        "23 ARGUMENT_TYPE_MISMATCH",
+        "24 ARGUMENT_TYPE_MISMATCH",
+        "24 ARGUMENT_TYPE_MISMATCH",
+        "25 UNRESOLVED_REFERENCE_WRONG_RECEIVER",
+        "26 NO_VALUE_FOR_PARAMETER",
+        "27 TOO_MANY_ARGUMENTS",
+        "27 TOO_MANY_ARGUMENTS",
+        "28 ARGUMENT_TYPE_MISMATCH",
+        "28 NON_VARARG_SPREAD",
+        "28 NO_VALUE_FOR_PARAMETER",
+        "29 INAPPLICABLE_CANDIDATE",
+        "29 UPPER_BOUND_VIOLATED",
+        "30 ARGUMENT_PASSED_TWICE",
+        "31 UNRESOLVED_REFERENCE",
+        "32 ARGUMENT_TYPE_MISMATCH",
+    });
+    try expectMessages(&fx, &.{
+        "Argument type mismatch: actual type is 'Int', but 'String' was expected.",
+        "none of the candidates for `g` accept (Int):\n    fun g(s: String): Unit\n    fun g(b: Boolean): Unit",
+        "Argument type mismatch: actual type is 'Int', but 'String' was expected.",
+        "Argument type mismatch: actual type is 'Int', but 'String' was expected.",
+        "Null cannot be a value of a non-null type 'String'.",
+        "No parameter with name 'b' found.",
+        "No value passed for parameter 'a'.",
+        "Argument type mismatch: actual type is 'Int', but 'String' was expected.",
+        "Argument type mismatch: actual type is 'String', but 'Int' was expected.",
+        "Argument type mismatch: actual type is 'Int', but 'String' was expected.",
+        "Candidate 'fun Int.ext(s: String): Unit' is inapplicable because of a receiver type mismatch.",
+        "No value passed for parameter 's'.",
+        "Too many arguments for 'fun k(s: String): Unit'.",
+        "Too many arguments for 'fun k(s: String): Unit'.",
+        "The spread operator (*foo) can only be applied in a vararg position.",
+        "No value passed for parameter 'b'.",
+        "Argument type mismatch: actual type is 'Array<Int>', but 'Int' was expected.",
+        "Type argument is not within its bounds: type parameter 'T (of fun <T : Int> id)' must be subtype of 'Int', but actual: 'String'.",
+        "Inapplicable candidate(s): fun <T : Int> id(x: T): T",
+        "Argument already passed for this parameter.",
+        "unresolved reference `plus` on `Any`",
+        "Argument type mismatch: actual type is 'String', but 'Int' was expected.",
+    });
+}
+
+test "an annotation parameter of its own class is a cycle unless it is a vararg" {
+    var fx = try fixture(&.{
+        \\package app
+        \\annotation class C(vararg val xc: C)
+        \\annotation class D(vararg val e: E)
+        \\annotation class E(val d: D)
+        \\annotation class Self(val a: Self)
+        \\@C(C())
+        \\fun f() {}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{"5 CYCLE_IN_ANNOTATION_PARAMETER_ERROR"});
+}
+
+test "a vararg of a value class needs FullValueClasses, an unsigned one does not" {
+    var fx = try fixture(&.{
+        \\package app
+        \\value class Cell(val v: Int)
+        \\fun a(vararg cs: Cell) {}
+        \\fun b(vararg cs: Cell?) {}
+        \\fun c(vararg us: UInt) {}
+        \\class K(vararg val cs: Cell)
+    ,
+        \\package kotlin
+        \\value class UInt(val data: Int)
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 FORBIDDEN_VARARG_PARAMETER_TYPE",
+        "4 FORBIDDEN_VARARG_PARAMETER_TYPE",
+        "6 FORBIDDEN_VARARG_PARAMETER_TYPE",
+    });
+}
+
+test "a member, operator, invoke or iteration on a value that may be null is unsafe" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Box(val v: Int) {
+        \\    fun get(): Int = v
+        \\    operator fun plus(o: Box): Box = this
+        \\    operator fun invoke(): Int = v
+        \\    operator fun unaryMinus(): Box = this
+        \\    operator fun get(i: Int): Int = v
+        \\}
+        \\fun Box.ext(): Int = v
+        \\fun Box?.implicitRead() = v
+        \\fun Box?.implicitCall() = get()
+        \\fun test(b: Box?, f: (() -> Int)?, l: List<Int>?) {
+        \\    b.v
+        \\    b.get()
+        \\    b.ext()
+        \\    b + Box(1)
+        \\    -b
+        \\    b[0]
+        \\    b()
+        \\    f()
+        \\    for (e in l) {}
+        \\    b?.v
+        \\    if (b != null) b.v
+        \\    b!!.get()
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "10 UNSAFE_CALL",
+        "11 UNSAFE_CALL",
+        "13 UNSAFE_CALL",
+        "14 UNSAFE_CALL",
+        "15 UNSAFE_CALL",
+        "16 UNSAFE_OPERATOR_CALL",
+        "17 UNSAFE_CALL",
+        "18 UNSAFE_CALL",
+        "19 UNSAFE_IMPLICIT_INVOKE_CALL",
+        "20 UNSAFE_IMPLICIT_INVOKE_CALL",
+        "21 ITERATOR_ON_NULLABLE",
+    });
+    // The unsafe call still resolves to the member it names.
+    try fx.expectRef("b.^get()\n    b.ext", .call, "app/Box.get");
+}
+
+test "a smart cast reaches an invoke of a property, and an equality with a value not null" {
+    var fx = try fixture(&.{
+        \\package app
+        \\enum class Kind { Mouse, Touch }
+        \\class Pointer(val type: Kind, val position: Int)
+        \\class Scope
+        \\class Holder(val calculate: (Scope.(Int) -> Int)?, val plain: ((Int) -> Int)?) {
+        \\    fun Scope.current(d: Int): Int = if (calculate !== null) calculate(d) else d
+        \\    fun direct(d: Int): Int = if (plain != null) plain(d) else d
+        \\}
+        \\fun pick(ps: List<Pointer?>, down: Boolean): Int {
+        \\    val pointer = ps.first()
+        \\    val isFromMouse = pointer?.type == Kind.Mouse
+        \\    if (down && isFromMouse) return pointer.position
+        \\    if (pointer?.type == Kind.Touch) return pointer.position
+        \\    return 0
+        \\}
+        \\class Late {
+        \\    val func: (() -> Unit)?
+        \\    val text: String?
+        \\    init {
+        \\        func = {}
+        \\        func()
+        \\        text = "a"
+        \\        text.length
+        \\    }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+}
+
+test "a local read before it is assigned, a val assigned twice and a missing return are kotlinc's" {
+    var fx = try fixture(&.{
+        \\package app
+        \\enum class InvocationKind { EXACTLY_ONCE }
+        \\fun contract(block: () -> Unit) {}
+        \\fun callsInPlace(f: Any, k: InvocationKind) {}
+        \\inline fun once(block: () -> Unit) { contract { callsInPlace(block, InvocationKind.EXACTLY_ONCE) }; block() }
+        \\inline fun many(block: () -> Unit) { block() }
+        \\fun cond(): Boolean = true
+        \\fun ok1(): Int { val x: Int; if (cond()) x = 1 else x = 2; return x }
+        \\fun ok2(): Int { val x: Int; once { x = 1 }; return x }
+        \\fun ok3(): Int { val x: Int; while (true) { x = 1; break }; return x }
+        \\fun ok4(): Int { while (true) { } }
+        \\fun ok5(): Int { throw Throwable() }
+        \\fun ok6(b: Boolean): Int { when (b) { true -> return 1; false -> return 2 } }
+        \\fun ok7(): Int { TODO() }
+        \\fun ok8(): Int { var x: Int; x = 1; x = 2; return x }
+        \\fun bad1(): Int { val x: Int; if (cond()) x = 1; return x }
+        \\fun bad2(): Int { val x = 1; x = 2; return x }
+        \\fun bad3(): Int { val x: Int; while (cond()) { x = 1 }; return 0 }
+        \\fun bad4(): Int { var x: Int; return x }
+        \\fun bad5(): Int { cond() }
+        \\fun bad6(p: Int): Int { p = 2; return p }
+        \\fun bad7(): Int { val x: Int; many { x = 1 }; return 0 }
+        \\fun bad8(): Int { val x: Int; val f = { x }; x = 1; return f() }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "16 UNINITIALIZED_VARIABLE",
+        "17 VAL_REASSIGNMENT",
+        "18 VAL_REASSIGNMENT",
+        "19 UNINITIALIZED_VARIABLE",
+        "20 NO_RETURN_IN_FUNCTION_WITH_BLOCK_BODY",
+        "21 VAL_REASSIGNMENT",
+        "22 VAL_REASSIGNMENT",
+        "23 UNINITIALIZED_VARIABLE",
+    });
+}
+
+test "a suspend call stands in a suspend function or lambda, through lambdas run in place" {
+    var fx = try fixture(&.{
+        \\package app
+        \\suspend fun sus(): Int = 1
+        \\fun plain(block: () -> Unit) = block()
+        \\inline fun inl(block: () -> Unit) = block()
+        \\inline fun cross(crossinline block: () -> Unit) { plain { block() } }
+        \\fun takesSuspend(block: suspend () -> Unit) {}
+        \\suspend fun ok1() { sus() }
+        \\suspend fun ok2() { inl { sus() } }
+        \\fun ok3() { takesSuspend { sus() } }
+        \\fun bad1() { sus() }
+        \\fun bad2() { plain { sus() } }
+        \\suspend fun bad3() { plain { sus() } }
+        \\fun bad4() { inl { sus() } }
+        \\suspend fun bad5() { cross { sus() } }
+        \\fun bad6() { val f = { sus() } }
+        \\suspend fun bad7() { fun local() { sus() } }
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "10 ILLEGAL_SUSPEND_FUNCTION_CALL",
+        "11 ILLEGAL_SUSPEND_FUNCTION_CALL",
+        "12 NON_LOCAL_SUSPENSION_POINT",
+        "13 ILLEGAL_SUSPEND_FUNCTION_CALL",
+        "14 NON_LOCAL_SUSPENSION_POINT",
+        "15 ILLEGAL_SUSPEND_FUNCTION_CALL",
+        "16 NON_LOCAL_SUSPENSION_POINT",
+    });
+}
+
+test "an equality over types no value has both of is refused where kotlinc refuses it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\enum class E1 { X }
+        \\enum class E2 { Y }
+        \\class A
+        \\class B
+        \\interface I
+        \\fun f(a: A, b: B, n: Int, s: String, l: Long, e1: E1, e2: E2, i: I, any: Any) {
+        \\    a == b
+        \\    a === b
+        \\    n == s
+        \\    n == l
+        \\    n === l
+        \\    s === n
+        \\    e1 == e2
+        \\    a === i
+        \\    a == any
+        \\    l == 1
+        \\    if (any is Long) any == n
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "9 EQUALITY_NOT_APPLICABLE",
+        "10 EQUALITY_NOT_APPLICABLE",
+        "11 EQUALITY_NOT_APPLICABLE",
+        "12 FORBIDDEN_IDENTITY_EQUALS",
+        "13 FORBIDDEN_IDENTITY_EQUALS",
+        "14 INCOMPATIBLE_ENUM_COMPARISON_ERROR",
+        "15 EQUALITY_NOT_APPLICABLE",
+        "17 EQUALITY_NOT_APPLICABLE",
+    });
+}
+
+test "an inline parameter is called or inlined further, and a public inline function sees only public API" {
+    var fx = try fixture(&.{
+        \\package app
+        \\var stored: (() -> Unit)? = null
+        \\fun take(f: () -> Unit) {}
+        \\inline fun take2(f: () -> Unit) { f() }
+        \\inline fun a1(action: () -> Unit) { stored = action; action() }
+        \\inline fun a2(noinline action: () -> Unit) { stored = action }
+        \\inline fun a3(action: () -> Unit) { take(action) }
+        \\inline fun a4(action: () -> Unit) { take2(action) }
+        \\inline fun a5(action: () -> Unit) { action.invoke() }
+        \\inline fun a6(action: () -> Unit) { take { action() } }
+        \\inline fun a7(crossinline action: () -> Unit) { take { action() } }
+        \\inline fun a8(action: (() -> Unit)?) { }
+        \\open class C { open tailrec fun loop(n: Int) { if (n > 0) loop(n + 1) } }
+        \\class D { tailrec fun loop(n: Int) { if (n > 0) loop(n + 1) } }
+        \\internal fun helper(x: Int): Int = x
+        \\public inline fun p1(x: Int): Int = helper(x)
+        \\internal inline fun p2(x: Int): Int = helper(x)
+        \\@PublishedApi internal fun pub(x: Int) = x
+        \\inline fun p3(x: Int): Int = pub(x)
+    ,
+        \\package kotlin
+        \\annotation class PublishedApi
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "5 USAGE_IS_NOT_INLINABLE",
+        "7 USAGE_IS_NOT_INLINABLE",
+        "10 NON_LOCAL_RETURN_NOT_ALLOWED",
+        "12 NULLABLE_INLINE_PARAMETER",
+        "13 TAILREC_ON_VIRTUAL_MEMBER_ERROR",
+        "16 NON_PUBLIC_CALL_FROM_PUBLIC_INLINE",
+    });
+}
+
+test "a type parameter declared in or out stands only where its variance allows" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class P<out T>(var v: T, val ok: T) {
+        \\    fun take(t: T) {}
+        \\    fun give(): T = ok
+        \\    private fun hidden(t: T) {}
+        \\    fun safe(t: @UnsafeVariance T) {}
+        \\    fun fn(f: (T) -> Unit) {}
+        \\    fun arr(a: Array<out T>) {}
+        \\}
+        \\class C<in T> { fun give(): T? = null }
+        \\typealias Sink<K> = (K) -> Unit
+        \\typealias Lenient<K> = (@UnsafeVariance K) -> Unit
+        \\class A<out T> { fun a(s: Sink<T>) {}; fun b(s: Lenient<in T>) {}; fun c(): Sink<T> = {} }
+        \\typealias Self = Self
+        \\typealias Ping = List<Pong>
+        \\typealias Pong = List<Ping>
+        \\typealias Fine = List<Ping>
+    ,
+        \\package kotlin
+        \\@Target(AnnotationTarget.TYPE)
+        \\annotation class UnsafeVariance
+    , mini_annotation });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "2 TYPE_VARIANCE_CONFLICT_ERROR",
+        "3 TYPE_VARIANCE_CONFLICT_ERROR",
+        "8 TYPE_VARIANCE_CONFLICT_ERROR",
+        "10 TYPE_VARIANCE_CONFLICT_ERROR",
+        "13 TYPE_VARIANCE_CONFLICT_IN_EXPANDED_TYPE",
+        "14 RECURSIVE_TYPEALIAS_EXPANSION",
+        "15 RECURSIVE_TYPEALIAS_EXPANSION",
+        "16 RECURSIVE_TYPEALIAS_EXPANSION",
+    });
+}
+
+test "a += on a var with both plusAssign and a plus that fits it is ambiguous" {
+    var fx = try fixture(&.{
+        \\package app
+        \\class Acc(var n: Int) {
+        \\    operator fun plus(o: Acc): Acc = Acc(n + o.n)
+        \\    operator fun plusAssign(o: Acc) { n += o.n }
+        \\    operator fun minus(o: Acc): Any = o
+        \\    operator fun minusAssign(o: Acc) {}
+        \\}
+        \\class Grid { operator fun get(i: Int) = Acc(i); operator fun set(i: Int, v: Acc) {} }
+        \\class Holder { var acc = Acc(0); val fixed = Acc(0) }
+        \\fun use(h: Holder, g: Grid) {
+        \\    var a = Acc(1)
+        \\    a += Acc(2)
+        \\    val b = Acc(1)
+        \\    b += Acc(2)
+        \\    a -= Acc(1)
+        \\    h.acc += Acc(1)
+        \\    h.fixed += Acc(1)
+        \\    g[0] += Acc(1)
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "12 ASSIGN_OPERATOR_AMBIGUITY",
+        "16 ASSIGN_OPERATOR_AMBIGUITY",
+        "18 ASSIGN_OPERATOR_AMBIGUITY",
+    });
+}
+
+test "a property read before its class or file initializes it is uninitialized" {
+    var fx = try fixture(&.{
+        \\package app
+        \\val early: Int = late + 1
+        \\val late = 2
+        \\val viaLambda = { after }
+        \\val viaFun = read()
+        \\fun read() = after
+        \\val after = 3
+        \\class K {
+        \\    val x = y + 1
+        \\    val y = 2
+        \\    val z = this.w
+        \\    val w = 3
+        \\    init { show(v) }
+        \\    val v = 4
+        \\    val set: Int
+        \\    val readSet = set
+        \\    init { set = 5 }
+        \\    val lam = { last }
+        \\    val last = 6
+        \\}
+        \\fun local() {
+        \\    val o = object {
+        \\        init { show(q) }
+        \\        val q = 1
+        \\    }
+        \\    class L { val m = n; val n = 2 }
+        \\}
+        \\fun show(x: Any?) {}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "2 UNINITIALIZED_VARIABLE",
+        "9 UNINITIALIZED_VARIABLE",
+        "11 UNINITIALIZED_VARIABLE",
+        "13 UNINITIALIZED_VARIABLE",
+        "16 UNINITIALIZED_VARIABLE",
+        "23 UNINITIALIZED_VARIABLE",
+        "26 UNINITIALIZED_VARIABLE",
+    });
+}
+
+test "a DSL block reaches an outer receiver of its marker only by naming it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\@DslMarker annotation class Markup
+        \\@Markup abstract class Tag
+        \\class Page : Tag() { fun title() {}; val name = "p" }
+        \\class Body : Tag() { fun para() {} }
+        \\fun Page.extra() {}
+        \\fun page(b: Page.() -> Unit) { Page().b() }
+        \\fun Page.body(b: Body.() -> Unit) { Body().b() }
+        \\class Plain { fun plain() {} }
+        \\fun <T> T.within(b: T.() -> Unit) { b() }
+        \\fun use() {
+        \\    page {
+        \\        body {
+        \\            title()
+        \\            name
+        \\            extra()
+        \\            this@page.title()
+        \\            para()
+        \\        }
+        \\        title()
+        \\    }
+        \\    Plain().within { page { plain() } }
+        \\}
+    ,
+        \\package kotlin
+        \\annotation class DslMarker
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "14 DSL_SCOPE_VIOLATION",
+        "15 DSL_SCOPE_VIOLATION",
+        "16 DSL_SCOPE_VIOLATION",
+    });
+}
+
+test "bounds in a circle, erased and unreified types, an intersection, super and loop labels are kotlinc's" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun <T, U> bad(): Int where T : U, U : T = 0
+        \\class Bad<T : T>
+        \\fun <A : B, B : B> reach() {}
+        \\fun <E : Throwable> trapped() { try { } catch (e: E) { } }
+        \\fun nullableLit(x: String?) = x::class
+        \\fun <T> genLit(t: T) = t::class
+        \\class Box<T> { fun cls(): Any = T::class }
+        \\val dnn: String & Any = "hi"
+        \\fun <T : Any> dnn2(t: T & Any) = t
+        \\fun <T> isT(x: Any) = x is T
+        \\fun isList(x: Any) = x is List<String>
+        \\fun subj(x: List<Any>) = x is MutableList<Any>
+        \\fun subj2(x: List<Any>) = x is MutableList<String>
+        \\interface IA { fun f() {} }
+        \\interface IC { fun f() {} }
+        \\class D : IA { override fun f() { super<IC>.f() } }
+        \\fun labels() { while (true) { break@nope } }
+        \\fun fine(x: Any?) = x is String
+        \\fun <T> okDnn(t: T & Any) = t
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "2 CYCLIC_GENERIC_UPPER_BOUND",
+        "2 CYCLIC_GENERIC_UPPER_BOUND",
+        "3 CYCLIC_GENERIC_UPPER_BOUND",
+        "4 CYCLIC_GENERIC_UPPER_BOUND",
+        "5 TYPE_PARAMETER_IN_CATCH_CLAUSE",
+        "6 EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS",
+        "7 EXPRESSION_OF_NULLABLE_TYPE_IN_CLASS_LITERAL_LHS",
+        "8 TYPE_PARAMETER_AS_REIFIED",
+        "9 INCORRECT_LEFT_COMPONENT_OF_INTERSECTION",
+        "10 INCORRECT_LEFT_COMPONENT_OF_INTERSECTION",
+        "11 CANNOT_CHECK_FOR_ERASED",
+        "12 CANNOT_CHECK_FOR_ERASED",
+        "14 CANNOT_CHECK_FOR_ERASED",
+        "17 NOT_A_SUPERTYPE",
+        "18 NOT_A_LOOP_LABEL",
+    });
+}
+
+test "a break leaves a loop only through bodies inlined where they are written" {
+    var fx = try fixture(&.{
+        \\package app
+        \\fun take(f: () -> Unit) = f()
+        \\inline fun inl(f: () -> Unit) = f()
+        \\fun use() {
+        \\    outer@ while (true) {
+        \\        val f = fun() { break@outer }
+        \\        take { break@outer }
+        \\        inl(fun() { break@outer })
+        \\        inl { continue@outer }
+        \\        fun local() { break@outer }
+        \\        break@nowhere
+        \\    }
+        \\}
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "6 BREAK_OR_CONTINUE_JUMPS_ACROSS_FUNCTION_BOUNDARY",
+        "7 BREAK_OR_CONTINUE_JUMPS_ACROSS_FUNCTION_BOUNDARY",
+        "10 BREAK_OR_CONTINUE_JUMPS_ACROSS_FUNCTION_BOUNDARY",
+        "11 NOT_A_LOOP_LABEL",
+    });
+}
+
+test "an extension property has no field, and an actual is published where its expect is" {
+    var fx = try fixture(&.{
+        \\package app
+        \\val String.shout: String
+        \\    get() = field + "!"
+        \\@PublishedApi internal expect fun helper(): Int
+        \\internal actual fun helper(): Int = 1
+        \\inline fun usesHelper(): Int = helper()
+        \\internal inline fun inl(): Int = 1
+        \\inline fun usesInl(): Int = inl()
+        \\internal fun plain(): Int = 1
+        \\inline fun usesPlain(): Int = plain()
+    ,
+        \\package kotlin
+        \\annotation class PublishedApi
+    });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "3 UNRESOLVED_REFERENCE",
+        "8 NON_PUBLIC_INLINE_CALL_FROM_PUBLIC_INLINE",
+        "10 NON_PUBLIC_CALL_FROM_PUBLIC_INLINE",
+    });
+}
+
+test "an annotation stands only where its class's targets admit it" {
+    var fx = try fixture(&.{
+        \\package app
+        \\@Target(AnnotationTarget.CLASS) annotation class OnClass
+        \\@Target(AnnotationTarget.FUNCTION) annotation class OnFun
+        \\@Target(AnnotationTarget.FIELD) annotation class OnField
+        \\@Target(AnnotationTarget.PROPERTY, AnnotationTarget.PROPERTY_GETTER) annotation class OnProp
+        \\@Target(AnnotationTarget.ANNOTATION_CLASS) annotation class OnAnno
+        \\annotation class Anywhere
+        \\@OnClass fun f1() {}
+        \\@OnFun class C1
+        \\@OnField val p1 = 1
+        \\@OnField val p2 get() = 1
+        \\fun f3(@OnClass x: Int) {}
+        \\@Anywhere typealias TA = Int
+        \\class C2(@OnField val a: Int, @OnProp b: Int, @OnClass var c: Int) {
+        \\    @OnClass fun member() {}
+        \\    @OnProp val m = 1
+        \\    @OnClass constructor(x: String) : this(1, 2, 3)
+        \\    @OnFun companion object
+        \\    @get:OnClass val g = 1
+        \\    @get:OnProp val g2 = 1
+        \\    val acc: Int @OnClass get() = 1
+        \\}
+        \\@OnFun enum class E { @OnField A, @OnClass B }
+        \\@OnFun interface I
+        \\@OnFun object O
+        \\@OnAnno class NotAnno
+        \\@OnAnno annotation class IsAnno
+        \\fun <@OnClass T> gen() {}
+        \\fun local() {
+        \\    @OnClass fun lf() {}
+        \\    @OnFun class LC
+        \\}
+    , mini_annotation });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "8 WRONG_ANNOTATION_TARGET",
+        "9 WRONG_ANNOTATION_TARGET",
+        "11 WRONG_ANNOTATION_TARGET",
+        "12 WRONG_ANNOTATION_TARGET",
+        "13 WRONG_ANNOTATION_TARGET",
+        "14 WRONG_ANNOTATION_TARGET",
+        "14 WRONG_ANNOTATION_TARGET",
+        "15 WRONG_ANNOTATION_TARGET",
+        "17 WRONG_ANNOTATION_TARGET",
+        "18 WRONG_ANNOTATION_TARGET",
+        "19 WRONG_ANNOTATION_TARGET_WITH_USE_SITE_TARGET",
+        "21 WRONG_ANNOTATION_TARGET",
+        "23 WRONG_ANNOTATION_TARGET",
+        "23 WRONG_ANNOTATION_TARGET",
+        "24 WRONG_ANNOTATION_TARGET",
+        "25 WRONG_ANNOTATION_TARGET",
+        "26 WRONG_ANNOTATION_TARGET",
+        "28 WRONG_ANNOTATION_TARGET",
+        "30 WRONG_ANNOTATION_TARGET",
+        "31 WRONG_ANNOTATION_TARGET",
+    });
+}
+
+test "a declaration a marker requires opt-in for is used where the use opts in" {
+    var fx = try fixture(&.{
+        \\package app
+        \\@RequiresOptIn annotation class Err
+        \\@RequiresOptIn(level = RequiresOptIn.Level.WARNING) annotation class Soft
+        \\@Err class EC { fun m() = 3 }
+        \\@Soft fun soft() = 2
+        \\fun a(e: EC) = e.m()
+        \\fun b() = EC().m()
+        \\@OptIn(Err::class) fun c() = EC()
+        \\@Err fun d() = EC()
+        \\fun e2() = @OptIn(Err::class) EC()
+        \\fun f() = soft()
+        \\open class B { @Err open fun g() {} }
+        \\class D : B() { override fun g() {} }
+    ,
+        \\package kotlin
+        \\annotation class RequiresOptIn(val message: String = "", val level: Level = Level.ERROR) {
+        \\    enum class Level { WARNING, ERROR }
+        \\}
+        \\@Target(AnnotationTarget.CLASS, AnnotationTarget.FUNCTION, AnnotationTarget.EXPRESSION, AnnotationTarget.FILE)
+        \\@Retention(AnnotationRetention.SOURCE)
+        \\annotation class OptIn(vararg val markerClass: kotlin.reflect.KClass<*>)
+    ,
+        \\package kotlin.reflect
+        \\interface KClass<T : Any>
+    , mini_annotation });
+    defer fx.deinit();
+    try fx.resolve();
+    try expectFactories(&fx, &.{
+        "6 OPT_IN_USAGE_ERROR",
+        "6 OPT_IN_USAGE_ERROR",
+        "7 OPT_IN_USAGE_ERROR",
+        "13 OPT_IN_OVERRIDE_ERROR",
+    });
+    // A marker of level WARNING asks for the opt-in with a warning.
+    var warned: usize = 0;
+    for (fx.s.census.warnings.items) |site| {
+        if (sema_mod.census.factoryOf(site).len != 0 and std.mem.eql(u8, sema_mod.census.factoryOf(site), "OPT_IN_USAGE")) warned += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), warned);
 }

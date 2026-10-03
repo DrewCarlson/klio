@@ -38,11 +38,15 @@ import kotlin.time.TimeSource.Monotonic.ValueTimeMark
 
 // --- internal native helpers (bound natively by the klio host) ----
 
-// Wall-clock time, milliseconds since the Unix epoch.
+// Wall-clock time, milliseconds since the Unix epoch. Published for
+// kotlin.system's inline `measureTimeMillis`.
+@PublishedApi
 internal fun __klio_time_systemMillis(): Long = 0L
 
 // A monotonically non-decreasing reading in nanoseconds. Only
-// differences between readings are meaningful.
+// differences between readings are meaningful. Published for
+// kotlin.system's inline `measureNanoTime`.
+@PublishedApi
 internal fun __klio_time_monotonicNanos(): Long = 0L
 
 // --- DurationUnit (public expect enum class) ----------------------

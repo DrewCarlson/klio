@@ -58,6 +58,7 @@ pub const Image = struct {
     contracts: []const KV(Sym, []const sema.body.Effect),
     annotation_classes: []const KV(u64, []const Sym),
     deprecations: []const KV(Sym, sema.usecheck.Deprecation),
+    opt_in_markers: []const KV(Sym, sema.optin.Level),
 };
 
 /// `Sema` fields the image does not carry: the arena, and what a body's
@@ -67,9 +68,9 @@ pub const Image = struct {
 const not_carried = [_][]const u8{
     "arena",            "census",             "builtins_bound",  "expr_types",      "backing_fields",
     "default_packages", "var_solution",       "open_var_bounds", "reified_vars",    "operator_memo",
-    "path_subjects",    "path_property",      "path_base",       "nonnull_implies", "local_writes",
+    "path_subjects",    "path_property",      "path_base",       "nonnull_implies", "bool_implies", "exhaustive_whens",     "local_writes",
     "sealed_inheritors", "lookup_memo",       "local_classifiers", "local_class_scopes", "pending_setters",
-    "refs",             "builder_owners",
+    "refs",             "builder_owners",     "dsl_markers",
 };
 
 comptime {
@@ -100,6 +101,7 @@ pub fn complete(s: *sema.Sema) Allocator.Error!void {
             if (written.len != 0) _ = try sema.headers.annotationClasses(s, sym, site);
         }
         _ = try sema.usecheck.ownDeprecation(s, sym);
+        if (s.syms.kind(sym) == .class) _ = try sema.optin.markerLevel(s, sym);
         if (s.syms.kind(sym) == .function) _ = try sema.body.contractOf(s, sym);
     }
 }
@@ -151,6 +153,14 @@ pub fn image(a: Allocator, s: *sema.Sema) Allocator.Error!Image {
             return x.k.int() < y.k.int();
         }
     }.lt);
+    var markers: std.ArrayList(KV(Sym, sema.optin.Level)) = .empty;
+    var mit = s.opt_in_markers.iterator();
+    while (mit.next()) |e| if (e.value_ptr.*) |l| try markers.append(a, .{ .k = e.key_ptr.*, .v = l });
+    std.mem.sort(KV(Sym, sema.optin.Level), markers.items, {}, struct {
+        fn lt(_: void, x: KV(Sym, sema.optin.Level), y: KV(Sym, sema.optin.Level)) bool {
+            return x.k.int() < y.k.int();
+        }
+    }.lt);
     var anns: std.ArrayList(KV(u64, []const Sym)) = .empty;
     var ait = s.annotation_classes.iterator();
     while (ait.next()) |e| if (e.value_ptr.len != 0) try anns.append(a, .{ .k = e.key_ptr.*, .v = e.value_ptr.* });
@@ -188,6 +198,7 @@ pub fn image(a: Allocator, s: *sema.Sema) Allocator.Error!Image {
         .contracts = contracts.items,
         .annotation_classes = anns.items,
         .deprecations = deps.items,
+        .opt_in_markers = markers.items,
     };
 }
 
@@ -252,5 +263,7 @@ pub fn load(a: Allocator, img: *const Image) Allocator.Error!*sema.Sema {
     };
     try s.deprecations.ensureTotalCapacity(a, @intCast(img.deprecations.len));
     for (img.deprecations) |e| s.deprecations.putAssumeCapacity(e.k, e.v);
+    try s.opt_in_markers.ensureTotalCapacity(a, @intCast(img.opt_in_markers.len));
+    for (img.opt_in_markers) |e| s.opt_in_markers.putAssumeCapacity(e.k, e.v);
     return s;
 }

@@ -446,8 +446,9 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
         else
             anyPlaceholder(name.span);
         var default: ?Expr = null;
+        var default_eq: u32 = 0;
         if (is(peekKind(p), .Eq)) {
-            _ = bump(p);
+            default_eq = bump(p).span.start;
             skipNl(p);
             default = exprmod.parseExpr(p);
         }
@@ -461,6 +462,7 @@ pub fn parseParamListWith(p: *Parser, allow_no_type: bool) []Param {
             .name = name,
             .ty = ty,
             .default = default_boxed,
+            .default_eq = default_eq,
             .is_vararg = is_vararg,
             .is_crossinline = is_crossinline,
             .is_noinline = is_noinline,
@@ -544,6 +546,7 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         break :blk types.parseType(p);
     } else null;
     var init: ?Expr = null;
+    var init_eq: u32 = 0;
     var delegate: ?Expr = null;
     var explicit_field: ?ast.ExplicitField = null;
     // Explicit backing-field clause in the initializer slot, ahead of any `=` or
@@ -554,7 +557,7 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         explicit_field = parseFieldClause(p, scan, allow_accessors);
     }
     if (explicit_field == null and is(peekKind(p), .Eq)) {
-        _ = bump(p);
+        init_eq = bump(p).span.start;
         skipNl(p);
         init = exprmod.parseExpr(p);
     } else if (explicit_field == null and nextSignificantIsBy(p)) {
@@ -611,6 +614,7 @@ fn parsePropertyInner(p: *Parser, flags: ModifierFlags, allow_accessors: bool) ?
         .receiver_type = support.boxedOpt(p, receiver_type),
         .ty = support.boxedOpt(p, ty),
         .init = support.boxedOpt(p, init),
+        .init_eq = init_eq,
         .delegate = delegate_boxed,
         .getter = getter_boxed,
         .setter = setter_boxed,

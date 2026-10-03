@@ -159,12 +159,13 @@ pub fn parseDisjunction(p: *Parser) ?Expr {
         if (std.meta.activeTag(support.peekKind(p).*) != .PipePipe) {
             break;
         }
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseConjunction(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = .Or,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -184,12 +185,13 @@ pub fn parseConjunction(p: *Parser) ?Expr {
         if (std.meta.activeTag(support.peekKind(p).*) != .AmpAmp) {
             break;
         }
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseEquality(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = .And,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -209,12 +211,13 @@ pub fn parseEquality(p: *Parser) ?Expr {
             .BangEqEq => .IdentNeq,
             else => break,
         };
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseComparison(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = op,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -247,12 +250,13 @@ pub fn parseComparison(p: *Parser) ?Expr {
                 break;
             },
         };
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseNamedChecks(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = op,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -305,12 +309,13 @@ pub fn parseElvis(p: *Parser) ?Expr {
         if (std.meta.activeTag(support.peekKind(p).*) != .QuestionColon) {
             break;
         }
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseInfixFn(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = .Elvis,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -406,12 +411,13 @@ pub fn parseRange(p: *Parser) ?Expr {
             .DotDotLess => .RangeUntil,
             else => break,
         };
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseAdditive(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = op,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -429,12 +435,13 @@ pub fn parseAdditive(p: *Parser) ?Expr {
             .Minus => .Sub,
             else => break,
         };
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseMultiplicative(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = op,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -453,12 +460,13 @@ pub fn parseMultiplicative(p: *Parser) ?Expr {
             .Percent => .Rem,
             else => break,
         };
-        _ = support.bump(p);
+        const op_at = support.bump(p).span.start;
         support.skipNl(p);
         const rhs = parseAs(p) orelse return null;
         const sp = lhs.span().join(rhs.span());
         lhs = Expr{ .Binary = .{
             .op = op,
+            .op_at = op_at,
             .lhs = boxExpr(p, lhs),
             .rhs = boxExpr(p, rhs),
             .span = sp,
@@ -524,7 +532,26 @@ pub fn parsePrefix(p: *Parser) ?Expr {
         const inner = Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, e), .span = inner_start.join(e.span()) } };
         return Expr{ .Unary = .{ .op = .Not, .expr = boxExpr(p, inner), .span = start.join(e.span()) } };
     }
+    // `@A expr` annotates the whole postfix expression; a function literal
+    // keeps its annotations itself.
+    if (atExpressionAnnotation(p)) {
+        const save = p.pos;
+        const annos = parseAnnotations(p);
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
+            p.pos = save;
+            return parsePostfix(p);
+        }
+        const e = parsePrefix(p) orelse return null;
+        noteAnnotated(p, annos, e.span(), e == .AnonFun);
+        return e;
+    }
     return parsePostfix(p);
+}
+
+pub fn noteAnnotated(p: *Parser, annos: []Annotation, sp: Span, function: bool) void {
+    if (annos.len == 0) return;
+    p.annotated_exprs.append(p.allocator, .{ .annotations = annos, .span = sp, .function = function }) catch @panic("OOM");
 }
 
 pub fn parsePostfix(p: *Parser) ?Expr {
@@ -609,7 +636,7 @@ fn postfixOperator(chain: *PostfixChain, op: PostfixOp) Step {
 fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
     const p = chain.p;
     const safe = std.meta.activeTag(support.peekKind(p).*) == .QuestionDot;
-    _ = support.bump(p);
+    const dot = support.bump(p).span.start;
     support.skipNl(p);
     if (!safe and std.meta.activeTag(support.peekKind(p).*) == .LParen) {
         const callee = parsePrimary(p) orelse return .fail;
@@ -621,15 +648,17 @@ fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
         _ = support.bump(p);
         var args: std.ArrayList(Expr) = .empty;
         var arg_names: std.ArrayList(?[]const u8) = .empty;
+        var name_spans: std.ArrayList(Span) = .empty;
         args.append(p.allocator, chain.expr) catch @panic("OOM");
         arg_names.append(p.allocator, null) catch @panic("OOM");
-        if (!parseCallArgs(p, &args, &arg_names)) return .fail;
+        name_spans.append(p.allocator, chain.expr.span()) catch @panic("OOM");
+        if (!parseCallArgs(p, &args, &arg_names, &name_spans)) return .fail;
         const rparen = support.expect(p, .RParen, "`)`") orelse return .fail;
         const sp = chain.expr.span().join(rparen.span);
         chain.expr = Expr{ .Call = .{
             .callee = boxExpr(p, callee),
             .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-            .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), &.{}),
+            .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), name_spans.items, &.{}),
             .is_infix = false,
             .span = sp,
         } };
@@ -641,6 +670,7 @@ fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
         .receiver = boxExpr(p, chain.expr),
         .name = name,
         .safe = safe,
+        .dot = dot,
         .span = sp,
     } };
     return .advance;
@@ -710,14 +740,15 @@ fn callArguments(chain: *PostfixChain) Step {
     _ = support.bump(p);
     var args: std.ArrayList(Expr) = .empty;
     var arg_names: std.ArrayList(?[]const u8) = .empty;
-    if (!parseCallArgs(p, &args, &arg_names)) return .fail;
+    var name_spans: std.ArrayList(Span) = .empty;
+    if (!parseCallArgs(p, &args, &arg_names, &name_spans)) return .fail;
     const rparen = support.expect(p, .RParen, "`)`") orelse return .fail;
     const sp = chain.expr.span().join(rparen.span);
     const type_args = chain.takeTypeArgs();
     chain.expr = Expr{ .Call = .{
         .callee = boxExpr(p, chain.expr),
         .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-        .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), type_args),
+        .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), name_spans.items, type_args),
         .is_infix = false,
         .span = sp,
     } };
@@ -831,7 +862,7 @@ fn chainContinuation(chain: *PostfixChain) Step {
 
 /// Value arguments up to the closing `)`, which is left unconsumed. False when
 /// an argument failed to parse.
-fn parseCallArgs(p: *Parser, args: *std.ArrayList(Expr), arg_names: *std.ArrayList(?[]const u8)) bool {
+fn parseCallArgs(p: *Parser, args: *std.ArrayList(Expr), arg_names: *std.ArrayList(?[]const u8), name_spans: *std.ArrayList(Span)) bool {
     // Inside the parentheses a lambda follows its call again: a class's
     // `by C.make(f = { x.apply { ... } })` has its body's `{` only after them.
     const suppressed = p.suppress_trailing_lambda;
@@ -840,10 +871,12 @@ fn parseCallArgs(p: *Parser, args: *std.ArrayList(Expr), arg_names: *std.ArrayLi
     while (true) {
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;
+        const name_at = support.currentSpan(p);
         const name = tryConsumeNamedArgName(p);
         const arg = parseValueArgument(p) orelse return false;
         args.append(p.allocator, arg) catch @panic("OOM");
         arg_names.append(p.allocator, name) catch @panic("OOM");
+        name_spans.append(p.allocator, if (name != null) name_at else arg.span()) catch @panic("OOM");
         support.skipNl(p);
         if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
             _ = support.bump(p);
@@ -880,11 +913,16 @@ fn appendTrailingLambda(
                 var arg_names: std.ArrayList(?[]const u8) = .empty;
                 arg_names.appendSlice(p.allocator, c.argNames()) catch @panic("OOM");
                 arg_names.append(p.allocator, null) catch @panic("OOM");
+                var name_spans: std.ArrayList(Span) = .empty;
+                if (c.extra) |x| if (x.arg_name_spans.len != 0) {
+                    name_spans.appendSlice(p.allocator, x.arg_name_spans) catch @panic("OOM");
+                    name_spans.append(p.allocator, lam.span()) catch @panic("OOM");
+                };
                 const type_args = if (c.typeArgs().len == 0) extra_type_args else c.typeArgs();
                 return Expr{ .Call = .{
                     .callee = c.callee,
                     .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), type_args),
+                    .extra = support.callExtra(p, arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"), name_spans.items, type_args),
                     .is_infix = c.is_infix,
                     .has_trailing_lambda = true,
                     .span = sp,
@@ -898,7 +936,7 @@ fn appendTrailingLambda(
     return Expr{ .Call = .{
         .callee = boxExpr(p, expr),
         .args = args,
-        .extra = support.callExtra(p, &.{null}, extra_type_args),
+        .extra = support.callExtra(p, &.{null}, &.{}, extra_type_args),
         .is_infix = false,
         .has_trailing_lambda = true,
         .span = sp,

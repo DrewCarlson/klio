@@ -417,6 +417,13 @@ pub const Bridge = struct {
         return slots[supertype];
     }
 
+    /// Whether class `c` keeps a `by` delegate in a slot of its own.
+    pub fn hasDelegates(self: *const Bridge, c: ClassId) bool {
+        if (c.int() >= self.by_slots.len) return false;
+        for (self.by_slots[c.int()]) |sl| if (sl != NONE) return true;
+        return false;
+    }
+
     pub fn outerSlot(self: *const Bridge, c: ClassId) ?u32 {
         const o = self.outer_slot[c.int()];
         return if (o == NONE) null else o;

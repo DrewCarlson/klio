@@ -44,18 +44,22 @@ private fun <K, V> __klio_buildMap(capacity: Int, builderAction: MutableMap<K, V
 // across a non-suspending host boundary and dropped the activation. The
 // read-only contract is restored AFTER the build by the freeze intrinsics,
 // which never touch a lambda.
-private fun <E> __klio_freezeList(list: MutableList<E>): List<E> =
+@PublishedApi
+internal fun <E> __klio_freezeList(list: MutableList<E>): List<E> =
     error("intrinsic kotlin.collections.__klio_freezeList not installed")
 
-private fun <E> __klio_freezeSet(set: MutableSet<E>): Set<E> =
+@PublishedApi
+internal fun <E> __klio_freezeSet(set: MutableSet<E>): Set<E> =
     error("intrinsic kotlin.collections.__klio_freezeSet not installed")
 
-private fun <K, V> __klio_freezeMap(map: MutableMap<K, V>): Map<K, V> =
+@PublishedApi
+internal fun <K, V> __klio_freezeMap(map: MutableMap<K, V>): Map<K, V> =
     error("intrinsic kotlin.collections.__klio_freezeMap not installed")
 
 // A builder's map until it is frozen: its entries fail fast after a structural
 // change, as `MapBuilder`'s do on every platform.
-private fun <K, V> __klio_builderMap(map: LinkedHashMap<K, V>): LinkedHashMap<K, V> =
+@PublishedApi
+internal fun <K, V> __klio_builderMap(map: LinkedHashMap<K, V>): LinkedHashMap<K, V> =
     error("intrinsic kotlin.collections.__klio_builderMap not installed")
 
 internal actual inline fun <E> buildListInternal(builderAction: MutableList<E>.() -> Unit): List<E> {

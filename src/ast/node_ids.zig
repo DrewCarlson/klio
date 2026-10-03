@@ -28,6 +28,7 @@ pub fn assign(file: *KotlinFile) void {
     var n = Numbering{ .next = @max(file.node_count, 1) };
     n.annotations(file.file_annotations);
     for (file.decls) |*d| n.decl(d);
+    for (file.annotated_exprs) |ae| n.annotations(ae.annotations);
     file.node_count = n.next;
 }
 
@@ -251,6 +252,7 @@ pub const Numbering = struct {
             },
             .DestructuringDecl => |dd| {
                 self.take(&dd.id);
+                for (dd.types) |*t| if (t.*) |*tr| self.typeRef(tr);
                 self.expr(&dd.init);
             },
         }
@@ -322,6 +324,7 @@ pub const Numbering = struct {
             },
             .For => |x| {
                 self.take(&x.id);
+                for (x.var_types) |*t| if (t.*) |*tr| self.typeRef(tr);
                 if (x.var_ty) |*t| self.typeRef(t);
                 self.expr(x.iter);
                 self.expr(x.body);
