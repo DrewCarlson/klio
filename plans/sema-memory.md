@@ -110,13 +110,40 @@ From the start: cold peak 5153 to 1061 MB, bake 2470 to 1240 MB, `bodies`
 4.4 s to 1.6 s. What sema keeps when its bodies are resolved is 258 MB,
 and the run's peak is now in bridging and lowering.
 
+The working data's own high-water was 88 MB in one declaration:
+Material3's `findTranslation`, whose resolution types the 75 locale tables
+on demand, each in the same scratch window.
+
+- A declaration typed on demand from another's body (`inferReturnType`,
+  `inferPropertyType`) resolves in a scratch level of its own
+  (`pushScratch` / `popScratch`), emptied when it returns.
+- Scratch is emptied after each member of a top-level class too: a class
+  only resolves from `resolveFile`, so no call is in flight between two
+  members.
+- A member's scopes (function, block, lambda) live in scratch. A class's
+  scopes and its constructor's stay open across its members and are held
+  by the arena; each scope carries the allocator its lists grow in
+  (`Scope.a`). A class declared in a body keeps an arena copy of its scope
+  chain (`keptScope`) for members resolved later. `Ctx.resetScratch`
+  asserts that every scope still open is the arena's.
+- Scratch is a bump allocator of its own (`scratch.Scratch`): not
+  thread safe (an analysis resolves on one thread), and it keeps its first
+  chunks mapped across resets, so a declaration does not fault fresh pages
+  in. On std's arena the levels' resets cost 1.5% of `bodies`.
+
+| | peak RSS | `bodies` | RSS added by `bodies` |
+|---|---:|---:|---:|
+| cold compose_material3 | 1014 MB | 1.63 s | 187 MB |
+| bake compose_material3 | 1185 MB | 1.62 s | 198 MB |
+| cold hello | 120 MB | 0.22 s | 24 MB |
+
+The largest declaration's working data is now 4 MB.
+
 ## Next
 
-- Scopes (138K, 19 MB, plus their lists): most are popped and dead, but a
-  class declared in a body keeps its scope chain for members resolved
-  later (`local_class_scopes`, pending setters), so recycling them needs
-  that chain kept apart.
 - The type store, the symbols and the memo maps still regrow (about 130 MB
-  allocated for 40 MB kept); their sizes do not follow the node count.
+  allocated for 40 MB kept); their sizes do not follow the node count, and
+  a run's arena returns what they outgrow.
 - `output.build` copies the records into per-file arrays (50 MB) where it
-  could index them in place.
+  could index them in place; the log is freed right after, before
+  lowering, where a run's peak is.

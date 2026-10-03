@@ -27,6 +27,7 @@ pub const records = @import("records.zig");
 pub const output = @import("output.zig");
 pub const members = @import("members.zig");
 pub const infer = @import("infer.zig");
+const scratch_mod = @import("scratch.zig");
 pub const diagnose = @import("diagnose.zig");
 pub const exhaustive = @import("exhaustive.zig");
 pub const suppress = @import("suppress.zig");
@@ -173,16 +174,22 @@ pub fn printTables(s: *Sema) void {
 pub const Sema = struct {
     arena: Allocator,
     /// What resolving a body works in and drops: constraint systems,
-    /// candidate lists, supertype walks (`scratch`). Nothing the analysis
-    /// keeps points into it, so it is emptied after each top-level
-    /// declaration whose bodies are resolved (`resetScratch`), and freed
-    /// when `resolveAll` ends.
-    scratch_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
-    /// `resolveAll` is running: `scratch` is `scratch_arena`, else `arena`.
+    /// candidate lists, supertype walks, a member's scopes (`scratch`).
+    /// Nothing the analysis keeps points into it, so it is emptied after
+    /// each top-level declaration and each member of a top-level class
+    /// (`resetScratch`), and freed when `resolveAll` ends.
+    scratch_base: scratch_mod.Scratch = .{},
+    /// `resolveAll` is running: `scratch` is scratch, else `arena`.
     scratch_open: bool = false,
-    /// The most `scratch_arena` held when it was emptied: the working data
+    /// The most scratch held in use when it was emptied: the working data
     /// of the declaration that needed the most.
     scratch_high: usize = 0,
+    /// A level of scratch for each declaration whose body another's
+    /// resolution types on demand (`pushScratch`), emptied when it returns:
+    /// one body asking for the types of many leaves none of their working
+    /// data behind. `scratch_depth` of them are in use.
+    scratch_levels: std.ArrayList(*scratch_mod.Scratch) = .empty,
+    scratch_depth: u32 = 0,
     names: Names,
     syms: Symbols,
     types: TypeStore,
@@ -304,30 +311,65 @@ pub const Sema = struct {
         throwable: TypeId = .none,
     };
 
-    /// Where a resolution's working data goes: `scratch_arena` while
-    /// `resolveAll` runs, `arena` outside it (headers typed before bodies,
-    /// the checks after), whose analysis nothing empties.
+    /// Where a resolution's working data goes: scratch while `resolveAll`
+    /// runs, `arena` outside it (headers typed before bodies, the checks
+    /// after), whose analysis nothing empties.
     pub fn scratch(self: *Sema) Allocator {
-        return if (self.scratch_open) self.scratch_arena.allocator() else self.arena;
+        if (!self.scratch_open) return self.arena;
+        if (self.scratch_depth == 0) return self.scratch_base.allocator();
+        return self.scratch_levels.items[self.scratch_depth - 1].allocator();
     }
 
-    /// Empties `scratch_arena`, keeping pages for the next declaration. Only
-    /// where no call is being resolved: between top-level declarations.
+    /// Opens a level of scratch for a declaration resolved on demand; true
+    /// when it did, which `popScratch` is given.
+    pub fn pushScratch(self: *Sema) Allocator.Error!bool {
+        if (!self.scratch_open) return false;
+        if (self.scratch_levels.items.len == self.scratch_depth) {
+            const level = try std.heap.page_allocator.create(scratch_mod.Scratch);
+            level.* = .{};
+            self.scratch_levels.append(std.heap.page_allocator, level) catch |e| {
+                std.heap.page_allocator.destroy(level);
+                return e;
+            };
+        }
+        self.scratch_depth += 1;
+        return true;
+    }
+
+    /// Empties and closes the level `pushScratch` opened.
+    pub fn popScratch(self: *Sema, pushed: bool) void {
+        if (!pushed) return;
+        const level = self.scratch_levels.items[self.scratch_depth - 1];
+        self.scratch_high = @max(self.scratch_high, level.inUse());
+        level.reset(4 * 1024 * 1024);
+        self.scratch_depth -= 1;
+    }
+
+    /// Empties scratch, keeping pages for the next declaration. Only where
+    /// no call is being resolved: between top-level declarations or the
+    /// members of a top-level class.
     pub fn resetScratch(self: *Sema) void {
         if (!self.scratch_open) return;
-        self.scratch_high = @max(self.scratch_high, self.scratch_arena.queryCapacity());
-        _ = self.scratch_arena.reset(.{ .retain_with_limit = 16 * 1024 * 1024 });
+        self.scratch_high = @max(self.scratch_high, self.scratch_base.inUse());
+        self.scratch_base.reset(16 * 1024 * 1024);
     }
 
     pub fn openScratch(self: *Sema) void {
         self.scratch_open = true;
     }
 
-    /// Ends what `openScratch` began and frees `scratch_arena`'s pages.
+    /// Ends what `openScratch` began and frees scratch's pages.
     pub fn closeScratch(self: *Sema) void {
-        self.scratch_high = @max(self.scratch_high, self.scratch_arena.queryCapacity());
+        self.scratch_high = @max(self.scratch_high, self.scratch_base.inUse());
         self.scratch_open = false;
-        _ = self.scratch_arena.reset(.free_all);
+        self.scratch_base.deinit();
+        for (self.scratch_levels.items) |level| {
+            level.deinit();
+            std.heap.page_allocator.destroy(level);
+        }
+        self.scratch_levels.deinit(std.heap.page_allocator);
+        self.scratch_levels = .empty;
+        self.scratch_depth = 0;
     }
 
     /// `arena` owns everything the analysis keeps; the analysis is dropped
@@ -578,6 +620,7 @@ pub const Sema = struct {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = scratch_mod;
     _ = names;
     _ = symbols;
     _ = types;

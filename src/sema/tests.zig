@@ -8893,7 +8893,8 @@ test "resolution works in scratch that is emptied after each declaration and fre
     try fx.expectClean();
     try std.testing.expect(!fx.s.scratch_open);
     try std.testing.expect(fx.s.scratch().ptr == fx.s.arena.ptr);
-    try std.testing.expectEqual(@as(usize, 0), fx.s.scratch_arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 0), fx.s.scratch_base.chunks.items.len);
+    try std.testing.expectEqual(@as(usize, 0), fx.s.scratch_levels.items.len);
     try std.testing.expect(fx.s.scratch_high > 0);
 }
 
@@ -8919,4 +8920,53 @@ test "a call of many generic arguments resolves in working memory that grows wit
     // copied the system per argument took hundreds of megabytes here.
     try std.testing.expect(fx.s.scratch_high < 8 * 1024 * 1024);
     try std.testing.expect(fx.arena.queryCapacity() - before < 16 * 1024 * 1024);
+}
+
+/// A program of `tables` functions `tK()`, each a 100-pair `mapOfTwo` call,
+/// declared after `head`.
+fn tablesProgram(a: std.mem.Allocator, head: []const u8, tables: usize, in_class: bool) ![]const u8 {
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a,
+        \\package app
+        \\class Two<out A, out B>(val a: A, val b: B)
+        \\infix fun <A, B> A.to(that: B): Two<A, B> = Two(this, that)
+        \\fun <K, V> mapOfTwo(vararg pairs: Two<K, V>): Map<K, V> = TODO()
+        \\
+    );
+    try src.appendSlice(a, head);
+    if (in_class) try src.appendSlice(a, "class Tables {\n");
+    var t: usize = 0;
+    while (t < tables) : (t += 1) {
+        try src.print(a, "fun t{d}() = mapOfTwo(\n", .{t});
+        var i: usize = 0;
+        while (i < 100) : (i += 1) try src.print(a, "\"k{d}\" to \"v{d}\",\n", .{ i, i });
+        try src.appendSlice(a, ")\n");
+    }
+    if (in_class) try src.appendSlice(a, "}\n");
+    return src.items;
+}
+
+fn scratchHighOf(src: []const u8) !usize {
+    var fx = try fixture(&.{src});
+    defer fx.deinit();
+    try fx.resolve();
+    try fx.expectClean();
+    return fx.s.scratch_high;
+}
+
+test "a declaration typing many others on demand, and a class of many members, hold one's working data at a time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const one = try scratchHighOf(try tablesProgram(a, "", 1, false));
+    // `all` asks for every table's type before the tables are resolved.
+    var calls: std.ArrayList(u8) = .empty;
+    try calls.appendSlice(a, "fun all() = listOf(");
+    var t: usize = 0;
+    while (t < 20) : (t += 1) try calls.print(a, "t{d}(), ", .{t});
+    try calls.appendSlice(a, ")\n");
+    const on_demand = try scratchHighOf(try tablesProgram(a, calls.items, 20, false));
+    const members = try scratchHighOf(try tablesProgram(a, "", 20, true));
+    try std.testing.expect(on_demand < 3 * one);
+    try std.testing.expect(members < 3 * one);
 }

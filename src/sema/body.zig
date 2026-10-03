@@ -87,6 +87,11 @@ pub const Runs = enum { plain, suspend_, in_place, unknown };
 
 pub const Scope = struct {
     parent: ?*Scope,
+    /// Holds the scope and its lists: scratch for a scope a member's
+    /// resolution opens, the analysis's arena for one that outlives it (a
+    /// file's, a class's while its members resolve, a class declared in a
+    /// body kept for its members resolved later).
+    a: Allocator,
     kind: ScopeKind,
     /// The class, function or lambda symbol that opened the scope.
     owner: Sym = .none,
@@ -308,8 +313,13 @@ pub const Ctx = struct {
     }
 
     pub fn push(self: *Ctx, kind: ScopeKind, owner: Sym) Allocator.Error!*Scope {
-        const sc = try self.s.arena.create(Scope);
-        sc.* = .{ .parent = self.scope, .kind = kind, .owner = owner };
+        return self.pushIn(kind, owner, self.s.scratch());
+    }
+
+    /// `push`, the scope held by `a`.
+    pub fn pushIn(self: *Ctx, kind: ScopeKind, owner: Sym, a: Allocator) Allocator.Error!*Scope {
+        const sc = try a.create(Scope);
+        sc.* = .{ .parent = self.scope, .a = a, .kind = kind, .owner = owner };
         self.scope = sc;
         return sc;
     }
@@ -318,8 +328,16 @@ pub const Ctx = struct {
         self.scope = sc.parent.?;
     }
 
+    /// Empties scratch between two declarations or members: no call is
+    /// being resolved, and every scope open is one the arena holds.
+    pub fn resetScratch(self: *Ctx) void {
+        var sc: ?*Scope = self.scope;
+        while (sc) |c| : (sc = c.parent) std.debug.assert(c.a.ptr == self.s.arena.ptr);
+        self.s.resetScratch();
+    }
+
     pub fn declareLocal(self: *Ctx, n: Name, sym: Sym) Allocator.Error!void {
-        try self.scope.locals.append(self.s.arena, .{ .name = n, .sym = sym });
+        try self.scope.locals.append(self.scope.a, .{ .name = n, .sym = sym });
     }
 
     pub fn intern(self: *Ctx, str: []const u8) Allocator.Error!Name {
@@ -418,8 +436,28 @@ pub fn samConstructorsFrom(s: *Sema, first: Sym) Allocator.Error!void {
 
 fn fileScope(s: *Sema) Allocator.Error!*Scope {
     const sc = try s.arena.create(Scope);
-    sc.* = .{ .parent = null, .kind = .file };
+    sc.* = .{ .parent = null, .a = s.arena, .kind = .file };
     return sc;
+}
+
+/// `sc` and the scopes around it held by the analysis's arena, copied as
+/// they stand where scratch holds them: what a class declared in a body
+/// keeps for its members resolved later.
+fn keptScope(s: *Sema, sc: *Scope) Allocator.Error!*Scope {
+    if (sc.a.ptr == s.arena.ptr) return sc;
+    const out = try s.arena.create(Scope);
+    out.* = sc.*;
+    out.a = s.arena;
+    out.parent = if (sc.parent) |p| try keptScope(s, p) else null;
+    out.locals = .empty;
+    out.receivers = .empty;
+    out.contexts = .empty;
+    out.narrow = .empty;
+    try out.locals.appendSlice(s.arena, sc.locals.items);
+    try out.receivers.appendSlice(s.arena, sc.receivers.items);
+    try out.contexts.appendSlice(s.arena, sc.contexts.items);
+    try out.narrow.appendSlice(s.arena, sc.narrow.items);
+    return out;
 }
 
 pub fn resolveFile(s: *Sema, file: u32) Allocator.Error!void {
@@ -430,8 +468,7 @@ pub fn resolveFile(s: *Sema, file: u32) Allocator.Error!void {
     for (fc.ast.?.decls) |*d| {
         const sym = declSym(s, fc.package, d) orelse continue;
         try resolveMemberDecl(&ctx, sym);
-        // No call is being resolved between top-level declarations.
-        s.resetScratch();
+        ctx.resetScratch();
     }
 }
 
@@ -462,6 +499,11 @@ fn declSym(s: *Sema, container: Sym, d: *const ast.Decl) ?Sym {
 /// Opens the class scopes a member of `cls` resolves in: the outer
 /// classes' first, then `cls`'s own.
 fn pushClassScopes(ctx: *Ctx, cls: Sym) Allocator.Error!void {
+    return pushClassScopesIn(ctx, cls, ctx.s.scratch());
+}
+
+/// `pushClassScopes`, the scopes held by `a`.
+fn pushClassScopesIn(ctx: *Ctx, cls: Sym, a: Allocator) Allocator.Error!void {
     var chain: std.ArrayList(Sym) = .empty;
     var cur = cls;
     while (cur != .none and ctx.s.syms.kind(cur) == .class) {
@@ -473,7 +515,7 @@ fn pushClassScopes(ctx: *Ctx, cls: Sym) Allocator.Error!void {
             ctx.scope = sc;
             break;
         }
-        try chain.append(ctx.arena(), cur);
+        try chain.append(ctx.s.scratch(), cur);
         const owner = ctx.s.syms.owner(cur);
         if (owner == .none or ctx.s.syms.kind(owner) != .class) break;
         cur = owner;
@@ -482,7 +524,7 @@ fn pushClassScopes(ctx: *Ctx, cls: Sym) Allocator.Error!void {
     // through `inner` classes.
     var this_visible = true;
     var i = chain.items.len;
-    var visible_flags = try ctx.arena().alloc(bool, chain.items.len);
+    var visible_flags = try ctx.s.scratch().alloc(bool, chain.items.len);
     {
         var j: usize = 0;
         while (j < chain.items.len) : (j += 1) {
@@ -494,7 +536,7 @@ fn pushClassScopes(ctx: *Ctx, cls: Sym) Allocator.Error!void {
     }
     while (i > 0) {
         i -= 1;
-        try pushClassScope(ctx, chain.items[i], !visible_flags[i]);
+        try pushClassScopeIn(ctx, chain.items[i], !visible_flags[i], a);
     }
 }
 
@@ -508,8 +550,12 @@ fn ownClassScope(ctx: *Ctx, cls: Sym) ?*Scope {
 }
 
 pub fn pushClassScope(ctx: *Ctx, cls: Sym, static_only: bool) Allocator.Error!void {
+    return pushClassScopeIn(ctx, cls, static_only, ctx.s.scratch());
+}
+
+fn pushClassScopeIn(ctx: *Ctx, cls: Sym, static_only: bool, a: Allocator) Allocator.Error!void {
     const s = ctx.s;
-    const sc = try ctx.push(.class, cls);
+    const sc = try ctx.pushIn(.class, cls, a);
     sc.static_only = static_only;
     const info = s.syms.classInfo(cls);
     // An enum entry's body is `this@X` for its entry `X`.
@@ -518,7 +564,7 @@ pub fn pushClassScope(ctx: *Ctx, cls: Sym, static_only: bool) Allocator.Error!vo
     sc.label = label;
     if (!static_only or info.kind == .object or info.kind == .companion) {
         const kind: ImplicitKind = if (info.kind == .object or info.kind == .companion) .object else .class_this;
-        try sc.receivers.append(s.arena, .{ .ty = try headers.selfType(s, cls), .kind = kind, .owner = cls, .label = label });
+        try sc.receivers.append(sc.a, .{ .ty = try headers.selfType(s, cls), .kind = kind, .owner = cls, .label = label });
     }
     // Companion objects of the class and its superclasses are implicit
     // receivers after `this`.
@@ -528,10 +574,10 @@ pub fn pushClassScope(ctx: *Ctx, cls: Sym, static_only: bool) Allocator.Error!vo
 
 fn pushCompanions(ctx: *Ctx, sc: *Scope, cls: Sym, seen: *std.AutoHashMapUnmanaged(Sym, void)) Allocator.Error!void {
     const s = ctx.s;
-    if ((try seen.getOrPut(s.arena, cls)).found_existing) return;
+    if ((try seen.getOrPut(s.scratch(), cls)).found_existing) return;
     const comp = s.syms.classInfo(cls).companion;
     if (comp != .none and comp != cls) {
-        try sc.receivers.append(s.arena, .{ .ty = try headers.selfType(s, comp), .kind = .object, .owner = comp, .label = s.syms.name(comp) });
+        try sc.receivers.append(sc.a, .{ .ty = try headers.selfType(s, comp), .kind = .object, .owner = comp, .label = s.syms.name(comp) });
     }
     for (try headers.supertypes(s, cls)) |st| {
         const sup = s.types.classSym(st);
@@ -560,7 +606,7 @@ pub fn pushContextParams(ctx: *Ctx, sc: *Scope, cps: []const Sym) Allocator.Erro
     for (cps) |p| {
         const n = s.syms.name(p);
         if (!std.mem.eql(u8, s.str(n), "_")) try ctx.declareLocal(n, p);
-        try sc.contexts.append(s.arena, .{ .ty = try headers.paramType(s, p), .sym = p });
+        try sc.contexts.append(sc.a, .{ .ty = try headers.paramType(s, p), .sym = p });
     }
 }
 
@@ -578,7 +624,7 @@ fn pushFunctionScope(ctx: *Ctx, f: Sym) Allocator.Error!*Scope {
     for (info.params) |p| try ctx.declareLocal(s.syms.name(p), p);
     try pushContextParams(ctx, sc, info.context_params);
     if (info.receiver != .none) {
-        try sc.receivers.append(s.arena, .{ .ty = info.receiver, .kind = .extension, .owner = f, .label = s.syms.name(f) });
+        try sc.receivers.append(sc.a, .{ .ty = info.receiver, .kind = .extension, .owner = f, .label = s.syms.name(f) });
     }
     sc.ret = info.ret;
     return sc;
@@ -845,6 +891,8 @@ pub fn inferReturnType(s: *Sema, f: Sym) Allocator.Error!TypeId {
     if (sym.decl != .function) return s.types.errType();
     const file = sym.file;
     if (file == symbols.NO_FILE) return s.types.errType();
+    const level = try s.pushScratch();
+    defer s.popScratch(level);
     var ctx = Ctx{ .s = s, .file = file, .scope = try fileScope(s) };
     // A member of a class declared in a body resolves in the scope that
     // body opened, where the enclosing locals are.
@@ -964,7 +1012,7 @@ fn pushPropertyScope(ctx: *Ctx, p: Sym) Allocator.Error!*Scope {
     const sc = try ctx.push(.function, p);
     sc.label = s.syms.name(p);
     const recv = s.syms.propertyInfo(p).receiver;
-    if (recv != .none) try sc.receivers.append(s.arena, .{ .ty = recv, .kind = .extension, .owner = p, .label = s.syms.name(p) });
+    if (recv != .none) try sc.receivers.append(sc.a, .{ .ty = recv, .kind = .extension, .owner = p, .label = s.syms.name(p) });
     try pushContextParams(ctx, sc, s.syms.propertyInfo(p).context_params);
     return sc;
 }
@@ -1117,6 +1165,8 @@ pub fn inferPropertyType(s: *Sema, p: Sym) Allocator.Error!TypeId {
         s.census.muted = muted;
         s.census.buffer = buffer;
     }
+    const level = try s.pushScratch();
+    defer s.popScratch(level);
     var ctx = Ctx{ .s = s, .file = sym.file, .scope = try fileScope(s), .typing_only = true };
     try openMemberScope(&ctx, sym.owner);
     try resolvePropertyIn(&ctx, p);
@@ -1139,9 +1189,14 @@ fn openMemberScope(ctx: *Ctx, owner: Sym) Allocator.Error!void {
 /// A scope with the primary constructor's parameters that are not
 /// properties: in initializers, a `val`/`var` parameter is the property.
 fn pushPlainCtorParams(ctx: *Ctx, primary: Sym) Allocator.Error!*Scope {
+    return pushPlainCtorParamsIn(ctx, primary, ctx.s.scratch());
+}
+
+/// `pushPlainCtorParams`, the scope held by `a`.
+fn pushPlainCtorParamsIn(ctx: *Ctx, primary: Sym, a: Allocator) Allocator.Error!*Scope {
     const s = ctx.s;
     try headers.functionHeader(s, primary);
-    const sc = try ctx.push(.function, primary);
+    const sc = try ctx.pushIn(.function, primary, a);
     sc.ctor_params = true;
     for (s.syms.functionInfo(primary).params) |p| {
         const decl = s.syms.get(p).decl;
@@ -1167,9 +1222,11 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
     const saved = ctx.scope;
     defer ctx.scope = saved;
     // The header's constructor arguments and delegates resolve in the
-    // primary constructor's scope, where its parameters are locals.
-    try pushClassScopes(ctx, cls);
-    const ctor_scope = try classInit(ctx, cls);
+    // primary constructor's scope, where its parameters are locals. Both
+    // stay open across the members, whose working data each member's end
+    // drops: the arena holds them.
+    try pushClassScopesIn(ctx, cls, s.arena);
+    const ctor_scope = try classInit(ctx, cls, s.arena);
     // Property initializers and init blocks see the constructor's
     // parameters; member functions do not.
     var it = s.syms.classInfo(cls).members.iterator();
@@ -1180,6 +1237,8 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
             return a.int() < b.int();
         }
     }.lt);
+    // Only a file's declarations come here, so no call is being resolved
+    // between two members: each member's working data goes with it.
     for (member_list.items) |m| {
         if (s.syms.owner(m) != cls) continue;
         switch (s.syms.kind(m)) {
@@ -1187,6 +1246,7 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
                 const inner_saved = ctx.scope;
                 try resolveProperty(ctx, m);
                 ctx.scope = inner_saved;
+                ctx.resetScratch();
             },
             else => {},
         }
@@ -1214,6 +1274,7 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
             },
             else => {},
         }
+        ctx.resetScratch();
     }
 }
 
@@ -1221,9 +1282,9 @@ fn resolveClass(ctx: *Ctx, cls: Sym) Allocator.Error!void {
 /// parameter defaults and supertype arguments see every constructor
 /// parameter; init blocks and property initializers (in the scope this
 /// returns, which the caller pops after them) see the plain parameters,
-/// since a `val`/`var` parameter there is the property.
-/// A class this analysis resolves, from its AST.
-fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
+/// since a `val`/`var` parameter there is the property. `a` holds that
+/// scope. A class this analysis resolves, from its AST.
+fn classInit(ctx: *Ctx, cls: Sym, a: Allocator) Allocator.Error!?*Scope {
     const s = ctx.s;
     const primary = s.syms.classInfo(cls).primary_ctor;
     const params: []const Sym = if (primary != .none) blk: {
@@ -1244,7 +1305,7 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
             var header: std.ArrayList(Recv) = .empty;
             for (o.receivers.items) |r| {
                 if (r.kind == .class_this and r.owner == cls) continue;
-                try header.append(s.arena, r);
+                try header.append(o.a, r);
             }
             o.receivers = header;
         }
@@ -1294,7 +1355,7 @@ fn classInit(ctx: *Ctx, cls: Sym) Allocator.Error!?*Scope {
         }
         return null;
     }
-    const sc = try pushPlainCtorParams(ctx, primary);
+    const sc = try pushPlainCtorParamsIn(ctx, primary, a);
     switch (s.syms.get(cls).decl) {
         .class => |c| {
             for (c.?.x().init_blocks) |*b| _ = try bodyBlock(ctx, b);
@@ -1413,7 +1474,7 @@ pub fn block(ctx: *Ctx, b: *const ast.Block, expected: TypeId) Allocator.Error!T
     const sc = try ctx.push(.block, .none);
     defer ctx.pop(sc);
     const t = try blockIn(ctx, b.stmts, expected);
-    try flowOut(ctx, sc);
+    try flowOut(sc);
     return t;
 }
 
@@ -1599,7 +1660,7 @@ fn localDecl(ctx: *Ctx, d: *const ast.Decl) Allocator.Error!void {
             s.syms.getMut(sym).decl = .{ .local_prop = p };
             try ctx.addRef(.{ .file = ctx.file, .anchor = p.name.span, .kind = .decl, .target = sym });
             try ctx.declareLocal(s.syms.name(sym), sym);
-            if (narrowed != .none) try ctx.scope.narrow.append(s.arena, .{ .sym = sym, .ty = narrowed, .reset = true });
+            if (narrowed != .none) try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = sym, .ty = narrowed, .reset = true });
             if (cond_facts) |f| try recordBoolImplies(ctx, sym, f);
             if (!p.mutable) if (p.init) |i| try recordNonNullImplies(ctx, sym, i);
         },
@@ -1752,9 +1813,9 @@ pub fn resolveLocalClassBody(ctx: *Ctx, cls: Sym) Allocator.Error!void {
 /// `resolveClass` for a class whose scope is `class_scope`, already open.
 fn resolveClassWithin(ctx: *Ctx, cls: Sym, class_scope: *Scope) Allocator.Error!void {
     const s = ctx.s;
-    try s.local_class_scopes.put(s.arena, cls, class_scope);
+    try s.local_class_scopes.put(s.arena, cls, try keptScope(s, class_scope));
     ctx.scope = class_scope;
-    const ctor_scope = try classInit(ctx, cls);
+    const ctor_scope = try classInit(ctx, cls, s.scratch());
     var member_list: std.ArrayList(Sym) = .empty;
     var it = s.syms.classInfo(cls).members.iterator();
     while (it.next()) |e| try member_list.appendSlice(s.arena, e.value_ptr.items);
@@ -1987,7 +2048,7 @@ fn narrowAfterAssign(ctx: *Ctx, target: *const Expr, vt_in: TypeId) Allocator.Er
         if (declared == .none or s.types.isErr(declared) or vt_in == .none or s.types.isErr(vt_in)) return;
         const vt = try widenForDecl(s, try infer.zonk(s, vt_in));
         if (infer.hasOpenVar(s, vt) or isNothingType(s, try s.types.makeNotNull(vt)) or !try subtyping.isSubtype(s, vt, declared)) return;
-        try ctx.scope.narrow.append(s.arena, .{ .sym = subj.sym, .ty = vt, .reset = true });
+        try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = subj.sym, .ty = vt, .reset = true });
         return;
     };
     // A `var`, or a `val` declared without an initializer and assigned
@@ -1999,7 +2060,7 @@ fn narrowAfterAssign(ctx: *Ctx, target: *const Expr, vt_in: TypeId) Allocator.Er
         const vt = try widenForDecl(s, try infer.zonk(s, vt_in));
         if (!infer.hasOpenVar(s, vt) and !isNothingType(s, try s.types.makeNotNull(vt)) and try subtyping.isSubtype(s, vt, declared)) t = vt;
     }
-    try ctx.scope.narrow.append(s.arena, .{ .sym = loc, .ty = t, .reset = true });
+    try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = loc, .ty = t, .reset = true });
     var log = ctx.try_log;
     while (log) |l| : (log = l.parent) try l.assigned.append(s.arena, .{ .sym = loc, .ty = t });
 }
@@ -2815,7 +2876,7 @@ fn whenExpr(ctx: *Ctx, w: *const ast.WhenExpr, expected_in: TypeId) Allocator.Er
             }
         }
         if (narrowed != .none and subject_sym != .none) {
-            try ctx.scope.narrow.append(s.arena, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, cur_t, narrowed) });
+            try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = subject_sym, .ty = try intersectNarrow(ctx, cur_t, narrowed) });
         }
         if (br.guard) |g| {
             covers.shrinkRetainingCapacity(covers_before);
@@ -3517,7 +3578,7 @@ fn oneFact(ctx: *Ctx, sym: Sym, t: TypeId) Allocator.Error![]const Narrow {
 }
 
 pub fn applyFacts(ctx: *Ctx, facts: []const Narrow) Allocator.Error!void {
-    for (facts) |f| try ctx.scope.narrow.append(ctx.arena(), f);
+    for (facts) |f| try ctx.scope.narrow.append(ctx.scope.a, f);
 }
 
 /// A stable value a smart cast can attach to: a local, a parameter, a
@@ -4139,13 +4200,13 @@ fn fieldCast(ctx: *Ctx, subject: Sym) Allocator.Error!?TypeId {
 fn narrowAfterCast(ctx: *Ctx, e: *const Expr, t: TypeId) Allocator.Error!void {
     if (ctx.s.types.isErr(t)) return;
     const subj = (try subjectOf(ctx, e)) orelse return;
-    try ctx.scope.narrow.append(ctx.arena(), .{ .sym = subj.sym, .ty = try intersectNarrow(ctx, subj.ty, t) });
+    try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = subj.sym, .ty = try intersectNarrow(ctx, subj.ty, t) });
 }
 
 /// After `x!!`, `x` is not null for the rest of the block.
 fn narrowAfterNotNull(ctx: *Ctx, e: *const Expr) Allocator.Error!void {
     const subj = (try subjectOf(ctx, e)) orelse return;
-    try ctx.scope.narrow.append(ctx.arena(), .{ .sym = subj.sym, .ty = try ctx.s.types.definitelyNotNull(subj.ty) });
+    try ctx.scope.narrow.append(ctx.scope.a, .{ .sym = subj.sym, .ty = try ctx.s.types.definitelyNotNull(subj.ty) });
 }
 
 /// The smart casts in effect where a branch ends, or null when it never
@@ -4214,11 +4275,11 @@ fn declaresLocal(sc: *const Scope, sym: Sym) bool {
 
 /// A block that completes leaves its smart casts on the values declared
 /// outside it to the code after it.
-fn flowOut(ctx: *Ctx, sc: *Scope) Allocator.Error!void {
+fn flowOut(sc: *Scope) Allocator.Error!void {
     const parent = sc.parent orelse return;
     for (sc.narrow.items) |n| {
         if (declaresLocal(sc, n.sym)) continue;
-        try parent.narrow.append(ctx.arena(), n);
+        try parent.narrow.append(parent.a, n);
     }
 }
 

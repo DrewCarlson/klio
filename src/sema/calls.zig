@@ -3512,7 +3512,7 @@ pub fn lambda(ctx: *Ctx, l: *const ast.LambdaExpr, expected_in: TypeId) Allocato
         for (exp_args[0..sh.contexts]) |ca| {
             const t = try infer.zonk(s, ca.ty);
             const csym = try body.newLocal(ctx, wk.anonymous, .{ .name = "<context>", .span = l.span }, t, false);
-            try sc.contexts.append(s.arena, .{ .ty = t, .sym = csym });
+            try sc.contexts.append(sc.a, .{ .ty = t, .sym = csym });
             try ctx_types.append(s.arena, ca.ty);
             try ctx_syms.append(s.arena, csym);
         }
@@ -3524,7 +3524,7 @@ pub fn lambda(ctx: *Ctx, l: *const ast.LambdaExpr, expected_in: TypeId) Allocato
         ret_expected = exp_args[exp_args.len - 1].ty;
     }
     if (recv != .none) {
-        try sc.receivers.append(s.arena, .{ .ty = try infer.zonk(s, recv), .kind = .lambda, .owner = fsym, .label = sc.label });
+        try sc.receivers.append(sc.a, .{ .ty = try infer.zonk(s, recv), .kind = .lambda, .owner = fsym, .label = sc.label });
     }
     // Parameters: declared, destructured, `it`, or none.
     var declared_types: std.ArrayList(TypeId) = .empty;
@@ -3745,7 +3745,7 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
         const t = try body.resolveTypeInBody(ctx, &cp.ty);
         const csym = try body.newLocal(ctx, try ctx.intern(cp.name.name), cp.name, t, false);
         if (!std.mem.eql(u8, cp.name.name, "_")) try ctx.declareLocal(s.syms.name(csym), csym);
-        try sc.contexts.append(s.arena, .{ .ty = t, .sym = csym });
+        try sc.contexts.append(sc.a, .{ .ty = t, .sym = csym });
         try ctx_types.append(s.arena, t);
         try ctx_syms.append(s.arena, csym);
     }
@@ -3754,7 +3754,7 @@ pub fn anonymousFunction(ctx: *Ctx, f: *const ast.AnonFunExpr, expected: TypeId)
     }
     var recv: TypeId = if (f.receiver_ty) |*tr| try body.resolveTypeInBody(ctx, tr) else exp_recv;
     recv = try infer.zonk(s, recv);
-    if (recv != .none) try sc.receivers.append(s.arena, .{ .ty = recv, .kind = .extension, .owner = fsym, .label = sc.label });
+    if (recv != .none) try sc.receivers.append(sc.a, .{ .ty = recv, .kind = .extension, .owner = fsym, .label = sc.label });
     var pts: std.ArrayList(TypeId) = .empty;
     var param_syms: std.ArrayList(Sym) = .empty;
     for (f.params, 0..) |*p, i| {
