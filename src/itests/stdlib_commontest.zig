@@ -10,7 +10,7 @@ const runtime = @import("runtime");
 const klio_child = @import("klio_child");
 
 /// Pass floor. Rises as fixes land, falls only with a root-caused record.
-const BASELINE: usize = 2301;
+const BASELINE: usize = 2466;
 
 /// Failure ceiling, the mirror of `BASELINE`. A file that produces no summary
 /// at all counts as build-blocked, not as a failure.
@@ -114,7 +114,7 @@ fn failedCount(stdout: []const u8) ?usize {
     return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
 }
 
-/// Symbol name from an `import test.<pkg>.<Name>` line.
+/// The qualified name an `import test.<pkg>.<Name>` line imports.
 fn importedTestName(line: []const u8) ?[]const u8 {
     const t = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, t, "import ")) return null;
@@ -125,7 +125,18 @@ fn importedTestName(line: []const u8) ?[]const u8 {
     const dot = std.mem.findScalarLast(u8, rest, '.') orelse return null;
     const name = rest[dot + 1 ..];
     if (name.len == 0 or std.mem.eql(u8, name, "*")) return null;
-    return name;
+    return rest;
+}
+
+/// The package a file's `package` line names, empty for the root package.
+fn packageOf(content: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, t, "package ")) continue;
+        return std.mem.trimEnd(u8, std.mem.trim(u8, t["package ".len..], " \t"), ";");
+    }
+    return "";
 }
 
 fn isIdentChar(c: u8) bool {
@@ -192,7 +203,8 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
 
     // The real Kotlin module compiles every file together, so the unique
     // provider of each imported `test.*` symbol joins the target's module as
-    // context. A name two targets declare is dropped rather than clashed.
+    // context: the file of the import's package that declares its name. A
+    // name two files of one package declare is dropped rather than clashed.
     var imported_names: std.StringHashMap(void) = .init(a);
     for (targets.items) |t| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch continue;
@@ -205,9 +217,12 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var ambiguous: std.StringHashMap(void) = .init(a);
     for (targets.items) |t| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch continue;
+        const pkg = packageOf(bytes);
         var kit = imported_names.keyIterator();
         while (kit.next()) |k| {
-            if (!declaresTopLevel(bytes, k.*)) continue;
+            const dot = std.mem.findScalarLast(u8, k.*, '.').?;
+            if (!std.mem.eql(u8, k.*[0..dot], pkg)) continue;
+            if (!declaresTopLevel(bytes, k.*[dot + 1 ..])) continue;
             if (provider.contains(k.*)) {
                 try ambiguous.put(k.*, {});
             } else {
@@ -268,24 +283,34 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         try argv.append(a, "test");
         try argv.append(a, try std.fmt.allocPrint(a, "--only-file={s}", .{target}));
         try argv.appendSlice(a, support.items);
+        var compiled: std.ArrayList([]const u8) = .empty;
+        try compiled.append(a, target);
         for (targets.items) |sibling| {
             if (std.mem.eql(u8, sibling, target)) continue;
             const sdir = std.fs.path.dirname(sibling) orelse "";
-            if (std.mem.eql(u8, sdir, tdir)) try argv.append(a, sibling);
+            if (!std.mem.eql(u8, sdir, tdir)) continue;
+            try argv.append(a, sibling);
+            try compiled.append(a, sibling);
         }
+        // Every file the job compiles gets the providers of its imports, and
+        // they theirs: an import that names nothing fails the whole
+        // compilation, as kotlinc's.
         {
-            const bytes = std.Io.Dir.cwd().readFileAlloc(io, target, a, .unlimited) catch "";
             var seen: std.StringHashMap(void) = .init(a);
-            var it = std.mem.splitScalar(u8, bytes, '\n');
-            while (it.next()) |line| {
-                const n = importedTestName(line) orelse continue;
-                const pf = provider.get(n) orelse continue;
-                if (std.mem.eql(u8, pf, target)) continue;
-                const pdir = std.fs.path.dirname(pf) orelse "";
-                if (std.mem.eql(u8, pdir, tdir)) continue;
-                if (seen.contains(pf)) continue;
-                try seen.put(pf, {});
-                try argv.append(a, pf);
+            var i: usize = 0;
+            while (i < compiled.items.len) : (i += 1) {
+                const bytes = std.Io.Dir.cwd().readFileAlloc(io, compiled.items[i], a, .unlimited) catch "";
+                var it = std.mem.splitScalar(u8, bytes, '\n');
+                while (it.next()) |line| {
+                    const n = importedTestName(line) orelse continue;
+                    const pf = provider.get(n) orelse continue;
+                    const pdir = std.fs.path.dirname(pf) orelse "";
+                    if (std.mem.eql(u8, pdir, tdir)) continue;
+                    if (seen.contains(pf)) continue;
+                    try seen.put(pf, {});
+                    try argv.append(a, pf);
+                    try compiled.append(a, pf);
+                }
             }
         }
         try argv.append(a, target);
@@ -381,4 +406,13 @@ test "failedCount parses the child summary (negative control for a zero)" {
     try std.testing.expectEqual(@as(?usize, 12), failedCount("12 failed"));
     try std.testing.expectEqual(@as(?usize, null), failedCount("no summary here\n"));
     try std.testing.expectEqual(@as(?usize, 33), passedCount("40 tests, 33 passed, 7 failed\n"));
+}
+
+test "a test import names its provider by package and name" {
+    try std.testing.expectEqualStrings("test.properties.delegation.references.Data", importedTestName("import test.properties.delegation.references.Data").?);
+    try std.testing.expectEqualStrings("test.collections.behaviors.listBehavior", importedTestName("  import test.collections.behaviors.listBehavior;").?);
+    try std.testing.expect(importedTestName("import test.collections.*") == null);
+    try std.testing.expect(importedTestName("import kotlin.test.assertEquals") == null);
+    try std.testing.expectEqualStrings("test.properties.delegation.references", packageOf("/* header */\npackage test.properties.delegation.references\n\nclass Data\n"));
+    try std.testing.expectEqualStrings("", packageOf("class Data\n"));
 }

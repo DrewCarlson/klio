@@ -362,19 +362,18 @@ test "pack-using program: image path matches a fresh base with installed packs" 
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
     };
-    var pack_files: [pack_dirs.len][]const u8 = undefined;
-    for (pack_dirs, &pack_files) |d, *f| {
-        f.* = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ home, std.fs.path.basename(d) });
-        const r = try runKlio(a, io, &env, null, &.{ bin, "pack", "build", d, "--out", f.* });
-        if (r.code != 0) {
-            std.debug.print("stdlib_image: pack build {s} failed:\n{s}\n", .{ d, r.stderr });
+    // In dependency order, each installed before the next builds: a pack
+    // builds against the packs its sources import, installed.
+    for (pack_dirs) |d| {
+        const f = try std.fmt.allocPrint(a, "{s}/{s}.klio-pack", .{ home, std.fs.path.basename(d) });
+        const built = try runKlio(a, io, &env, null, &.{ bin, "pack", "build", d, "--out", f });
+        if (built.code != 0) {
+            std.debug.print("stdlib_image: pack build {s} failed:\n{s}\n", .{ d, built.stderr });
             return error.TestUnexpectedResult;
         }
-    }
-    for (pack_files) |f| {
-        const r = try runKlio(a, io, &env, null, &.{ bin, "pack", "install", f });
-        if (r.code != 0) {
-            std.debug.print("stdlib_image: pack install {s} failed:\n{s}\n", .{ f, r.stderr });
+        const installed = try runKlio(a, io, &env, null, &.{ bin, "pack", "install", f });
+        if (installed.code != 0) {
+            std.debug.print("stdlib_image: pack install {s} failed:\n{s}\n", .{ f, installed.stderr });
             return error.TestUnexpectedResult;
         }
     }

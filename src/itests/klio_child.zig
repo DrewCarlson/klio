@@ -116,6 +116,21 @@ pub fn baseEnv(a: Allocator) !Environ.Map {
     return envFor(a, try home(a));
 }
 
+/// Names the `<name>.input` beside the program `path` as its windows'
+/// scripted input (`KLIO_WIN_INPUT`), as the corpus runs a windowed example:
+/// without it a window on a display waits for input that never comes.
+pub fn putWindowInput(a: Allocator, env: *Environ.Map, path: []const u8) !void {
+    if (!std.mem.endsWith(u8, path, ".kt")) return;
+    const script = try std.fmt.allocPrint(a, "{s}.input", .{path[0 .. path.len - ".kt".len]});
+    var threaded: std.Io.Threaded = .init(a, .{});
+    defer threaded.deinit();
+    const abs = std.Io.Dir.cwd().realPathFileAlloc(threaded.io(), script, a) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => |x| return x,
+    };
+    try env.put("KLIO_WIN_INPUT", abs);
+}
+
 var fallback_lock: runtime.SpinMutex = .{};
 var fallback_home: ?[]const u8 = null;
 
@@ -279,6 +294,7 @@ pub const Result = union(enum) {
 pub fn run(a: Allocator, files: []const []const u8, opts: RunOptions) !Result {
     var env = try baseEnv(a);
     if (opts.mode == .cold) try env.put("KLIO_SEMA_IMAGE", "0");
+    if (files.len != 0) try putWindowInput(a, &env, files[0]);
     for (opts.env) |kv| try env.put(kv[0], kv[1]);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ bin(), "run", "--virtual-time" });
@@ -345,6 +361,27 @@ test "runArgs takes the header's flags and drops the file" {
     try std.testing.expectEqualStrings("--feature", got[0]);
     try std.testing.expectEqualStrings("kotlinx.serialization/json", got[1]);
     try std.testing.expectEqual(@as(usize, 0), (try runArgs(arena.allocator(), "fun main() {}\n")).len);
+}
+
+test "a program with an .input beside it runs with that script as its window input" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "windowed.kt", .data = "fun main() {}\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "windowed.input", .data = "100ms press 10 10\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "plain.kt", .data = "fun main() {}\n" });
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var env = Environ.Map.init(a);
+    try putWindowInput(a, &env, try std.fmt.allocPrint(a, "{s}/plain.kt", .{dir}));
+    try std.testing.expect(env.get("KLIO_WIN_INPUT") == null);
+
+    try putWindowInput(a, &env, try std.fmt.allocPrint(a, "{s}/windowed.kt", .{dir}));
+    const script = env.get("KLIO_WIN_INPUT") orelse return error.TestExpectedWindowInput;
+    try std.testing.expect(std.fs.path.isAbsolute(script));
+    try std.testing.expect(std.mem.endsWith(u8, script, "/windowed.input"));
 }
 
 test "linesOf terminates a partial line and keeps empty lines between" {

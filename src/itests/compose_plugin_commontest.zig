@@ -10,6 +10,7 @@
 const std = @import("std");
 const runtime = @import("runtime");
 const klio_child = @import("klio_child");
+const census_support = @import("commontest_support.zig");
 
 /// Pass-count floor, a ratchet: raise as fixes land, never lower. Set to
 /// `1390 - MAX_FAILED`, so it tolerates exactly the failures the ceiling below
@@ -312,8 +313,8 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     try env.put("KLIO_GC_STRESS", "0");
     if (stress.term != .exited or stress.term.exited != 0) {
         std.debug.print(
-            "compose_plugin_commontest: GC-stress Map copy failed:\n{s}\n{s}\n",
-            .{ stress.stdout, stress.stderr },
+            "compose_plugin_commontest: GC-stress Map copy failed ({any}):\n{s}\n{s}\n",
+            .{ stress.term, stress.stdout, stress.stderr },
         );
         return error.GcStressMapCopyFailed;
     }
@@ -356,21 +357,28 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
         if (slice_of[cls_i] != shard_k) continue;
         // `validatePotentialDeadlock` is the suite wall, so it gets its own
         // child scheduled first and the class's remainder runs as an overlapping
-        // job. Both compile a trimmed source set: the class file plus the
-        // same-package files whose helpers it reaches without imports. An
-        // unlisted helper fails loudly as an unresolved global, never silently.
+        // job. Both compile a trimmed source set: the class file, the
+        // same-package files whose helpers it reaches without imports, and
+        // the test files declaring what those import.
         if (std.mem.eql(u8, cls, "RecomposerTests")) {
             var trimmed: std.ArrayList([]const u8) = .empty;
+            var test_files: std.ArrayList([]const u8) = .empty;
+            var kept: std.ArrayList([]const u8) = .empty;
             for (sources.items) |src| {
                 const in_test_dirs =
                     std.mem.find(u8, src, "/commonTest/") != null or
                     std.mem.find(u8, src, "/nonEmulatorCommonTest/") != null;
-                const keep = !in_test_dirs or
-                    std.mem.endsWith(u8, src, "/RecomposerTests.kt") or
+                if (!in_test_dirs) {
+                    try trimmed.append(a, src);
+                    continue;
+                }
+                try test_files.append(a, src);
+                if (std.mem.endsWith(u8, src, "/RecomposerTests.kt") or
                     std.mem.endsWith(u8, src, "/EffectsTests.kt") or
-                    std.mem.endsWith(u8, src, "/CompositionTests.kt");
-                if (keep) try trimmed.append(a, src);
+                    std.mem.endsWith(u8, src, "/CompositionTests.kt")) try kept.append(a, src);
             }
+            try trimmed.appendSlice(a, kept.items);
+            try trimmed.appendSlice(a, try census_support.testProviders(a, io, test_files.items, kept.items));
             var solo: std.ArrayList([]const u8) = .empty;
             // The solo child takes cores 0-5 on a big box (scripts/stack.sh pins
             // everything else off them); siblings run under nice so its threads

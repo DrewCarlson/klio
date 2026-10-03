@@ -77,6 +77,22 @@ jobs:
       - uses: ./.github/actions/klio-env
         with:
           cache-key: ${{ matrix.shard }}
+      # The compose suites and the drawing examples draw through the Skia
+      # shim, which the harness loads from zig-out/lib; it builds over
+      # JetBrains' prebuilt Skia, as scripts/gate.sh builds it.
+      - name: cache prebuilt Skia
+        id: skia-cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: third_party/skia/linux-x64
+          key: skia-${{ hashFiles('scripts/fetch-skia.sh') }}-linux-x64
+      - name: fetch prebuilt Skia (if not cached)
+        if: steps.skia-cache.outputs.cache-hit != 'true'
+        run: ./scripts/fetch-skia.sh linux x64
+      - name: zig build skia-lib
+        run: |
+          sudo apt-get install -y --no-install-recommends libfontconfig1-dev
+          zig build skia-lib
       - name: zig build ${{ matrix.step }}
         run: zig build ${{ matrix.step }} -Dharness-optimize=ReleaseSafe --summary all
       - name: save zig build + test state

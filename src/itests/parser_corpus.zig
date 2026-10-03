@@ -105,7 +105,7 @@ const Printer = struct {
                     try params.appendSlice(self.arena, ps);
                 }
                 const ret = if (fn_.return_type) |t|
-                    try std.fmt.allocPrint(self.arena, ":{s}", .{try renderType(self.arena, &t)})
+                    try std.fmt.allocPrint(self.arena, ":{s}", .{try renderType(self.arena, t)})
                 else
                     "";
                 try self.line(try std.fmt.allocPrint(self.arena, "fun {s}({s}){s}", .{ fn_.name.name, params.items, ret }));
@@ -133,7 +133,7 @@ const Printer = struct {
             .Property => |prop| {
                 const kw: []const u8 = if (prop.mutable) "var" else "val";
                 const ty = if (prop.ty) |t|
-                    try std.fmt.allocPrint(self.arena, ":{s}", .{try renderType(self.arena, &t)})
+                    try std.fmt.allocPrint(self.arena, ":{s}", .{try renderType(self.arena, t)})
                 else
                     "";
                 try self.line(try std.fmt.allocPrint(self.arena, "{s} {s}{s}", .{ kw, prop.name.name, ty }));
@@ -141,7 +141,7 @@ const Printer = struct {
                     self.indent += 1;
                     try self.line("init=");
                     self.indent += 1;
-                    try self.expr(&init);
+                    try self.expr(init);
                     self.indent -= 1;
                     self.indent -= 1;
                 }
@@ -175,7 +175,7 @@ const Printer = struct {
             .Decl => |d| {
                 try self.line("stmt-decl");
                 self.indent += 1;
-                try self.decl(&d);
+                try self.decl(d);
                 self.indent -= 1;
             },
             .Assign => |asg| {

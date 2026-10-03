@@ -106,7 +106,9 @@ of downloading. `scripts/gate.sh` runs both before anything else. Only when
 the libraries can be neither found nor fetched does it skip the marked
 examples, naming each one (`corpus_check.py --no-skia`,
 `KLIO_GATE_NO_SKIA=1` for the compose-ui gate); a shim that fails to build is
-a red gate. An example marked `// corpus: tray` also needs the platform's tray
+a red gate. CI's itest shards build the shim the same way before their suites
+(`.github/workflows/ci.yml`): the compose suites' skikoTest cases and the
+drawing examples need it. An example marked `// corpus: tray` also needs the platform's tray
 icon, which macOS and Windows have and an X display has only while a system
 tray runs on it; elsewhere `corpus_check.py` skips it, naming it, unless
 `KLIO_TRAY_HOST=1` says the display has one.

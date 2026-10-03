@@ -75,6 +75,7 @@ fn worker(sh: *Shared) void {
 
 fn runCase(a: std.mem.Allocator, sh: *Shared, c: Case) !bool {
     var env = try klio_child.baseEnv(a);
+    try klio_child.putWindowInput(a, &env, c.path);
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(a, &.{ klioBin(), "run", c.path });
     try argv.appendSlice(a, c.args);

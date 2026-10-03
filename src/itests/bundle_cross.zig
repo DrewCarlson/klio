@@ -1,14 +1,17 @@
 //! `klio bundle --target` resolves the target stub through `KLIO_STUB_DIR`,
-//! never the network. The "linux-arm64" stub planted there is a copy of the
-//! host stub, so the cross bundle it produces boots here.
+//! never the network. The stub planted there for a target other than the
+//! host is a copy of the host stub, so the cross bundle it produces boots
+//! here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime = @import("runtime");
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const TMP_ROOT = "/tmp/klio_itest_bundle_cross";
-const FAKE_TARGET = "linux-arm64";
+/// A target that is not the host's, which a bundle needs a stub for.
+const FAKE_TARGET = if (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64) "linux-x64" else "linux-arm64";
 
 fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]const u8 {
     const rel = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -78,7 +81,7 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
             bin, "bundle", "examples/hello.kt", "-o", TMP_ROOT ++ "/nostub", "--target", FAKE_TARGET,
         });
         try std.testing.expectEqual(@as(u32, 1), r.code);
-        try std.testing.expect(std.mem.find(u8, r.stderr, "no cached stub for linux-arm64") != null);
+        try std.testing.expect(std.mem.find(u8, r.stderr, "no cached stub for " ++ FAKE_TARGET) != null);
         try std.testing.expect(std.mem.find(u8, r.stderr, "--stub <path>") != null);
     }
 

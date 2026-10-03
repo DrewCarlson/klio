@@ -487,6 +487,41 @@ fn providerClosure(
     return out.items;
 }
 
+/// The files of `candidates` the files `kept` need, transitively and in
+/// `candidates`' order: the ones that declare at top level a name a needing
+/// file uses in a package it resolves against (its own, or one it imports).
+/// `kept` must be among `candidates`; the result leaves them out.
+pub fn testProviders(a: std.mem.Allocator, io: std.Io, candidates: []const []const u8, kept: []const []const u8) ![]const []const u8 {
+    var scans: std.ArrayList(DeclScan) = .empty;
+    var owner: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
+    for (candidates, 0..) |path, ci| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch "";
+        const s = try scanDecls(a, bytes);
+        try scans.append(a, s);
+        for (s.declares) |d| {
+            const key = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ s.package, d });
+            const gop = try owner.getOrPut(a, key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(a, ci);
+        }
+    }
+    const needed = try a.alloc(bool, candidates.len);
+    @memset(needed, false);
+    for (candidates, 0..) |path, ci| {
+        for (kept) |k| {
+            if (!std.mem.eql(u8, k, path)) continue;
+            for (try providerClosure(a, scans.items, &owner, ci)) |pi| needed[pi] = true;
+        }
+    }
+    var out: std.ArrayList([]const u8) = .empty;
+    outer: for (candidates, 0..) |path, ci| {
+        if (!needed[ci]) continue;
+        for (kept) |k| if (std.mem.eql(u8, k, path)) continue :outer;
+        try out.append(a, path);
+    }
+    return out.items;
+}
+
 /// Count per-test `PASSED` lines (`<Class>.<method> PASSED`).
 fn passedLineCount(stdout: []const u8) usize {
     var n: usize = 0;
@@ -1342,4 +1377,29 @@ test "top-level declarations provide for other files in the same package" {
     const imported = try providerClosure(aa, &scans2, &owner2, 0);
     try std.testing.expectEqual(@as(usize, 1), imported.len);
     try std.testing.expectEqual(@as(usize, 1), imported[0]);
+}
+
+test "a trimmed set takes the test files declaring what it imports, and theirs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "Uses.kt", .data = "package app\n\nimport app.gap.expectError\n\nclass UsesTest {\n    fun t() = expectError()\n}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Gap.kt", .data = "package app.gap\n\nfun expectError() = deeper()\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Deeper.kt", .data = "package app.gap\n\nfun deeper() = 1\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "Link.kt", .data = "package app.link\n\nfun expectError() = 2\n" });
+    const dir = try std.fmt.allocPrint(aa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path = struct {
+        fn of(a: std.mem.Allocator, d: []const u8, name: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(a, "{s}/{s}", .{ d, name });
+        }
+    }.of;
+    const uses = try path(aa, dir, "Uses.kt");
+    const candidates = [_][]const u8{ uses, try path(aa, dir, "Gap.kt"), try path(aa, dir, "Deeper.kt"), try path(aa, dir, "Link.kt") };
+    const got = try testProviders(aa, io, &candidates, &.{uses});
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    try std.testing.expectEqualStrings(candidates[1], got[0]);
+    try std.testing.expectEqualStrings(candidates[2], got[1]);
 }
