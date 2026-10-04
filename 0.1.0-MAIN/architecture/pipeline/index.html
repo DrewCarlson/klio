@@ -600,10 +600,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#execution-path-klio-run" class="md-nav__link">
+  <a href="#execution-path-klio-run-klio-test" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Execution path (klio run)
+        Execution path (klio run, klio test)
       
     </span>
   </a>
@@ -1067,6 +1067,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1305,6 +1309,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1328,6 +1388,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1473,6 +1537,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1528,10 +1648,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#execution-path-klio-run" class="md-nav__link">
+  <a href="#execution-path-klio-run-klio-test" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Execution path (klio run)
+        Execution path (klio run, klio test)
       
     </span>
   </a>
@@ -1611,43 +1731,40 @@
 <p>klio has two entry paths through the front end: <strong>execution</strong>
 (<code>klio run</code>) and <strong>diagnostics</strong> (<code>klio check</code>). They share the
 lexer and parser; they diverge after the AST.</p>
-<h2 id="execution-path-klio-run">Execution path (<code>klio run</code>)<a class="headerlink" href="#execution-path-klio-run" title="Permanent link">&para;</a></h2>
+<h2 id="execution-path-klio-run-klio-test">Execution path (<code>klio run</code>, <code>klio test</code>)<a class="headerlink" href="#execution-path-klio-run-klio-test" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>.kt bytes
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>   │
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>   ▼  lexer            UTF-8 source → tokens
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>   ▼  parser           tokens → ast.KotlinFile
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>   ▼  (pack loading)   merge installed pack ASTs into the module
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>   ▼  ast passes       typealias expansion, @Serializable and @Composable plugins
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   ▼  ir               AST → register IR (lowering)
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>   ▼  interp_ir        build the IR module, then Vm.run
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>   ▼
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>program output
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>   ▼  (pack loading)   the stdlib and the program's declared packs, as sources
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>   ▼  @Serializable    the serialization plugin splices its members into the files
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   ▼  sema             symbols, headers and bodies: every name bound to a symbol
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>   ▼  bridge           sema's symbols → IR ids (classes, functions, fields, slots)
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>   ▼  lower            sema's records → register IR (`ir/lower/sema`, with @Composable)
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>   ▼  interp_ir        the Vm runs the lowered module
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>   ▼
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>program output
 </code></pre></div>
 <p>The Vm executes the lowered IR directly. There is no AST evaluator
-and no bytecode VM — <code>ir</code> lowers every supported construct
+and no bytecode VM — <code>ir/lower/sema</code> lowers every supported construct
 (classes, lambdas, suspend state machines, reflection, delegates) to
-structured IR instructions, and the Vm dispatches on them. Under the
+IR instructions that name their targets by id, and the Vm dispatches on
+them. Under the
 default <code>fast</code> profile, hot loops and functions additionally compile
 to native code through the tiered JIT; see
 <a href="../performance/">Performance</a>.</p>
-<p>Before lowering, whole-program AST passes rewrite the parsed files in
-place. The first is typealias expansion (<code>ast.alias_expand</code>): every
-reference to a <code>typealias</code> — a type position, a constructor call
-<code>Alias(args)</code> / <code>recv.Alias(args)</code>, a supertype of a class or object
-literal, a value read of an aliased object or companion, a callable
-reference <code>::Alias</code> — becomes the aliased type with the alias's type
-parameters substituted, resolved with Kotlin's scoping (enclosing class
-body, explicit imports, own package, star imports; the target itself
-resolves in the alias's declaring file). Lowering and the runtime then
-only ever see the target. An alias name the program also declares as a
-classifier, function or value is left for the lowering's scope model.
-<code>KLIO_ALIAS_EXPAND=0</code> skips the pass. The <code>@Serializable</code> and
-<code>@Composable</code> plugin passes follow.</p>
-<p>With <code>KLIO_EAGER=1</code> the run path also executes the resolver and type
-checker ahead of lowering, and lowering consumes their answers
-(call targets, receiver types) instead of deferring those decisions
-to runtime; files the checker cannot finish fall back to the lazy
-path.</p>
+<p>Every node sema will record a fact on carries an <code>ast.NodeId</code>: each
+expression, block, assignment, destructuring declaration, catch clause,
+declaration, parameter and <code>$name</code> template part. The parser numbers a
+file's nodes in source order from 1 (a node before its children) and
+leaves the next free id in <code>KotlinFile.node_count</code>; 0 is <code>none</code>, the id of
+a node a later pass built. The <code>@Serializable</code> pass parses each snippet it
+splices into a file with ids continuing from that file's count. In Debug
+builds <code>ast.checkIds</code> runs after the parse and after that pass and panics
+on an id held by two nodes, which is what a pass copying an <code>Expr</code> leaves.</p>
+<p>A pack file's class typealiases are expanded in its function signatures
+and constructor parameters as it loads (<code>ast.expandFileClassAliases</code>);
+every other alias is resolved by sema.</p>
 <table>
 <thead>
 <tr>
@@ -1669,12 +1786,20 @@ path.</p>
 <td>Tokens → <code>ast.KotlinFile</code>. Error recovery; <code>P00xx</code> diagnostics.</td>
 </tr>
 <tr>
+<td><code>sema</code></td>
+<td>Symbols, declaration headers and body analysis; the records lowering reads.</td>
+</tr>
+<tr>
 <td><code>ir</code></td>
-<td>Lowers the AST to the register IR (<code>Module</code>, <code>Func</code>, <code>Inst</code>).</td>
+<td>The register IR (<code>Module</code>, <code>Func</code>, <code>Inst</code>), the bridge and the lowering.</td>
+</tr>
+<tr>
+<td><code>lower_driver</code></td>
+<td>Drives sema, the bridge and lowering over a base and a program.</td>
 </tr>
 <tr>
 <td><code>interp_ir</code></td>
-<td>Builds the IR module from one or more files and runs it on the Vm.</td>
+<td>The Vm that runs the lowered module.</td>
 </tr>
 <tr>
 <td><code>runtime</code></td>
@@ -1717,10 +1842,8 @@ non-zero on any error.</p>
 </tr>
 </tbody>
 </table>
-<p>Type-checking does not gate execution: a program that type-checks
-clean and a program that merely parses both run through the same Vm
-(under <code>KLIO_EAGER=1</code> the checker runs on the run path too, but as
-an accuracy upgrade for lowering, never as a gate).</p>
+<p><code>klio run</code> does not run the resolver or the type checker; sema reports
+the errors that stop a program from running.</p>
 <h2 id="stdlib-and-packs">Stdlib and packs<a class="headerlink" href="#stdlib-and-packs" title="Permanent link">&para;</a></h2>
 <p>The standard library ships as <code>stdlib.klio-pack</code>, embedded into the
 binary by <code>stdlib_pack</code> as a byte slice. At startup the loader:</p>
@@ -1728,24 +1851,21 @@ binary by <code>stdlib_pack</code> as a byte slice. At startup the loader:</p>
 <li>Decodes the embedded stdlib pack and registers its native
    bindings against <code>stdlib</code>'s <code>HostBindings</code>.</li>
 <li>Enumerates <code>~/.klio/packs/</code> and <code>$KLIO_PACKS</code>, topologically
-   sorts packs by their declared dependencies, and merges each
-   pack's parsed AST into the IR module so its top-level
-   declarations become part of the program.</li>
-<li>Hands the resolved binding table to the Vm via
-   <code>set_installed_bindings</code>.</li>
+   sorts packs by their declared dependencies, and adds each pack's
+   parsed sources to the base the program is analyzed over.</li>
 </ol>
 <p>See <a href="../../packs/format/">Pack Format</a> for the on-disk layout.</p>
-<p>To avoid re-lowering the stdlib (and selected packs) on every run, the
-CLI bakes the lowered dependency base — the IR module, its registry
-side tables, the runtime <code>ClassDef</code> graph, and the post-lift AST the
-extend path consumes — to a content-addressed image under
-<code>~/.klio/cache</code> and extends it with just the user program's
-declarations on later runs (<code>src/interp_ir/image.zig</code>,
-<code>src/cli/stdlib_image.zig</code>). The image's wire format is the pack
+<p>To avoid analyzing and lowering the stdlib (and selected packs) on every
+run, the CLI bakes the base's bridge and lowered bodies to a
+content-addressed image, <code>$KLIO_HOME/.klio/cache/sema-base-&lt;key&gt;.klio-sema</code>
+(<code>src/lower_driver/base_image.zig</code>, <code>src/cli/sema_base_cache.zig</code>), and
+later runs analyze and lower only the program over it. The image is
+written in the value codec of <code>src/interp_ir/codec.zig</code>: the pack
 codec's postcard style plus a shared-graph protocol (slice and AST-node
-define/backref registries) so cross-references like
-<code>ClassDef.methods[].decl</code> and inline-function ASTs decode pointing into
-the same decoded tree they did in memory.</p>
+define/backref registries), so cross-references decode pointing into the
+same decoded tree they did in memory. <code>klio bake-image</code> and <code>klio bundle</code>
+write a self-contained image (<code>src/cli/sema_image.zig</code>) that carries the
+base image with the sources it was baked from.</p>
 <h2 id="diagnostics-model">Diagnostics model<a class="headerlink" href="#diagnostics-model" title="Permanent link">&para;</a></h2>
 <p>Every front-end pass emits through <code>diagnostics.DiagnosticSink</code>,
 which renders to plain text, JSON, or SARIF. Codes are prefixed by

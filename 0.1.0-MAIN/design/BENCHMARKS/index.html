@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1365,6 +1429,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1442,6 +1562,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#compose-ui-workloads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compose UI workloads
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#reference-runners" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1511,7 +1642,7 @@
 
 
 <h1 id="benchmarks">Benchmarks<a class="headerlink" href="#benchmarks" title="Permanent link">&para;</a></h1>
-<p>KLIO ships a benchmark harness (<code>src/bench/</code>) that times every stage of the pipeline (<code>lex → parse → resolve → typeck → e2e</code>) plus end-to-end runs. The goal is to make every performance- or memory-shaped change measurable in numbers before and after the diff, so optimization work targets real bottlenecks rather than guesses.</p>
+<p>KLIO ships a benchmark harness (<code>src/bench/</code>) that times every stage of the pipeline (<code>lex → parse → headers → bodies → records → bridge → lower</code>) plus end-to-end runs. The goal is to make every performance- or memory-shaped change measurable in numbers before and after the diff, so optimization work targets real bottlenecks rather than guesses.</p>
 <h2 id="layout">Layout<a class="headerlink" href="#layout" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>src/bench/
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>  bench.zig               corpus loader, per-stage pipeline runners, timing
@@ -1522,6 +1653,12 @@
 <a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>benches-baseline/HEAD.json    checked-in baseline (numbers from main)
 </code></pre></div>
 <h2 id="running">Running<a class="headerlink" href="#running" title="Permanent link">&para;</a></h2>
+<p><code>lex</code> and <code>parse</code> time the workload alone. <code>headers</code>, <code>bodies</code>,
+<code>records</code>, <code>bridge</code> and <code>lower</code> time the stages sema and lowering run over
+the stdlib base and the workload together, as a run with no base image does
+(<code>KLIO_SEMA_IMAGE=0</code>); each is its own number, not a running total. <code>e2e</code>
+spawns the harness (<code>KLIO_ITEST_BIN</code>) on the workload, over the base image
+it caches in <code>/tmp/klio_bench_home</code>, as a user runs it.</p>
 <p>The bench module runs as a program-running suite through the build
 system (it rides the integration tier, not the fast unit step):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>zig<span class="w"> </span>build<span class="w"> </span>itest-bench
@@ -1531,6 +1668,19 @@ budgets), <code>--json</code>, <code>--out &lt;file&gt;</code>, <code>--filter &
 <code>--diff &lt;baseline.json&gt;</code>; a standalone installed <code>klio-bench</code> binary
 is a follow-up (see <code>.github/workflows/bench.yml</code> — benchmarking is
 manual for now, and the workflow keeps the module compiling).</p>
+<h2 id="compose-ui-workloads">Compose UI workloads<a class="headerlink" href="#compose-ui-workloads" title="Permanent link">&para;</a></h2>
+<p><code>bench/compose/</code> runs eight Compose programs, four headless scenes and four
+real windows, on klio and on Compose Desktop, alternating. It reports frame
+cost, frame rate, launch time, idle CPU and peak memory, and compares a run
+with an earlier one:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>zig<span class="w"> </span>build<span class="w"> </span>klio-harness-fast
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>bench/compose/run.py<span class="w"> </span><span class="o">[</span>--only<span class="w"> </span>hb_list<span class="o">]</span><span class="w"> </span><span class="o">[</span>--no-jvm<span class="o">]</span><span class="w"> </span><span class="o">[</span>--rounds<span class="w"> </span>N<span class="o">]</span><span class="w"> </span><span class="o">[</span>--jit<span class="w"> </span>on<span class="p">|</span>off<span class="p">|</span>both<span class="o">]</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>bench/compose/summarize.py<span class="w"> </span>&lt;results.json&gt;<span class="w"> </span><span class="o">[</span>--baseline<span class="w"> </span>&lt;older.json&gt;<span class="o">]</span>
+</code></pre></div>
+<p><code>--jit off</code> runs the JVM with <code>-Xint</code> and klio with <code>KLIO_JIT=0</code>, for
+interpreter against interpreter; <code>--jit both</code> runs each program both ways.
+<code>bench/compose/README.md</code> describes each program, the flags, and what each
+number measures.</p>
 <h2 id="reference-runners">Reference runners<a class="headerlink" href="#reference-runners" title="Permanent link">&para;</a></h2>
 <p>End-to-end runs can be compared to the official Kotlin compilers
 through <code>refrunner.zig</code>. Compiled artifacts are cached under
@@ -1568,23 +1718,23 @@ current / baseline), from <code>schema.zig</code>:</p>
 </table>
 <p>The diff path exits non-zero when any row is red.</p>
 <h2 id="reading-the-schema">Reading the schema<a class="headerlink" href="#reading-the-schema" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"git_sha"</span><span class="p">:</span><span class="w"> </span><span class="s2">"abcd123"</span><span class="p">,</span>
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"macos-aarch64"</span><span class="p">,</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">"records"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="p">{</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">      </span><span class="nt">"stage"</span><span class="p">:</span><span class="w"> </span><span class="s2">"e2e"</span><span class="p">,</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">      </span><span class="nt">"workload"</span><span class="p">:</span><span class="w"> </span><span class="s2">"game/entity_tick"</span><span class="p">,</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">      </span><span class="nt">"median_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">14000000</span><span class="p">,</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">      </span><span class="nt">"p99_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">15200000</span><span class="p">,</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">      </span><span class="nt">"iters"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">      </span><span class="nt">"allocs"</span><span class="p">:</span><span class="w"> </span><span class="mi">42018</span><span class="p">,</span>
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">      </span><span class="nt">"alloc_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">1284911</span><span class="p">,</span>
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">      </span><span class="nt">"ref_kotlinc_native_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">31000000</span><span class="p">,</span>
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">      </span><span class="nt">"ref_kotlinc_jvm_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">940000000</span>
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">  </span><span class="p">]</span>
-<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="p">}</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="nt">"git_sha"</span><span class="p">:</span><span class="w"> </span><span class="s2">"abcd123"</span><span class="p">,</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nt">"host"</span><span class="p">:</span><span class="w"> </span><span class="s2">"macos-aarch64"</span><span class="p">,</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">"records"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="p">{</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">      </span><span class="nt">"stage"</span><span class="p">:</span><span class="w"> </span><span class="s2">"e2e"</span><span class="p">,</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">      </span><span class="nt">"workload"</span><span class="p">:</span><span class="w"> </span><span class="s2">"game/entity_tick"</span><span class="p">,</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">      </span><span class="nt">"median_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">14000000</span><span class="p">,</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">      </span><span class="nt">"p99_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">15200000</span><span class="p">,</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">      </span><span class="nt">"iters"</span><span class="p">:</span><span class="w"> </span><span class="mi">12</span><span class="p">,</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="w">      </span><span class="nt">"allocs"</span><span class="p">:</span><span class="w"> </span><span class="mi">42018</span><span class="p">,</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="w">      </span><span class="nt">"alloc_bytes"</span><span class="p">:</span><span class="w"> </span><span class="mi">1284911</span><span class="p">,</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="w">      </span><span class="nt">"ref_kotlinc_native_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">31000000</span><span class="p">,</span>
+<a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="w">      </span><span class="nt">"ref_kotlinc_jvm_ns"</span><span class="p">:</span><span class="w"> </span><span class="mi">940000000</span>
+<a id="__codelineno-3-15" name="__codelineno-3-15" href="#__codelineno-3-15"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-3-16" name="__codelineno-3-16" href="#__codelineno-3-16"></a><span class="w">  </span><span class="p">]</span>
+<a id="__codelineno-3-17" name="__codelineno-3-17" href="#__codelineno-3-17"></a><span class="p">}</span>
 </code></pre></div>
 <p>Optional fields are omitted when absent.</p>
 <h2 id="what-we-measure-and-why-each-thing-matters">What we measure, and why each thing matters<a class="headerlink" href="#what-we-measure-and-why-each-thing-matters" title="Permanent link">&para;</a></h2>

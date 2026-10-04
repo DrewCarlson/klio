@@ -976,6 +976,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#features-one-per-upstream-module" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features: one per upstream module
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#testing-the-project" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1091,6 +1102,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1344,6 +1359,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1367,6 +1438,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1512,6 +1587,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1588,6 +1719,17 @@
   
     <nav class="md-nav" aria-label="2. Edit klio.toml">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#features-one-per-upstream-module" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features: one per upstream module
+      
+    </span>
+  </a>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#testing-the-project" class="md-nav__link">
@@ -1705,8 +1847,8 @@ scratch.</p>
 <a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="n">implicit_packages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[]</span>
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">source_roots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"src/main/kotlin"</span><span class="p">]</span>
 <a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="k">[[deps]]</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"stdlib"</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="k">[deps]</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">stdlib</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"*"</span>
 <a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
 <a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="c1"># Map Kotlin FQN -&gt; host_symbol for any native bindings. Omit the</span>
 <a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="c1"># table when the library is pure Kotlin.</span>
@@ -1747,8 +1889,8 @@ scratch.</p>
 <td>A packed source set: <code>root</code> + optional <code>include</code> (file list relative to <code>root</code>). Repeatable; use instead of <code>source_roots</code> for finer control.</td>
 </tr>
 <tr>
-<td><code>[[deps]]</code></td>
-<td>Library ids this pack depends on. The loader topo-sorts them.</td>
+<td><code>[deps]</code></td>
+<td>One line per dependency: <code>"kotlinx.io" = "*"</code> for any version, a version string for a minimum, <code>{ version = "..", features = [..], default_features = false }</code> for the rest. The loader topo-sorts them.</td>
 </tr>
 <tr>
 <td><code>[bindings]</code></td>
@@ -1756,53 +1898,91 @@ scratch.</p>
 </tr>
 <tr>
 <td><code>[features]</code></td>
-<td>Named, opt-in source subsets (<code>name = { sources = [...] }</code>, optionally <code>requires = [...]</code>). Consumers enable them with <code>--feature &lt;id&gt;/&lt;name&gt;</code>.</td>
+<td>One feature per upstream module: <code>default = [...]</code> names the primary module(s); <code>name = { sources = [...], requires = [...], deps = [...] }</code> declares one (see below). Consumers enable them with <code>--feature &lt;id&gt;/&lt;name&gt;</code>.</td>
 </tr>
 <tr>
 <td><code>[[test]]</code></td>
-<td>A test source set for <code>klio test &lt;project&gt;</code>: <code>root</code> + optional <code>include</code>, optional <code>feature = "&lt;name&gt;"</code> (composed only when that feature is active; untagged = core, always active). Test sources are never packed.</td>
+<td>A test source set for <code>klio test &lt;project&gt;</code>: <code>root</code> + optional <code>include</code>, optional <code>feature = "&lt;name&gt;"</code> (composed only when that feature is active; untagged = core, always active), optional <code>group</code> (each group is its own test program). Test sources are never packed.</td>
 </tr>
 </tbody>
 </table>
+<h3 id="features-one-per-upstream-module">Features: one per upstream module<a class="headerlink" href="#features-one-per-upstream-module" title="Permanent link">&para;</a></h3>
+<p>A multi-module library ships as one pack whose features are its modules,
+named after the artifact with the library prefix stripped
+(<code>kotlinx-coroutines-test</code> -&gt; <code>test</code>, <code>ktor-client-core</code> -&gt; <code>client-core</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">[[source]]</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/kotlinx-coroutines-core/common/src"</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">[[source]]</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/kotlinx-coroutines-test/common/src"</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="k">[[source]]</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"klioMain"</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="k">[features]</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"core"</span><span class="p">]</span>
+<a id="__codelineno-3-12" name="__codelineno-3-12" href="#__codelineno-3-12"></a><span class="n">core</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">sources</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"upstream/kotlinx-coroutines-core"</span><span class="p">,</span><span class="w"> </span><span class="s2">"klioMain"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="n">test</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">sources</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"upstream/kotlinx-coroutines-test"</span><span class="p">,</span><span class="w"> </span><span class="s2">"klioMain/kotlinx/coroutines/test"</span><span class="p">],</span><span class="w"> </span><span class="n">requires</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"core"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<ul>
+<li><code>sources</code> are pack-relative path prefixes over the collected files. A
+  file claimed by several features belongs to the one whose matching
+  prefix is longest, so <code>klioMain</code> can hold every module's klio-authored
+  actuals with the package path placing each file in its module. A file
+  no feature claims always loads.</li>
+<li><code>requires</code> names the pack's own modules this one is built on (its
+  upstream <code>api</code> dependencies inside the library); <code>deps</code> names features
+  of other packs (<code>"kotlinx.serialization/json-io"</code>, or a bare pack id for
+  its defaults).</li>
+<li><code>default</code> is the module that loads when a consumer names nothing,
+  normally the library's entry point (<code>core</code>); a pack with no single
+  entry point (ktor) defaults to nothing.</li>
+<li>A library with one module declares no <code>[features]</code> at all.</li>
+<li><code>klio pack build</code> refuses a manifest whose <code>default</code>, <code>requires</code>, or
+  <code>[[test]] feature</code> names an undeclared feature, or whose <code>sources</code>
+  prefix covers no collected file.</li>
+</ul>
+<p>Lay klio-authored sources out as <code>klioMain/</code> (packed, any module) and
+<code>klioTest/</code> (test-only support for <code>[[test]]</code>, never packed).</p>
 <h3 id="testing-the-project">Testing the project<a class="headerlink" href="#testing-the-project" title="Permanent link">&para;</a></h3>
 <p>With one or more <code>[[test]]</code> stanzas, <code>klio test &lt;project-dir&gt;</code> builds+installs
 the pack, composes the active test sources into one module, and runs every
 <code>@Test</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">[[test]]</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/core/common/test"</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">[[test]]</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/feature/common/test"</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="n">feature</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"myfeature"</span><span class="w">   </span><span class="c1"># only composed under --feature &lt;id&gt;/myfeature (or --all)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">[[test]]</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/core/common/test"</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="k">[[test]]</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="n">root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"upstream/feature/common/test"</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="n">feature</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"myfeature"</span><span class="w">   </span><span class="c1"># only composed under --feature &lt;id&gt;/myfeature (or --all)</span>
 </code></pre></div>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w">                              </span><span class="c1"># this project</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w"> </span>--filter<span class="w"> </span>MyTest<span class="w"> </span>--format<span class="w"> </span>json
-<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w"> </span>--isolate<span class="w"> </span>--timeout<span class="w"> </span><span class="m">5</span><span class="w">        </span><span class="c1"># per-test sub-process, pinpoint a hang</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w">                              </span><span class="c1"># this project</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w"> </span>--filter<span class="w"> </span>MyTest<span class="w"> </span>--format<span class="w"> </span>json
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>.<span class="w"> </span>--isolate<span class="w"> </span>--timeout<span class="w"> </span><span class="m">5</span><span class="w">        </span><span class="c1"># per-test sub-process, pinpoint a hang</span>
 </code></pre></div>
 <p>See <a href="../../testing/#project-mode">Testing with KLIO</a> for the full runner surface.</p>
 <h2 id="3-write-the-kotlin-source">3. Write the Kotlin source<a class="headerlink" href="#3-write-the-kotlin-source" title="Permanent link">&para;</a></h2>
 <p>Pure Kotlin libraries are easiest — no Zig module required. Edit
 <code>src/main/kotlin/Sample.kt</code>:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">package</span><span class="w"> </span><span class="nn">com.example.greetings</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">greet</span><span class="p">(</span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kt">String</span><span class="p">):</span><span class="w"> </span><span class="kt">String</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"hello, </span><span class="si">$</span><span class="n">name</span><span class="s">"</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">shout</span><span class="p">(</span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kt">String</span><span class="p">):</span><span class="w"> </span><span class="kt">String</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">greet</span><span class="p">(</span><span class="n">name</span><span class="p">).</span><span class="na">uppercase</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">"!"</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">package</span><span class="w"> </span><span class="nn">com.example.greetings</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">greet</span><span class="p">(</span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kt">String</span><span class="p">):</span><span class="w"> </span><span class="kt">String</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">"hello, </span><span class="si">$</span><span class="n">name</span><span class="s">"</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">shout</span><span class="p">(</span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="kt">String</span><span class="p">):</span><span class="w"> </span><span class="kt">String</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">greet</span><span class="p">(</span><span class="n">name</span><span class="p">).</span><span class="na">uppercase</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">"!"</span>
 </code></pre></div>
 <h2 id="4-build">4. Build<a class="headerlink" href="#4-build" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>~/projects/greetings
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>~/projects/greetings
 </code></pre></div>
 <p>Output goes to <code>target/packs/com.example.greetings.klio-pack</code>.</p>
 <h2 id="5-install-and-use">5. Install and use<a class="headerlink" href="#5-install-and-use" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>install<span class="w"> </span>target/packs/com.example.greetings.klio-pack
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/use.kt<span class="w"> </span><span class="s">&lt;&lt;'EOF'</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="s">import com.example.greetings.greet</span>
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="s">fun main() = println(greet("world"))</span>
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="s">EOF</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>
-<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>klio<span class="w"> </span>run<span class="w"> </span>/tmp/use.kt
-<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="c1"># =&gt; hello, world</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>install<span class="w"> </span>target/packs/com.example.greetings.klio-pack
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/use.kt<span class="w"> </span><span class="s">&lt;&lt;'EOF'</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="s">import com.example.greetings.greet</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="s">fun main() = println(greet("world"))</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="s">EOF</span>
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>klio<span class="w"> </span>run<span class="w"> </span>/tmp/use.kt
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a><span class="c1"># =&gt; hello, world</span>
 </code></pre></div>
 <h2 id="adding-a-native-binding">Adding a native binding<a class="headerlink" href="#adding-a-native-binding" title="Permanent link">&para;</a></h2>
 <p>When pure Kotlin is too slow or needs host capabilities (clock, HTTP,
@@ -1812,14 +1992,14 @@ threads), pair the library with a Zig module.</p>
    exposing a <code>pub fn hostBindings(allocator) HostBindings</code>.</li>
 <li>Declare the binding in <code>klio.toml</code>:</li>
 </ol>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">[bindings]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="s2">"com.example.greetings.now"</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"com.example.greetings.now"</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">[bindings]</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="s2">"com.example.greetings.now"</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"com.example.greetings.now"</span>
 </code></pre></div>
 <ol>
 <li>In your Kotlin source, declare a stub body that returns the
    default the loader uses if the host fails to resolve:</li>
 </ol>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="kd">internal</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">now</span><span class="p">():</span><span class="w"> </span><span class="kt">Long</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0L</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="kd">internal</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">now</span><span class="p">():</span><span class="w"> </span><span class="kt">Long</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0L</span>
 </code></pre></div>
 <p>The loader, on installing the pack, will replace <code>now</code> with the
 intrinsic at dispatch time. See <a href="../native-bindings/">Native Bindings</a>

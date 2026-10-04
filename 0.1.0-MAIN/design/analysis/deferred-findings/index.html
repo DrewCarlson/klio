@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1658,25 +1778,20 @@ initializer is a <code>run { … }</code> HOF. Closing it needs the typeck-infer
 carrier on the run path, deferred under the latency gate.</p>
 <h3 id="7-lenient-extension-dispatch-residue">7. Lenient extension-dispatch residue<a class="headerlink" href="#7-lenient-extension-dispatch-residue" title="Permanent link">&para;</a></h3>
 <p>The lenient pass after the strict receiver-proven walk remains the designed
-residue of the strict-then-lenient call policy, now pinned by an on-demand
-detector: <code>python3 scripts/or_audit_sweep.py</code> runs examples +
-coroutine_smoke + parity_corpus (583 programs) under <code>KLIO_OR_AUDIT=1</code>,
-dedups identical runtime <code>arm=member_lenient</code> lines per program, and fails
-if any lenient name falls outside the documented residue set (<code>{dispatch}</code>).
-Current baseline: 10 deduped lenient lines across 10 programs (38 raw
-occurrences), all <code>name=dispatch</code> — the kotlinx coroutine-internal
-<code>dispatch</code> member-extensions whose erased receiver the strict prover cannot
-model. The sweep is deliberately not wired into <code>zig build test</code>; a new
-name in the lenient arm trips it and should be triaged as a prover gap,
-not widened into the residue set. The readout in
-<code>execution-architecture.md</code> records the same baseline and counting method.</p>
+residue of the strict-then-lenient call policy. Its last measured baseline
+was 10 lenient dispatches across 10 programs, all <code>name=dispatch</code>: the
+kotlinx coroutine-internal <code>dispatch</code> member-extensions whose erased
+receiver the strict prover cannot model. The detector that measured it read
+<code>KLIO_OR_AUDIT</code> lines, which the interpreter stopped emitting when the
+by-name instructions left the IR, so it was removed and the residue is no
+longer swept.</p>
 <p>The lenient arm is load-bearing and must not be deleted. Two attempts to
 delete it (after teaching the strict prover to prove the corpus-visible
 <code>dispatch</code> receivers) both regressed the ktor client: the arm also serves
 <code>async</code>/<code>proceed</code> (and, on the response exception path,
 <code>unwrapCancellationException</code>) whose receivers the strict prover does not
-fully model, and the <code>or_audit_sweep</code> corpus does not exercise the
-live-server ktor path, so a sweep reading of an empty residue is not proof
+fully model, and the audit corpus did not exercise the
+live-server ktor path, so a sweep reading of an empty residue was not proof
 the arm is unused. Deleting it caused spurious dispatch misses that
 cascaded into the exception branch. Closing this properly means completing
 the strict prover to cover those receiver classes AND enumerating consumers

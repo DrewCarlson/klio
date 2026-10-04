@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1506,7 +1626,7 @@ interchangeable — pick by what the state is keyed on.</p>
 <li>
 <p><strong>Generation stamping.</strong> Entries carry a generation counter; a bump
    invalidates every entry at once, including on parked worker threads a
-   per-thread clear could never reach. <code>host_call_member.dispatch_cache_gen</code>
+   per-thread clear could never reach. <code>host_util.dispatch_cache_gen</code>
    with <code>bumpDispatchCacheGen()</code> is the reference implementation.
    Use when: the cache is thread-local or too hot to walk, and a stale hit
    would be silently wrong rather than merely stale.</p>
@@ -1552,14 +1672,6 @@ per-program global remained</strong> after the seven roots were fixed.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>host_instances.shared_anon_module</code> / <code>shared_anon_arena</code></td>
-<td>boundary reset (and the clone is dropped at every boundary — its identity gate compares run-module CELL ADDRESSES, which an arena-reusing driver reissues)</td>
-</tr>
-<tr>
-<td><code>host_instances.anon_site_names</code> / <code>anon_site_thunks</code></td>
-<td>boundary reset</td>
-</tr>
-<tr>
 <td><code>ir.bc.cache</code></td>
 <td>boundary reset (entries freed, not just cleared)</td>
 </tr>
@@ -1601,12 +1713,6 @@ per-program global remained</strong> after the seven roots were fixed.</p>
 </tr>
 </tbody>
 </table>
-<p>Open, minor: <code>host_call_member.lenient_warned</code> is a warn-once set keyed by
-id and is not reset per program, so the second program in a process can
-lose a leniency warning the first already emitted. Cosmetic — it suppresses
-a diagnostic, never changes a result — but it is the one piece of
-per-program state deliberately left shared, and it is recorded here rather
-than left to be rediscovered.</p>
 <h2 id="the-contract-for-new-state">The contract for new state<a class="headerlink" href="#the-contract-for-new-state" title="Permanent link">&para;</a></h2>
 <p>Any new <code>var</code> at file scope that holds a container, a pointer, or a module
 handle must, in the same commit:</p>

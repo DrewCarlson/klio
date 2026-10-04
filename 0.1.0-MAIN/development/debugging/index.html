@@ -16,7 +16,7 @@
         <link rel="prev" href="../testing/">
       
       
-        <link rel="next" href="../contributing/">
+        <link rel="next" href="../platforms/">
       
       
         
@@ -963,6 +963,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1201,6 +1205,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1226,6 +1286,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1425,10 +1489,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#resolution-audits-and-the-eager-front-end" class="md-nav__link">
+  <a href="#resolution-audits" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resolution audits and the eager front end
+        Resolution audits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sema-and-the-resolved-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sema and the resolved pipeline
       
     </span>
   </a>
@@ -1480,10 +1555,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#performance-profile-jit-and-profiler" class="md-nav__link">
+  <a href="#performance-profile-and-profiler" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Performance profile, JIT, and profiler
+        Performance profile and profiler
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-jit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The JIT
       
     </span>
   </a>
@@ -1600,6 +1686,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../contributing/" class="md-nav__link">
         
   
@@ -1677,10 +1819,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#resolution-audits-and-the-eager-front-end" class="md-nav__link">
+  <a href="#resolution-audits" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Resolution audits and the eager front end
+        Resolution audits
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sema-and-the-resolved-pipeline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sema and the resolved pipeline
       
     </span>
   </a>
@@ -1732,10 +1885,21 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#performance-profile-jit-and-profiler" class="md-nav__link">
+  <a href="#performance-profile-and-profiler" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Performance profile, JIT, and profiler
+        Performance profile and profiler
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-jit" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The JIT
       
     </span>
   </a>
@@ -1874,8 +2038,8 @@ stderr tag each one prints. All of them are safe to combine.</p>
   switches work this way (<code>KLIO_ERR_TRACE=1</code>).</li>
 <li><strong>Truthy flags</strong>: non-empty and not <code>"0"</code> enables; <code>=0</code> or empty
   disables. Used where a default-on feature needs an off switch
-  (<code>KLIO_STDLIB_IMAGE=0</code>) and by a few gates
-  (<code>KLIO_OR_AUDIT</code>, <code>KLIO_TRACE_PATH</code>, <code>KLIO_TRACE_INVARIANTS</code>).
+  (<code>KLIO_SEMA_IMAGE=0</code>) and by a few gates
+  (<code>KLIO_TRACE_PATH</code>, <code>KLIO_TRACE_INVARIANTS</code>).
   The tables below say "<code>0</code>/empty off" for these.</li>
 <li><strong>Name filters</strong>: the value is a function/type name the trace is
   restricted to, matched exactly (<code>KLIO_MISS_TRACE=maxOf</code>) or as a
@@ -1891,10 +2055,9 @@ stderr tag each one prints. All of them are safe to combine.</p>
 <li><code>zig build</code> run steps forward only a fixed passthrough list to
   their child processes (<code>interp_env_keys</code> in <code>build.zig</code>):
   <code>KLIO_RACE_JITTER</code>, <code>KLIO_MAX_EVAL_DEPTH</code>, <code>KLIO_THROW_TRACE</code>,
-  <code>KLIO_TRACE_RESOLVE</code>, <code>KLIO_TRACE_CHAIN</code>, <code>KLIO_TRACE_INVARIANTS</code>,
+  <code>KLIO_TRACE_RESOLVE</code>, <code>KLIO_TRACE_INVARIANTS</code>,
   <code>KLIO_TRACE_PATH</code>, <code>KLIO_TRACE_HTTP</code>, <code>KLIO_LINK_AUDIT</code>,
-  <code>KLIO_RESOLVE_AUDIT</code>, <code>KLIO_RESOLVE_STRICT</code>, <code>KLIO_STDLIB_PACK</code>,
-  <code>KLIO_PACK_DIAG</code>, <code>KLIO_STDLIB_IMAGE</code>, <code>KLIO_TRACE_STDLIB_IMAGE</code>
+  <code>KLIO_STDLIB_PACK</code>, <code>KLIO_PACK_DIAG</code>
   (plus, for fuzz suites, <code>KLIO_FUZZ_SEED</code>, <code>KLIO_FUZZ_SEEDS</code>,
   <code>KLIO_SKIP_KOTLINC_PARITY</code>, <code>KLIO_KOTLINC_JVM_HOME</code>,
   <code>KLIO_KOTLINC_NATIVE</code>, <code>KLIO_NO_AUTO_INSTALL_KOTLINC</code>,
@@ -1905,8 +2068,8 @@ stderr tag each one prints. All of them are safe to combine.</p>
 </ul>
 <h2 id="dispatch-and-resolution-traces">Dispatch and resolution traces<a class="headerlink" href="#dispatch-and-resolution-traces" title="Permanent link">&para;</a></h2>
 <p>Runtime dispatch is the Vm side (<code>interp_ir/vm</code>); bare-call
-resolution is the lowering side (<code>ir/lower</code>). The static/dynamic
-pair to reach for first is <code>KLIO_BARE_TRACE</code> (what lowering picked)
+resolution against the module's tables is <code>ir/core</code>. The static/dynamic
+pair to reach for first is <code>KLIO_BARE_TRACE</code> (what the tables picked)
 plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <table>
 <thead>
@@ -1921,14 +2084,8 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <tr>
 <td><code>KLIO_BARE_TRACE</code></td>
 <td><code>&lt;name&gt;</code></td>
-<td>How a bare call <code>name(...)</code> statically resolved during lowering: the chosen overload (fqn, params, ext, emit form) or <code>NONE</code></td>
-<td><code>[bare]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_ALIAS_EXPAND</code></td>
-<td><code>0</code></td>
-<td>Skip the typealias expansion pass that rewrites every alias reference to its target before lowering; the lowering's per-site alias registry then serves the program (bisect an alias-related difference)</td>
-<td>—</td>
+<td>How a bare call <code>name(...)</code> statically resolved during lowering: the chosen overload (fqn, params, ext, emit form) or <code>NONE</code> with the resolver's deferral reason; each candidate's parameter count, default flags and declared arity against the wanted arity; the composer-ABI direct and threaded verdicts</td>
+<td><code>[bare]</code>, <code>[bare-cand]</code>, <code>[abi-direct]</code>, <code>[abi-retry]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_EXT_TRACE</code></td>
@@ -1961,12 +2118,6 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[sam-walk]</code>, <code>[sam-direct]</code>, <code>[sam-arm]</code>, <code>[marm]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_RLP_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Receiver-lambda-param lowering for bare calls of <code>name</code>: which arm engaged (marked/resolved/outer/head) and the receiver-tower <code>this@&lt;label&gt;</code> pick</td>
-<td><code>[rlp-arm]</code>, <code>[rlp-head]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_HEAD_TRACE</code></td>
 <td>set</td>
 <td>Runtime head-directed receiver re-selection for <code>CallValueWithThis</code> instructions carrying a declared receiver head</td>
@@ -1985,22 +2136,10 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[seldbg]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_MCRT_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Member-call return-type derivation for a chained arg (<code>recv.map { … }</code>): receiver tag/type and candidate agreement</td>
-<td><code>[mcrt]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_ADM_TRACE</code></td>
 <td>set</td>
 <td>Callable-vs-class adjudication detail inside <code>argDefinitelyNotParamType</code></td>
 <td><code>[adm]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_MEMO_TRACE</code></td>
-<td>set</td>
-<td>Compose plugin memoization-path decisions per lambda arg (cache / lifted singleton / remember, with capture keys) and the value-invocation call-site <code>$changed</code> bits</td>
-<td><code>[memo]</code>, <code>[bits]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_EF_TRACE</code></td>
@@ -2009,46 +2148,10 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[ef]</code>, <code>[tbie]</code>, <code>[efset]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_INLINE_PICK</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Inline-overload candidate set (receiver type, owner class, file) plus the receiver chain head</td>
-<td><code>[ipick]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_EXTKEY_TRACE</code></td>
 <td><code>&lt;fid&gt;[,&lt;fid&gt;]</code></td>
 <td>The eight-element extension ranking key for the named candidates, plus their parameter type heads. Ranking is lexicographic, so the first differing component is the one that decided</td>
 <td><code>[extkey]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_ARGTY_TRACE</code></td>
-<td><code>&lt;identifier&gt;</code></td>
-<td>The static type lowering actually used for that named expression, and whether it came from an inline splice's declared parameter type. Separates "no type" from "wrong type", which look identical from a failing test</td>
-<td><code>[argty]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SPLICE_TRACE</code></td>
-<td><code>&lt;function name&gt;</code></td>
-<td>Whether a named <code>inline fun</code> reaches the splice path (with the declaration and call-site spans), whether the call-site splice landed or bailed to dispatch, and — matched against a lambda PARAMETER name — each caller-lambda splice with its receiver-mark state</td>
-<td><code>[splice]</code>, <code>[splice-ok]</code>, <code>[splice-bail]</code>, <code>[splice-lam]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_THIS_TRACE</code></td>
-<td>set</td>
-<td>Every bare-<code>this</code> lowering: the active splice window, each scope index holding a <code>this</code> binding, and the register <code>resolve</code> picked. The tool for "whose <code>this</code> did this lambda capture"</td>
-<td><code>[this-trace]</code>, <code>[splice-bind]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LEAF_TRACE</code></td>
-<td><code>&lt;substring of a function name&gt;</code></td>
-<td>Why the frameless leaf-expression serve declined for a matching function (unsupported opcode, non-instance field receiver, unclaimed field route, callee that is not a leaf)</td>
-<td><code>[leaf]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SBC_TRACE</code></td>
-<td>set</td>
-<td>Constructor-vs-member routing inputs for each capitalized bare call</td>
-<td><code>[sbc]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_SUBTYPE_TRACE</code></td>
@@ -2063,34 +2166,40 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[shadow]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_BARERET</code></td>
-<td><code>&lt;name&gt;</code> or <code>*</code></td>
-<td>Why a bare call does or does not lend its return type to the local it initializes: the receiver head it resolved against, the target, the final type, and each refusal</td>
-<td><code>[bareret]</code></td>
+<td><code>KLIO_EXT_AUDIT</code></td>
+<td><code>1</code></td>
+<td>Dual-compute audit for extension dispatch: the declaration a commit at lowering would name (<code>would</code>) beside the one the runtime's by-name walk serves (<code>ran</code>). Join them with <code>scripts/ext_audit_sweep.py</code></td>
+<td><code>[KLIO_EXT_AUDIT]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_LI_NAMES</code></td>
+<td><code>KLIO_THIS_EXT</code></td>
+<td><code>0</code></td>
+<td>Leaves bare <code>this</code> in an extension function body without a recorded class identity, so a wrong answer can be told from a wrong reading of one</td>
+<td></td>
+</tr>
+<tr>
+<td><code>KLIO_DISPATCH_TRACE</code></td>
 <td>set</td>
-<td>Names the callee of every local initializer that yields no static type. Pair with <code>KLIO_BARERET</code> on whichever name dominates</td>
-<td><code>[li-null]</code></td>
+<td>Runtime: a member-extension frame that had to derive its own dispatch receiver from the enclosing chain because no caller handed one over (<code>[dispatch-fallback] fn= found=</code>), and a contextual frame that had to derive a context parameter the same way (<code>[context-fallback] fn= idx= ty= found=</code>); a producer is missing at whichever call site reached it. Static: how a context argument resolved at a call site, the scope, the subjects and the receiver tower it saw (<code>[context-arg] want= ...</code> then <code>-&gt; &lt;reg&gt;</code> or <code>-&gt; null</code>), a <code>contextOf&lt;T&gt;()</code> with nothing of that type in scope (<code>[context-none] ty= fn=</code>), and the context types a lambda literal was given from its expected type (<code>[lambda-ctx]</code>)</td>
+<td><code>[dispatch-fallback]</code>, <code>[context-fallback]</code>, <code>[context-arg]</code>, <code>[context-none]</code>, <code>[lambda-ctx]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_DISPATCH_STATS</code></td>
-<td><code>1</code></td>
-<td>Route counts per dispatch kind, plus <code>replay-hits</code>: how many named member calls the builtin intrinsic replay served outright. <code>member_ladder</code> names a route, not a walk — compare the two before reading it as name-resolution work</td>
-<td><code>[dispatch-stats]</code></td>
+<td><code>KLIO_SLOT_TRACE</code></td>
+<td>set</td>
+<td>Why a field read on the enclosing <code>this</code> did or did not claim a declared slot of its class's published layout: no owner, no class id, no layout (with the state), not a slot, or a capture</td>
+<td><code>[slot]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_NOINST_WHY</code></td>
-<td><code>1</code></td>
-<td>Why a statically bound slot on a host-backed receiver declined to a member-name walk: <code>no-slot-entry</code> (no <code>(class, slot)</code> mapping) or <code>target-not-executable</code> (the target is bodyless and no native is registered under its FQN)</td>
-<td><code>[noinst-why]</code></td>
+<td><code>KLIO_CGEN_REACH</code></td>
+<td>set</td>
+<td>What <code>klio transpile --native &lt;file.kt&gt;</code> reaches from <code>main</code>: every function (program or base) with its instruction count, every native with its binding, the classes it constructs, the slots it dispatches, its statics and closures, and a count of each instruction kind. The backlog for widening the native backend</td>
+<td><code>[reach]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_NORECV_WHY</code></td>
-<td>a local name, or <code>*</code></td>
-<td>Why an untyped-receiver site's local has no type: <code>at=file:line</code>, the initializer's AST tag, and the deriver's terminal. NOTE: the census counts CALL sites — probe with <code>x.first()</code>, never <code>x.size</code>, or the file has no counted site at all and the measurement is vacuous</td>
-<td><code>[norecv-why]</code></td>
+<td><code>KLIO_CGEN_DUMP</code></td>
+<td><code>&lt;substring&gt;</code></td>
+<td>The resolved instructions of every function whose name or FQN contains the substring, as <code>klio transpile --native</code> sees them</td>
+<td>(none)</td>
 </tr>
 <tr>
 <td><code>KLIO_ICRT</code></td>
@@ -2105,75 +2214,9 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td>—</td>
 </tr>
 <tr>
-<td><code>KLIO_NORECV_NAMES</code></td>
-<td>a <code>[no-recv-path]</code> bucket name, or <code>*</code></td>
-<td>Names the receiver identifier behind each untyped bare-path receiver, split by why it is untyped (<code>local_no_decl_type</code>, <code>captured</code>, <code>enclosing_member</code>, <code>unknown</code>)</td>
-<td><code>[no-recv-name]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_ARGSHAPE_UNK</code></td>
-<td>set</td>
-<td>Every argument whose applicability shape carries no type, no literal kind and no callable form — the expression forms that leave a member call unproven. Histogram the tags to pick the next typing channel</td>
-<td><code>[argshape-unk]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_NULLEXT_NAMES</code></td>
-<td>set</td>
-<td>Every member call held off the static path because a <code>T?</code> extension of that name exists and the extension itself did not resolve — the residue of the nullable-receiver rule</td>
-<td><code>[nullext]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SPLICE_REF</code></td>
-<td>set</td>
-<td>The full receiver type each inline splice installs in its window, and the argument it came from. Names the link where a chain loses its type arguments</td>
-<td><code>[splice-ref]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SLOT_BYNAME</code></td>
-<td>set</td>
-<td>Every statically bound virtual slot call that degraded to a by-name member walk, with the slot root. The host boundary made visible</td>
-<td><code>[slot-byname]</code></td>
-</tr>
-<tr>
 <td>—</td>
 <td>—</td>
 <td>NOTE: any captured log carrying <code>$class$</code> identity-mangle rows embeds NUL bytes and is BINARY to grep — filter with <code>grep -a</code>, or matching rows silently vanish and a dump looks nondeterministic</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_COMP_TRACE</code></td>
-<td>set</td>
-<td>The type a destructured name takes from its <code>componentN()</code> accessor, or why none was available</td>
-<td><code>[comp]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_INIT_SELF</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a local's own name shadows its initializer's bare call again (<code>val iterator = iterator()</code>). For A/B measurement of that channel from one binary</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_TP_HEAD</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a type-parameter receiver resolves only through a bound that carries no type arguments, so <code>C : MutableCollection&lt;in T&gt;</code> names no owner again</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_EXT_RECV_PROP</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a bare name in a top-level extension's body stops resolving to the extension receiver's property, so it gets no declared type</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_MEMBER_INIT</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a property-read, indexed-read or ALIAS initializer (<code>val node = coord.layoutNode</code>, <code>val held = row[1]</code>, <code>val b = a</code>) stops lending its type to the local</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_RECV_CHAIN</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a member or indexed receiver is typed only from a declared type or a call's return type, never from the type a local's own initializer lends it</td>
 <td>—</td>
 </tr>
 <tr>
@@ -2201,87 +2244,9 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[disproof]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_BARE_EXT</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a bare call in a receiver context resolves only MEMBERS of the implicit receiver — an extension written without <code>this.</code> (<code>toMutableList()</code> in an extension body) stops lending its return type</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_TP_RECV</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a call on a receiver typed by a TYPE PARAMETER (<code>M : MutableMap&lt;in K, MutableList&lt;T&gt;&gt;</code>) stops deriving its return type through the parameter's full upper bound, so the local it initializes loses its type again</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_SOLE_GLOBAL</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a bare call under a receiver context stops lending its return type even when its name has exactly one declaration program-wide</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_FACTORY_PROP</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, only a CONSTRUCTOR call names an un-annotated property's type — a factory call (<code>val made = newBase()</code>) and a constructor PARAMETER (<code>private val held = start</code>) both stop registering a type head</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_NULL_CHAIN</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, only a condition that is itself the whole <code>!= null</code> check narrows — an <code>&amp;&amp;</code> chain and an early-return guard stop smart-casting</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_AGREED_RET</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a bare call whose every top-level declaration agrees on a return type stops lending that agreed return to the local it initializes</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_CTOR_RET</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a direct constructor expression (<code>SlotTable().also { … }</code>) stops naming its own type for the value it produces</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_EAGER_MEMBER</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, the checker's eager extern-call pick stops serving member-call lowering where the lazy engine has no receiver type or no resolver target</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_ENGINE_LAMBDA</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a lambda's declared fn type is no longer instantiated through the one-pass call-binding solve (receiver + typed args + explicit type args)</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_ITC_MEMBER</code></td>
-<td><code>0</code> off, <code>1</code> on (default), or <code>name1,name2</code></td>
-<td>Whether a member the receiver type provably declares commits statically over the <code>OrGlobal</code> fallback; a name list restricts the commit to those calls</td>
-<td>—</td>
-</tr>
-<tr>
 <td><code>KLIO_LAMBDA_REFUTE</code></td>
 <td><code>0</code> to disable</td>
 <td>Off, a lambda argument stops refuting candidates whose parameter names a resolvable non-fun-interface class</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_LAMBDA_RET</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, lambda argument shapes are no longer enriched from the target's declared <code>Function</code>-typed parameters</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_MEMBER_EXT_SPLICE</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a member body's own extension call stops qualifying for the inline splice</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_MEMBER_PROMO</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a deferred member call is never promoted to a static bind by the member-compatible / every-extension-refuted proof</td>
 <td>—</td>
 </tr>
 <tr>
@@ -2297,93 +2262,9 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td>—</td>
 </tr>
 <tr>
-<td><code>KLIO_REFSHAPE</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a callable-reference argument (<code>::f</code>) stops contributing its declaration-read function type to the argument shapes</td>
-<td>—</td>
-</tr>
-<tr>
 <td><code>KLIO_STAR_RET</code></td>
 <td><code>0</code> to disable</td>
 <td>Off, a type parameter still unbound after the receiver and every argument had their chance refuses the whole return instantiation instead of erasing to <code>*</code></td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_SUBST_NONGEN</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a head-only receiver naming a non-generic class stops counting as a complete substitution receiver (<code>SlotWriter.let { … }</code> no longer binds <code>T := SlotWriter</code>)</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_THIS_NARROW</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, an <code>is</code>-narrowed <code>this</code> stops serving as the innermost implicit receiver head for bare calls</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_TOWER_EMIT</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a bare call stops committing statically to an OUTER tower entry's extension through its <code>this@&lt;label&gt;</code> slot</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_TOWER_EXT</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, typing-side bare-call extension resolution stops trying the outer implicit-receiver tower entries when the innermost head serves none</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_TOWER_SCOPE</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a this-capturing lambda or parameter thunk never counts its receiver scope complete through the tower</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_VOWN</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a stub or value-class owner stops emitting its virtual slot and declines to the member-name walk</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_HDR_BOUNDS</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, header-stub type-parameter bounds are not registered at image build, so bare-call resolution loses them</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_HDR_BOUNDS_SKIP</code></td>
-<td><code>&lt;substr&gt;</code></td>
-<td>Skips header-bound registration for functions whose name the value contains — the per-name bisect of <code>KLIO_HDR_BOUNDS</code></td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_HDR_BOUNDS_LIST</code></td>
-<td>set</td>
-<td>Prints each function's registered header bounds as they are put</td>
-<td><code>[hdrb]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_NO_LR_ABSORB</code></td>
-<td>set disables</td>
-<td>Set, an inline body containing <code>return@&lt;fnName&gt;</code> no longer gets the labeled-return absorb region</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_NO_LR_STATIC</code></td>
-<td>set disables</td>
-<td>Set, a <code>return@&lt;inlineFnName&gt;</code> inside a spliced lambda stops resolving statically to the splice frame's join</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_SPLICE_HYG</code></td>
-<td><code>0</code> to disable</td>
-<td>Off, a top-level extension's spliced body resolves in the caller's member scope instead of its own declaration scope</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_SPLICE_PIN</code></td>
-<td>set disables</td>
-<td>Set, a bound-receiver member call inside a splice is no longer pinned to its virtual slot — the per-invocation walk arbitrates again</td>
 <td>—</td>
 </tr>
 <tr>
@@ -2399,34 +2280,10 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[slot-dump]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_ABSVETO_TRACE</code></td>
-<td>set</td>
-<td>Each inline-overload pick vetoed because a member of the receiver chain takes the call instead</td>
-<td><code>[absveto]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_AGREED_TRACE</code></td>
-<td><code>&lt;name&gt;</code> or <code>*</code></td>
-<td>Why the agreed-top-level-return channel accepted or refused the name (top-level usable, enclosing member, class-member namesake, ...)</td>
-<td><code>[agreed]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_ALPT</code></td>
-<td><code>&lt;fn name&gt;</code> (<code>[alpt-site]</code> rows fire on any set value)</td>
-<td>Argument-lambda parameter-type computation for calls of the named target: entry shape, each filled slot, and which emit site asked</td>
-<td><code>[alpt]</code>, <code>[alpt-slot]</code>, <code>[alpt-site]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_APPLIC_TRACE</code></td>
 <td>set</td>
 <td>Candidates the shared applicability scorer refuses: the runtime re-pick's null scores and the named-arm hard-reject site that declined</td>
 <td><code>[pp-null]</code>, <code>[applic-reject]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_BAREARM</code></td>
-<td>set</td>
-<td>The bare-member arm of unresolved bare-call lowering: why it broke (no class id, no <code>this</code> register) and each final miss with file:line</td>
-<td><code>[barearm-break]</code>, <code>[barearm-miss]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_BARG_TRACE</code></td>
@@ -2441,82 +2298,16 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[bcc]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_BINDS_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Whether a bare name binds <code>this</code>: receiver-chain head, hierarchy-shadow completeness, own-member state, and the verdict</td>
-<td><code>[binds]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_CHAN</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Snapshot of every receiver channel at a bare call in receiver context: <code>this</code>-narrow, splice hint and receiver, owner class, <code>this</code> decl, static head</td>
-<td><code>[chan]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_CITR_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Constructor-initializer type derivation for a bare ctor call: the local-class head or the bail reason (local/outer binding, function namesake, no class)</td>
-<td><code>[citr]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_CIX_TRACE</code></td>
 <td><code>&lt;class name&gt;</code></td>
 <td>Scoped class-by-simple-name resolution: each candidate's fqn, package, and tier</td>
 <td><code>[cix]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_CPT_TRACE</code></td>
-<td>set</td>
-<td>Why instantiating a declared receiver typed by a class type parameter declined</td>
-<td><code>[cpt]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_CTORLPT_TRACE</code></td>
-<td>set</td>
-<td>Constructor trailing-lambda parameter typing: the class row's parameter shapes at each ctor call carrying lambda args</td>
-<td><code>[ctorlpt]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_DECLTY_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>The receiver static type a member call of that name resolved against, and whether it came from a declaration or the full deriver</td>
-<td><code>[declty]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_DROP_TRACE</code></td>
 <td><code>&lt;name&gt;</code></td>
 <td>Why each bare-call candidate dropped from the applicable set (form mismatch, low priority, no sig view, inapplicable shape, static-incompatible)</td>
 <td><code>[drop]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_EBM_TRACE</code></td>
-<td>set</td>
-<td>Expression-body member registry register/lookup rows (currently keyed to <code>createOnCancellationAction</code> only)</td>
-<td><code>[ebm]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_EMIT_TRACE</code></td>
-<td><code>&lt;name&gt;</code> or <code>*</code></td>
-<td>Every <code>Call</code>/<code>CallVirtual</code>/<code>CallMember</code>/<code>CallMemberOrGlobal</code> instruction pushed for that simple name, with the resolved target and emitting function</td>
-<td><code>[emit]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_EMIT_STACK</code></td>
-<td>set (needs <code>KLIO_EMIT_TRACE</code>)</td>
-<td>Adds a native stack trace naming the emitting arm at each traced <code>CallMember</code> push</td>
-<td>native stack</td>
-</tr>
-<tr>
-<td><code>KLIO_EXPECT_HDR_TRACE</code></td>
-<td>set</td>
-<td>Each bodyless <code>expect</code>-class member retained as a header row binding its host symbol</td>
-<td><code>[expect-hdr]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_FORVAR_TRACE</code></td>
-<td>set</td>
-<td>Each for-loop variable whose iterable element type could not be derived, so the variable lowers untyped</td>
-<td><code>[forvar]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_GRA_TRACE</code></td>
@@ -2531,54 +2322,6 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[binop-in]</code>, <code>[binop]</code>, <code>[hop]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_IMPLPROP_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>Implicit property-read typing for that name: the bare, guard, implicit-receiver, and member arms with their channel state</td>
-<td><code>[implprop]</code>, <code>[implprop-bare]</code>, <code>[implprop-guard]</code>, <code>[implprop-mem]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LAMINH</code></td>
-<td>set</td>
-<td>The lambda-body declared-type inheritance channel: the pending snapshot each lambda body consumes (an empty pending while the enclosing builder holds records means the records were lost)</td>
-<td><code>[laminh]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LAMRET_TRACE</code></td>
-<td>set</td>
-<td>The lambda-return-directed extension-family pick: the derived return head's winner and the instantiated callee return</td>
-<td><code>[lamret-pick]</code>, <code>[lamret-inst]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LAMRET_WHY</code></td>
-<td><code>&lt;substr of an fqn&gt;</code></td>
-<td>Per-candidate skip reasons in the lambda-return family walk (no body, receiver mismatch, non-fn last param)</td>
-<td><code>[lamret-why]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LAR_TRACE</code></td>
-<td>set</td>
-<td>The lambda-arg declared-receiver record: each put and get keyed by argument span</td>
-<td><code>[lar-put]</code>, <code>[lar-get]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_LFN_TRACE</code></td>
-<td>set</td>
-<td>Local-fn overload selection for bare calls: overload count, the selected mangled cell, applicability, and capture reachability</td>
-<td><code>[lfn]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_NOCLASS_HEADS</code></td>
-<td>set (needs <code>KLIO_DISPATCH_STATS</code>)</td>
-<td>Names each receiver head the census counted as having no class id, with its bound record where one exists</td>
-<td><code>[no-class-head]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_OPTY_TRACE</code></td>
-<td>set</td>
-<td>Indexed-read return typing (<code>a[i]</code> as <code>get</code> on the container): receiver typing and the answer</td>
-<td><code>[opty]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_OVERRIDES_TRACE</code></td>
 <td>set</td>
 <td>Why <code>overridesSlot</code> rejected each (own method, inherited slot) pair: missing sigs, kind/arity mismatch, no ancestor bindings, param-type mismatch</td>
@@ -2587,20 +2330,8 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <tr>
 <td><code>KLIO_PROMO_NAMES</code></td>
 <td>set</td>
-<td>Member-promotion proof verdicts, each <code>PROMOTED</code>/<code>HELD</code> with the refusal reason (the per-candidate <code>[promo-ext]</code> rows also need <code>KLIO_DISPATCH_STATS</code>)</td>
+<td>Member-promotion proof verdicts, each <code>PROMOTED</code>/<code>HELD</code> with the refusal reason</td>
 <td><code>[promo-ext]</code>, <code>[promo-proof]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_REF_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td><code>::name</code> callable-reference lowering state: local-ext detection, receiver context, resolve/capture reachability, and the expected fn type</td>
-<td><code>[ref-trace]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_RENAME_TRACE</code></td>
-<td>set</td>
-<td>Each package-scope type-rename resolution (an <code>internal</code> classifier renamed for its whole package)</td>
-<td><code>[rnm-pkg]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_REX_TRACE</code></td>
@@ -2621,70 +2352,16 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[rmc]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_SCOPEFN_TRACE</code></td>
-<td>set</td>
-<td>The scope-function (<code>let</code>/<code>run</code>/<code>also</code>/<code>apply</code>) return-derivation arm: enter and each bail reason</td>
-<td><code>[scopefn]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_SCORE_TRACE</code></td>
 <td>set</td>
 <td>The applicability scorer's per-argument refusals: parameter vs argument type at each null score</td>
 <td><code>[score-null]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_SCRT_TRACE</code></td>
-<td><code>&lt;name&gt;</code></td>
-<td>The static call-return-type derivation for calls of that name: which channel answered, the explicit-type-arg arm, the agreed-return handoff, and the final answer</td>
-<td><code>[scrt-via]</code>, <code>[scrt-out]</code>, <code>[scrt-path]</code>, <code>[scrt-agreed]</code>, <code>[scrt-target]</code>, <code>[expl]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SIBEXP_TRACE</code></td>
-<td>set</td>
-<td>The sibling-argument expected-type solve: the pushed instantiation or the bail</td>
-<td><code>[sibexp]</code>, <code>[sibexp-inst]</code>, <code>[sibexp-bail]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SIBEXP_WHY</code></td>
-<td><code>&lt;outer fn name&gt;</code></td>
-<td>Per-candidate skip reasons in the sibling-expected solve (receiver untyped, no bindings, result not concrete)</td>
-<td><code>[sibexp-why]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_SMAC_TRACE</code></td>
 <td><code>&lt;fn name&gt;</code></td>
 <td>Static member-args compatibility: entry state and each argument's instantiated-parameter verdict with route</td>
 <td><code>[smac]</code>, <code>[smac-arg]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TLP_TRACE</code></td>
-<td><code>&lt;prop name&gt;</code></td>
-<td>The tiered top-level property type-head lookup: each declaration's package, tier, and head</td>
-<td><code>[tlp]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_VABI_NAMES</code></td>
-<td>set</td>
-<td>Each member call declined off the virtual-slot emit, with the owner's receiver ABI and body state</td>
-<td><code>[vabi]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_VALTY_TRACE</code></td>
-<td><code>&lt;local name&gt;</code></td>
-<td>Property-decl lowering entry state for that local, and every declared-type write recorded under the name</td>
-<td><code>[valty]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_VALTY_STACK</code></td>
-<td>set (needs <code>KLIO_VALTY_TRACE</code>)</td>
-<td>Adds a native stack trace at each declared-type write</td>
-<td>native stack</td>
-</tr>
-<tr>
-<td><code>KLIO_VARARG_TRACE</code></td>
-<td>set (most rows keyed to <code>listOf</code>)</td>
-<td>The sole-trailing-vararg full-instantiation derivation (<code>listOf("a")</code> as <code>List&lt;String&gt;</code>): guards, candidate refusals, and element typing</td>
-<td><code>[vaf-guard]</code>, <code>[vaf-nocands]</code>, <code>[vaf-enter]</code>, <code>[vaf-cand]</code>, <code>[vaf-sole]</code>, <code>[vaf]</code></td>
 </tr>
 </tbody>
 </table>
@@ -2694,52 +2371,32 @@ ways and reports what differs. It skips the twelve examples that never
 terminate (each blocks on a window or event loop at ~0% CPU, at every commit) —
 left in, they cost twice the timeout apiece for no signal and turn a five-minute
 comparison into a three-hour one.</p>
-<p>| <code>KLIO_OPERATOR_TY</code> | <code>0</code> to disable | Off, an indexed read and the <code>times</code>/<code>div</code>/<code>rem</code>/<code>rangeTo</code> operators stop lending their declared return type to a receiver | — |
-| <code>KLIO_GLOBAL_TRACE</code> | <code>&lt;name&gt;</code> | Which arm resolves a global lookup: cached value, function, or intrinsic | <code>[gtrace]</code> |
+<p>| <code>KLIO_GLOBAL_TRACE</code> | <code>&lt;name&gt;</code> | Which arm resolves a global lookup: cached value, function, or intrinsic, with the instance address; a file <code>&lt;clinit&gt;</code> binding the name prints <code>arm=init</code> with the host, its globals scope, the thread and the frames that drove it | <code>[gtrace]</code> |
+| <code>KLIO_CAS_TRACE</code> | set | Every atomicfu <code>AtomicRef.compareAndSet</code>: the atomic, the current and expected values with their addresses, and whether it swapped | <code>[cas]</code> |
 | <code>KLIO_OUTER_TRACE</code> | <code>&lt;substr&gt;</code> | Inner-class enclosing <code>this@Outer</code> selection for IR names containing the substring | <code>[outer]</code> |
-| <code>KLIO_ANON_AUDIT</code> | set | Synthesized class name and captured names at each anonymous-object site | <code>[ANON]</code> |
 | <code>KLIO_REBIND_AUDIT</code> | set | Arity-guess <code>this</code> rebinds during closure invocation | <code>[REBIND]</code> |
-| <code>KLIO_CVNRC</code> | set | A this-less closure invoked on an instance receiver being rebound to <code>callValueWithThis</code> | <code>[cvnrc]</code> |
 | <code>KLIO_TRACE_RESOLVE</code> | <code>name1,name2</code> or <code>*</code> | Per-dispatch decision log for the named function(s) | <code>[RESOLVE]</code> |
-| <code>KLIO_TRACE_CHAIN</code> | set | Adds the enclosing-<code>this</code> chain to each traced dispatch (with <code>KLIO_TRACE_RESOLVE</code>) | <code>[RESOLVE]   chain=</code> |
 | <code>KLIO_TRACE_PATH</code> | set; <code>0</code>/empty off | One structured record per terminal dispatch site (proves single-path dispatch; see <code>scripts/assert_single_path.py</code>) | <code>[PATH]</code> |
 | <code>KLIO_TRACE_INVARIANTS</code> | set; <code>0</code>/empty off | Detect-only dispatch invariant checks, one machine-readable line per violation | <code>[INVARIANT]</code> |
-| <code>KLIO_TRACE_CAPTURE</code> | set | A lambda capture that fails to resolve and collapses to <code>Unit</code> | <code>[CAPTURE]</code> |
-| <code>KLIO_UNRESOLVED_TRACE</code> | set | The unresolved bare name, function, and span just before an <code>Unbound</code> error | <code>[unresolved]</code> |
 | <code>KLIO_INIT_DEBUG</code> | set | <code>object</code>/companion initializer first-failure and the cause take/swallow/restash steps | <code>[init-debug]</code> |
-| <code>KLIO_ANON_BASE</code> | <code>0</code> to disable | Off, anonymous-object synthesis lowers against the empty side module instead of the image-clone, leaving every call in anon bodies name-dynamic | — |
-| <code>KLIO_ANON_PROP</code> | <code>0</code> to disable | Off, an anon object's property type heads are not carried into its member lowerings, so sibling bodies lose their bare property-read types | — |
-| <code>KLIO_BARRIER_TRACE</code> | set | The type-safe collection bridge (erased-bound check on generic members called through an erased signature): each refusal reason | <code>[barrier]</code> |
 | <code>KLIO_CFN_TRACE</code> | <code>&lt;substr of a fn name&gt;</code> | Named-argument call binding: the declared parameter list vs the supplied names, on both the named and the typed entry | <code>[cfn]</code>, <code>[cft]</code> |
-| <code>KLIO_CHAIN_TRACE</code> | set | Enclosing-<code>this</code> chain activation per frame: enter/activate with thread id, frame pointers, and chain base (high volume) | <code>[chain]</code> |
-| <code>KLIO_DCS_TRACE</code> | set | The declaring-class scan for a FuncId — the per-class method walk feeding the owner cache (very high volume) | <code>[dcs]</code> |
 | <code>KLIO_DRAIN_TRACE</code> | set | Each Iterable receiver drained to a list by the collection fallback, with the caller and call-site span | <code>[drain]</code> |
 | <code>KLIO_FASTPLAN_TRACE</code> | <code>&lt;substr of a fn name&gt;</code> | Why a function is ineligible for the monomorphic fast call plan (no body, inline, extension, defaults, sibling overloads, ...) | <code>[fastplan]</code> |
 | <code>KLIO_ITER_TRACE</code> | set | The builtin iterator's <code>next()</code> element kind per call | <code>[iter-next]</code> |
 | <code>KLIO_KTYPE_TRACE</code> | set | Each synthetic <code>KType</code> materialized for a reified type name, with the enclosing function | <code>[ktype]</code> |
 | <code>KLIO_MEOI_TRACE</code> | <code>&lt;owner class&gt;</code> | Member-extension dispatch-receiver selection: the enclosing entries walked and each owner-identity verdict | <code>[meoi]</code> |
-| <code>KLIO_NOINST_TRACE</code> | set | Each virtual slot resolved by member name against the runtime class of a host-backed (non-<code>Instance</code>) receiver | <code>[noinst]</code> |
 | <code>KLIO_PICK_TRACE</code> | <code>&lt;name&gt;</code> | The runtime overload re-pick: the base candidate's applicability score and every sibling's | <code>[pick]</code> |
-| <code>KLIO_QT_TRACE</code> | <code>&lt;substr of a qualifier&gt;</code> | The qualified <code>this@Qualifier</code> receiver walk: each candidate class and the match | <code>[qt]</code> |
 | <code>KLIO_REDIR_TRACE</code> | set | Value-shaped redirect-target resolution among same-arity expect/actual siblings | <code>[redir]</code> |
 | <code>KLIO_RFP_DUMP</code> | set | Dumps every registered receiver-fn-property <code>(receiver, name)</code> pair when the gate masks build | <code>[rfp]</code> |
 | <code>KLIO_ROUTE</code> | <code>&lt;name&gt;</code> | Which runtime arm bound each <code>*OrGlobal</code> execution of that name (member@depth, overload, global-id, global, the fallback variants), plus dispatch-ladder route markers | <code>[route]</code> |
-| <code>KLIO_SLOT_RECV</code> | set (needs <code>KLIO_SLOT_BYNAME</code>) | The slot-byname note prints the receiver's runtime type instead of the slot root | <code>[slot-recv]</code> |
 | <code>KLIO_THIS_TRAP</code> | set | Every frame entry that binds a Bool or Int into a <code>this</code> parameter — the ext-receiver misbind signature — with the caller | <code>[this-trap]</code> |
-| <code>KLIO_VFLAT_TRACE</code> | set | One line per declined virtual flat prepare, with the reason a slot population stays recursive | <code>[vflat]</code> |
 | <code>KLIO_WALK_TRACE</code> | set | Each by-name IR method walk and extension-fallback walk entry, with the receiver and cache-key state | <code>[ir-walk]</code>, <code>[extfb-walk]</code> |</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">KLIO_BARE_TRACE</span><span class="o">=</span>format<span class="w"> </span><span class="nv">KLIO_MISS_TRACE</span><span class="o">=</span>format<span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
 </code></pre></div>
-<h2 id="resolution-audits-and-the-eager-front-end">Resolution audits and the eager front end<a class="headerlink" href="#resolution-audits-and-the-eager-front-end" title="Permanent link">&para;</a></h2>
-<p>The resolver + type checker always run ahead of lowering; their overload
-picks and type heads feed it. There is no switch — <code>KLIO_EAGER</code> was removed
-once validation was identical with and without the evidence. A
-resolver/typeck failure still falls back to AST evidence alone, so a program
-that defeats the front end runs.</p>
-<p>The audit switches emit machine-readable divergence records the
-sweep scripts grep; see
-<a href="../testing/">Testing and verification</a> for the
-<code>resolve_audit_sweep.py</code> cycle.</p>
+<h2 id="resolution-audits">Resolution audits<a class="headerlink" href="#resolution-audits" title="Permanent link">&para;</a></h2>
+<p>The resolver and type checker serve <code>klio check</code>; <code>klio run</code> and <code>klio test</code>
+resolve through sema. The audit switches emit machine-readable records the
+sweep scripts grep.</p>
 <table>
 <thead>
 <tr>
@@ -2763,46 +2420,10 @@ sweep scripts grep; see
 <td><code>[EAGER-REC]</code>, <code>[REC-MSC]</code>, <code>[EAGER-PROBE]</code>, <code>[EAGER-HIT]</code>, <code>[EAGER-MISS2]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_RESOLVE_AUDIT</code></td>
-<td>set (any value, even <code>0</code>, enables)</td>
-<td>One record per bare call / inline target / value ref comparing the symbol index against the order-based heuristic, with a divergence grade</td>
-<td><code>[KLIO_RESOLVE_AUDIT]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_RESOLVE_STRICT</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>Turns an unexplained index-vs-heuristic divergence into a panic instead of a log line</td>
-<td>none (panics)</td>
-</tr>
-<tr>
-<td><code>KLIO_OR_AUDIT</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>Member-vs-global audit: each <code>*OrGlobal</code> emission decision and the runtime arm that actually bound (<code>scripts/or_audit_sweep.py</code> asserts the lenient-arm residue)</td>
-<td><code>[KLIO_OR_AUDIT]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_LINK_AUDIT</code></td>
 <td>set (any value enables)</td>
 <td>Re-derives what the deleted per-call dispatch ladder would have chosen and logs any disagreement with the link-settled tables</td>
 <td><code>[KLIO_LINK_AUDIT]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_RECVHEAD_AUDIT</code></td>
-<td>set</td>
-<td>Whether the type checker's recorded receiver-lambda head can answer the membership walk</td>
-<td><code>[RECVHEAD-AUDIT]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TYPEHEAD_AUDIT</code></td>
-<td>set</td>
-<td>The type checker's per-argument type head vs the AST-derived declared type (fills and disagreements)</td>
-<td><code>[TYPEHEAD-FILL]</code>, <code>[TYPEHEAD-AUDIT]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_DECL_AUDIT</code></td>
-<td><code>1</code></td>
-<td>Completeness audit of the no-holes symbol table after the run: every intrinsic FQN paired with whether the module declares it, tallied per package with hole samples. Program-scoped — the lazy IR only declares what the program reached, so the number is a lower bound</td>
-<td><code>[decl-audit]</code></td>
 </tr>
 </tbody>
 </table>
@@ -2810,6 +2431,70 @@ sweep scripts grep; see
 ignores it: there is only one pipeline, so <code>both</code> just runs the corpus
 twice and reports any run-to-run divergence (useful for catching
 nondeterminism, not modes).</p>
+<h2 id="sema-and-the-resolved-pipeline">Sema and the resolved pipeline<a class="headerlink" href="#sema-and-the-resolved-pipeline" title="Permanent link">&para;</a></h2>
+<p><code>klio run</code> and <code>klio test</code> run the symbol-identity front end (<code>src/sema</code>),
+the bridge and lowering from sema's records; <code>klio sema</code> runs the front end
+alone and reports its census.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Values</th>
+<th>What it shows/does</th>
+<th>Output tag</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KLIO_SEMA_TRACE</code></td>
+<td><code>&lt;name&gt;</code></td>
+<td>Every candidate a call named <code>&lt;name&gt;</code> considers, level by level, and why each is rejected</td>
+<td><code>[sema-trace]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SEMA_TIMING</code></td>
+<td>set</td>
+<td>Milliseconds per step of a sema-pipeline run: load and parse, collect, headers, bodies, records, bridge, lowering, execution</td>
+<td><code>[sema-timing]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_LOWER_FINGERPRINT</code></td>
+<td>set</td>
+<td>One line per body the build lowered: its id, block, instruction and register counts, and a hash of its blocks by value (<code>[fn]</code>). Two builds that lower alike print the same file: the check for a change to lowering meant to leave the IR as it was</td>
+<td><code>[fn]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SEMA_TABLES</code></td>
+<td>set</td>
+<td>Once bodies are resolved, the size and capacity of each table the analysis keeps (records, expression types, types, symbols, the memos), the nodes analyzed, and the most working memory one declaration's resolution took (<code>scratch high</code>)</td>
+<td><code>[sema-tables]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_CHECK_BASE</code></td>
+<td><code>1</code></td>
+<td>As <code>KLIO_CHECK_PACKS</code>, over the base set (the stdlib and klio's actuals): with <code>scripts/sema-census.py</code>, a <code>type_mismatch</code> site there is a false positive of the type checks, or klio-authored code kotlinc would refuse</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_CHECK_PACKS</code></td>
+<td><code>1</code></td>
+<td>Also runs the declaration, annotation and use checks (<code>declcheck</code>, <code>annocheck</code>, <code>usecheck</code>) over the installed packs' sources, which kotlinc compiled: a finding there is a false positive to fix, or klio-authored code kotlinc would refuse. The pack checks see no module <code>-opt-in</code> or <code>@file:Suppress</code>, so <code>use</code> sites there are noise</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_SEMA_PIPELINE_BASE</code></td>
+<td>set</td>
+<td>Also prints the base's lowering failures, which a run otherwise only counts</td>
+<td><code>[base]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SEMA_IMAGE</code></td>
+<td><code>0</code> off</td>
+<td>The base image: a run loads the base's bridge and lowered bodies from <code>$KLIO_HOME/.klio/cache/sema-base-&lt;key&gt;.klio-sema</code>, else from the copy the build installed under <code>share/klio/cache</code> beside the binary (baked on a miss, keyed by the binary and every base file's path and text), and analyzes and lowers only the program; <code>0</code> analyzes and lowers the base in every run</td>
+<td>none</td>
+</tr>
+</tbody>
+</table>
 <h2 id="errors-throws-and-hangs">Errors, throws, and hangs<a class="headerlink" href="#errors-throws-and-hangs" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -2830,7 +2515,7 @@ nondeterminism, not modes).</p>
 <tr>
 <td><code>KLIO_THROW_TRACE</code></td>
 <td>set</td>
-<td>One line per exception as it is thrown (including failed casts that raise without a <code>Throw</code>)</td>
+<td>One line per exception as it is thrown (including failed casts that raise without a <code>Throw</code>, which name the class of the value and the receiver in <code>r0</code> with its address)</td>
 <td><code>[throw-trace]</code></td>
 </tr>
 <tr>
@@ -2864,9 +2549,15 @@ nondeterminism, not modes).</p>
 <td>native backtrace</td>
 </tr>
 <tr>
+<td><code>KLIO_FAULT_INJECT</code></td>
+<td><code>internal-error@&lt;fqn&gt;</code></td>
+<td>A test knob: calling the function with that qualified name (<code>trigger</code>, <code>demo.trigger</code>) raises the internal error "injected internal error in <code>&lt;fqn&gt;</code>" instead of running it, for the tests of the paths that handle one (<code>tl_dispatched_internal_error_fails_run</code> sets it through its <code>//&gt;env</code> line)</td>
+<td>none</td>
+</tr>
+<tr>
 <td><code>KLIO_MAX_EVAL_DEPTH</code></td>
-<td>number (default 2000)</td>
-<td>Caps interpreter recursion depth; on breach returns a catchable <code>StackOverflow</code> instead of faulting the native stack</td>
+<td>number (default 100000)</td>
+<td>Caps interpreter recursion depth; a call past it throws <code>java.lang.StackOverflowError</code>, which Kotlin code catches. A call the host makes back into Kotlin also throws it when the native stack is down to its reserve, whatever the depth</td>
 <td>none</td>
 </tr>
 <tr>
@@ -2899,8 +2590,8 @@ nondeterminism, not modes).</p>
 <tr>
 <td><code>KLIO_PUMP_DIAG</code></td>
 <td>set</td>
-<td>The cooperative pump: loop/slot/parked dumps, the park/adopt/persist/take token lifecycle, stalled-pump dumps, idle-streak and exit-time sleep attribution</td>
-<td><code>[PUMP]</code>, <code>[tok]</code>, <code>[pump-streak]</code>, <code>[wall-timer]</code>, <code>[pump-sleep]</code></td>
+<td>The cooperative pump: loop/slot/parked dumps, the park/adopt/persist/take token lifecycle, stalled-pump dumps, idle-streak and exit-time sleep attribution, and the timer thread's posts and takes</td>
+<td><code>[PUMP]</code>, <code>[tok]</code>, <code>[pump-streak]</code>, <code>[wall-timer]</code>, <code>[pump-sleep]</code>, <code>[timer]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_RESUME_TRACE</code></td>
@@ -2956,8 +2647,8 @@ nondeterminism, not modes).</p>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>HangingTest.kt
 </code></pre></div>
 <h2 id="compose-plugin">Compose plugin<a class="headerlink" href="#compose-plugin" title="Permanent link">&para;</a></h2>
-<p>The <code>@Composable</code> lowering plugin + upstream engine runtime is the only compose
-path — it always runs. These knobs bisect its two emissions.</p>
+<p>The <code>@Composable</code> lowering (<code>ir/lower/sema/compose.zig</code>) and the upstream
+engine runtime are the only compose path; the lowering always runs.</p>
 <table>
 <thead>
 <tr>
@@ -2968,12 +2659,6 @@ path — it always runs. These knobs bisect its two emissions.</p>
 </tr>
 </thead>
 <tbody>
-<tr>
-<td><code>KLIO_COMPOSE_DBG</code></td>
-<td>set</td>
-<td>One activation summary line (oracle sizes) plus group-emission debug inside the pass</td>
-<td><code>[compose-pass]</code></td>
-</tr>
 <tr>
 <td><code>KLIO_COMPOSER_BIND_TRACE</code></td>
 <td>set</td>
@@ -2987,28 +2672,76 @@ path — it always runs. These knobs bisect its two emissions.</p>
 <td><code>[rss]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_FJ_ESCAPE</code></td>
-<td><code>1</code> enables</td>
-<td>Lets a compiled body call back into the interpreter for one instruction instead of declining the whole function. Off: it widened acceptance with execution time unchanged, because an escaped instruction costs what the interpreter would have</td>
-<td>—</td>
-</tr>
-<tr>
-<td><code>KLIO_FJ_SELF_INLINE</code></td>
-<td><code>0</code> disables</td>
-<td>The whole-function tier splices a self call (<code>this.helper(...)</code>) whose callee is scalar control flow over its own registers, reading and writing <code>this</code> only through the field sites. On by default: the receiver Move such a call needs is otherwise what makes the whole method uncompilable</td>
-<td><code>[jit] inlining self-call</code></td>
-</tr>
-<tr>
-<td><code>KLIO_FJ_DIRECT</code></td>
-<td><code>0</code> disables</td>
-<td>A self call the splice cannot take goes STRAIGHT into the callee's compiled code — a deopt-free method body over the same receiver, so no frame, no boxing, no host callback. On by default; without it such a call is a trampoline site, which also costs the caller its frameless seam</td>
-<td><code>[jit] direct call</code></td>
-</tr>
-<tr>
 <td><code>KLIO_CTOR_TRACE</code></td>
 <td>set</td>
 <td>Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call</td>
 <td><code>[ctor]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_CTOR_PICK_SERVE</code></td>
+<td><code>0</code> disables</td>
+<td>Whether a construction takes the constructor its site named. Off with the pass still on measures the pass without serving it</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TC_OWN_MEMBER</code></td>
+<td><code>0</code> disables</td>
+<td>The checker resolving a bare name against an enclosing class's members before giving up on it</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_CALL_UNRES</code></td>
+<td>set</td>
+<td>Which exit of the call checker returns an unnameable type, by source line, plus the callee shape at its last exit</td>
+<td><code>[CALL-UNRES]</code>, <code>[CALL-TAIL]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_CALL_UNRES_NAMES</code></td>
+<td>set</td>
+<td>With the above: the callee name at each last-exit give-up</td>
+<td><code>[CALL-TAIL]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_DISPATCH_HANDOFF</code></td>
+<td><code>0</code> disables</td>
+<td>A <code>Dispatchers.Default</code>/<code>IO</code> dispatch from a non-worker thread waits, bounded and only when the pool was idle, for a worker to pick the task up and run it to its first suspension. Without it a <code>launch</code> followed by <code>yield()</code> and a cancel finds a child whose body never ran</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TC_FIXPOINT</code></td>
+<td><code>&lt;n&gt;</code> extra body passes</td>
+<td>Re-check every body <code>n</code> more times with reporting off, so a body can use what the first pass learned. Off by default: it converges after ONE extra pass for 2 007 more type heads and 27 fewer unresolved sites, at 16% of the cold build</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TC_&lt;NAME&gt;</code></td>
+<td><code>0</code> disables</td>
+<td>One checker capability, for bisection: <code>EXTERN</code> (image class members), <code>TOPFN</code> (image top-level functions), <code>GENERIC</code> (receiver substitution), <code>RECV</code> (receiver constraints in inference), <code>LAMBDA</code> (lambdas checked inside inference), <code>CTOR</code> (constructor overload sets), <code>TOPPROP</code> (top-level property type inference), <code>MEMBERFB</code> (member receiver class fallback), <code>INFIX</code>, <code>COMPANION</code>, <code>LOSSY</code>/<code>LOSSYRH</code>/<code>CLONERH</code> (generic and receiver heads on converted types), <code>PERMISSIVE</code> (subtyping of unrelated heads), <code>PKGROOT</code> (a qualified path's head must be a known package root before it reads as package-qualified)</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_TYPE_TRACE</code></td>
+<td>set</td>
+<td>One row per type the checker records, by span</td>
+<td><code>[type]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_INFER_TRACE</code></td>
+<td>set</td>
+<td>Each receiver constraint and solved variable of a generic call's inference session</td>
+<td><code>[infer]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_EXTERN_TRACE</code></td>
+<td><code>&lt;Class&gt;</code></td>
+<td>The class info the checker imports from the image for that class: type parameters, typed supertypes, member types</td>
+<td><code>[extern-class]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_FILE_IDS</code></td>
+<td>set</td>
+<td>Every file id the front end assigns with its path, so a <code>f&lt;id&gt;:&lt;start&gt;-&lt;end&gt;</code> span in any trace can be read</td>
+<td><code>[file]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_RUN_STATS</code></td>
@@ -3018,9 +2751,6 @@ path — it always runs. These knobs bisect its two emissions.</p>
 </tr>
 </tbody>
 </table>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">      </span><span class="c1"># plugin lowering</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">   </span><span class="c1"># bisect the skip calculus</span>
-</code></pre></div>
 <h2 id="compose-ui-and-skia">Compose UI and Skia<a class="headerlink" href="#compose-ui-and-skia" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -3035,13 +2765,7 @@ path — it always runs. These knobs bisect its two emissions.</p>
 <tr>
 <td><code>KLIO_SKIA_LIB</code></td>
 <td>path</td>
-<td>The Skia shim library to load at runtime (first in the search order) and to embed when bundling</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_SKIA_GPU</code></td>
-<td>set</td>
-<td>Requests a GPU (Ganesh+EGL) surface for offscreen render; falls back to raster on failure</td>
+<td>The Skia shim library to load at runtime (first in the search order) and to embed when bundling. A shim that is there but does not load says why on stderr (<code>klio: the Skia shim at ... did not load (&lt;the loader's reason&gt;)</code>, or the symbol it lacks) and rendering is headless</td>
 <td>none</td>
 </tr>
 <tr>
@@ -3053,8 +2777,68 @@ path — it always runs. These knobs bisect its two emissions.</p>
 <tr>
 <td><code>KLIO_SKIA_DUMP</code></td>
 <td>path</td>
-<td>Writes the first presented GPU frame to the given PNG path (Metal builds)</td>
+<td>Writes a window's presented frame to the given PNG path (the first, or the <code>KLIO_SKIA_DUMP_AT</code>-th), GPU or raster, on every backend; an SDL window's frame includes its drawn menu bar and open menus. A path with <code>%d</code> writes every presented frame, numbered from 1 (<code>frame-%d.png</code>)</td>
 <td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_CLIPBOARD</code></td>
+<td><code>system</code>, <code>private</code>, <code>none</code></td>
+<td>The clipboard <code>klio.datatransfer.systemClipboard()</code> answers with, which Compose's <code>LocalClipboard</code> uses: the host's (the default; none where the host has none), one of the program's own that nothing outside it reads or changes (the test runners set this), or none, as a headless desktop has</td>
+<td><code>system</code></td>
+</tr>
+<tr>
+<td><code>KLIO_A11Y</code></td>
+<td><code>1</code></td>
+<td>Turns a window's accessibility on from its first frame, as a screen reader reading it does: the program sends its semantics to the platform's accessibility API (NSAccessibility, UI Automation, AT-SPI through ATK). A scripted input with an <code>a11y</code> event turns it on too</td>
+<td>off until an assistive client reads the window</td>
+</tr>
+<tr>
+<td><code>KLIO_SYSTEM_THEME</code></td>
+<td><code>light</code>, <code>dark</code>, <code>unknown</code></td>
+<td>The system theme skiko's <code>currentSystemTheme</code> reports, so <code>isSystemInDarkTheme()</code> answers it, in place of the host's (macOS: its interface style; Windows: whether apps use the light theme; elsewhere unknown). The test runners set <code>light</code></td>
+<td>the host's</td>
+</tr>
+<tr>
+<td><code>KLIO_URI_OPENER</code></td>
+<td>program</td>
+<td>The program Compose's <code>LocalUriHandler</code> runs with a URI to open it, in place of the platform's (<code>open</code> on macOS, <code>xdg-open</code> on Linux, the URL protocol handler on Windows); <code>openUri</code> throws when it exits non-zero or cannot start</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_LOCALE</code></td>
+<td>language tag</td>
+<td>Compose's <code>Locale.current</code>, as <code>-Duser.language</code>/<code>-Duser.country</code> set the JVM's default; unset, it is the host's (macOS: the first preferred language with the current region; Windows: the user's UI language; elsewhere LC_ALL, LC_MESSAGES or LANG). The test runners set <code>en-US</code></td>
+<td>the host's</td>
+</tr>
+<tr>
+<td><code>KLIO_MENU_DUMP</code></td>
+<td><code>1</code></td>
+<td>Prints a window's menu bar (native, or the one an SDL window draws) or a tray's menu on stderr each time it changes (<code>[menu]</code> lines: titles, disabled items, checked states, key equivalents), each item icon set, and each tray notification</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_SCRIPT_TRACE</code></td>
+<td>set</td>
+<td>Scripted window input (<code>KLIO_WIN_INPUT</code>) as it is taken: each window's poll that queued events, when, and how many, and the frame each window presented after them</td>
+<td><code>[script]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SKIA_DUMP_AT</code></td>
+<td>n</td>
+<td>Which presented frame <code>KLIO_SKIA_DUMP</code> writes, counting from 1</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_WIN_INPUT</code></td>
+<td>path</td>
+<td>Scripted window input: a file of events (<code>&lt;when&gt; move/press/release/scroll/key/text/focus ...</code>, described in <code>src/compose_ui/window_events.h</code>) queued on a window at its n-th event poll, or <code>&lt;t&gt;ms</code> after the first poll of any window (one timeline for every window), as if its platform sent them; a key given <code>menu</code> carries the platform's menu shortcut modifier (Command on macOS, Control elsewhere); <code>&lt;when&gt; menu File/Open</code> chooses a menu bar item by its titles' path, through the menu as a click does; <code>&lt;when&gt; menushow File/Open</code> opens an SDL window's drawn menus down to the item and leaves them open, for frame dumps (native menu bars ignore it); <code>&lt;when&gt; close</code> is the window's close button; <code>&lt;when&gt; tray action</code> and <code>&lt;when&gt; tray menu Quit</code> click a tray icon and choose its menu's items (a tray counts its own polls and time); <code>&lt;when&gt; compose &lt;text&gt;</code> and <code>&lt;when&gt; commit &lt;text&gt;</code> are the input method's composing and committed text; <code>&lt;when&gt; a11y dump</code> prints the window's accessibility tree as the platform's accessibility API exposes it, and <code>&lt;when&gt; a11y press &lt;name&gt;</code>, <code>a11y focus &lt;name&gt;</code>, <code>a11y value &lt;name&gt;=&lt;text&gt;</code> and <code>a11y increment &lt;name&gt;</code> ask through that API as a screen reader does; <code>&lt;when&gt; cursor</code> prints the cursor the window shows; <code>&lt;when&gt; drop &lt;x&gt; &lt;y&gt; text &lt;text&gt;</code> and <code>&lt;when&gt; drop &lt;x&gt; &lt;y&gt; files &lt;path&gt;|&lt;path&gt;</code> are another application's drag entering at the point and dropping there, offering copy and move. The windows take timed events in the order they fall due, and each window's next events wait until the program has shown the effect of the last ones any window took (a frame presented, or the window loop settled with nothing left to do). A scripted press drags within the window (a real press drags through the platform). A script with pointer events is the windows' only pointer input, and one with a focus event their only focus changes: the real pointer and focus do not reach them. The example runners set it for an example with a <code>&lt;name&gt;.input</code> beside it</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_XDND_TRACE</code></td>
+<td>set</td>
+<td>X11 windows' drag and drop: each XDND message a window sends and hears, the data asked for and whether it was served, each drag a window starts and the action it ended with</td>
+<td><code>[xdnd]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_SKIA_FONT</code></td>
@@ -3082,7 +2866,7 @@ path — it always runs. These knobs bisect its two emissions.</p>
 </tr>
 </tbody>
 </table>
-<h2 id="performance-profile-jit-and-profiler">Performance profile, JIT, and profiler<a class="headerlink" href="#performance-profile-jit-and-profiler" title="Permanent link">&para;</a></h2>
+<h2 id="performance-profile-and-profiler">Performance profile and profiler<a class="headerlink" href="#performance-profile-and-profiler" title="Permanent link">&para;</a></h2>
 <p>The profile itself (<code>--opt</code> / <code>KLIO_OPT</code>) is documented in
 <a href="../../architecture/performance/">Performance</a>; the granular
 variables override individual fields on top of it.</p>
@@ -3099,13 +2883,7 @@ variables override individual fields on top of it.</p>
 <tr>
 <td><code>KLIO_OPT</code></td>
 <td><code>fast</code>/<code>safe</code>/<code>off</code> (aliases: <code>full</code>, <code>on</code>, <code>balanced</code>, <code>none</code>, <code>interp</code>)</td>
-<td>Selects the performance profile: JIT tiers plus memory backend. <code>klio run</code> defaults to <code>fast</code>, <code>klio test</code> to <code>safe</code></td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_JIT</code></td>
-<td><code>1</code> on, <code>0</code> off</td>
-<td>Loop-tier JIT override on top of the profile (on by default under <code>fast</code>)</td>
+<td>Selects the performance profile, which picks the memory backend: <code>fast</code> and <code>safe</code> the tracing collector, <code>off</code> an arena</td>
 <td>none</td>
 </tr>
 <tr>
@@ -3115,52 +2893,10 @@ variables override individual fields on top of it.</p>
 <td>none</td>
 </tr>
 <tr>
-<td><code>KLIO_FLAT_VCALL</code></td>
-<td><code>0</code> off (default on)</td>
-<td>The fused virtual flat path; <code>0</code> keeps slot-bound and lowering-resolved member calls on the recursive invoker (bisect)</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_MEMBER_SITE</code></td>
-<td><code>0</code> off (default on)</td>
-<td>The <code>CallMember</code> instruction-site memo — the by-name replay path; <code>0</code> disables for bisection</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_NATIVE_TRACE</code></td>
-<td>set</td>
-<td>In a transpiled binary (<code>klio transpile</code> + libklio_rt): one line per native activation with its entry block and outcome, plus a miss line for user-package functions with no (or an fqn-guarded) native table entry — the engagement oracle: output parity alone cannot distinguish native execution from silent fallback to interpretation</td>
-<td><code>[native]</code>, <code>[native-miss]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_CM_TRACE</code></td>
-<td><code>&lt;member name&gt;</code></td>
-<td>At every CallMember execution of that name: the executing frame, whether lowering resolved it, and the full enclosing-<code>this</code> chain with entry kinds — the receiver-visibility debugger for member-extension dispatch</td>
-<td><code>[cmarm]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_GF_TRACE</code></td>
-<td><code>&lt;substr of a field name&gt;</code></td>
-<td>Every GetField execution whose field name matches: field, receiver class, executing frame — pairs with <code>KLIO_CM_TRACE</code> to separate a wrong read from a wrong dispatch</td>
-<td><code>[gfarm]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_RSEL_TRACE</code></td>
 <td>set</td>
 <td>Every compatibility receiver re-selection at a receiver-lambda invoke: the recorded head, the passed receiver, and what was selected</td>
 <td><code>[rsel]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_FUNC_JIT</code></td>
-<td><code>1</code> on, <code>0</code> off</td>
-<td>Whole-function JIT override; turning it on also forces the loop tier on</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_JIT_DEBUG</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>Per-decision JIT tracing: compile, bail, inline, evict</td>
-<td><code>[jit]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_RECLAIM</code></td>
@@ -3171,7 +2907,7 @@ variables override individual fields on top of it.</p>
 <tr>
 <td><code>KLIO_PROF</code></td>
 <td>set; value = sampling interval in microseconds (default 1000, floor 100)</td>
-<td>Statistical SIGPROF profiler; prints a by-function sample histogram to stderr at the end of the run (Linux)</td>
+<td>Statistical SIGPROF profiler on Linux and macOS; prints a by-function sample histogram to stderr at the end of the run. On macOS the in-process symbolizer resolves nothing: dump raw addresses with <code>KLIO_PROF_RAW</code> and fold them with <code>scripts/prof_symbolize.py</code>. The timer is per process, so a phase on ten threads is undercounted; the shares within a phase still hold</td>
 <td><code>[prof]</code></td>
 </tr>
 <tr>
@@ -3185,6 +2921,12 @@ variables override individual fields on top of it.</p>
 <td><code>&lt;substr&gt;</code></td>
 <td>After the histogram, folds the callers of every sampled leaf whose name contains the substring</td>
 <td><code>[prof]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_PROF_RAW</code></td>
+<td><code>&lt;n&gt;</code> (needs <code>KLIO_PROF</code>)</td>
+<td>Prints the n most sampled addresses folded by address, phase and caller (the link register on arm64, so a leaf such as memcpy names who called it), after the phase table and the handler's own address for sliding. Every lowering pass, bake step and cold-run step marks a phase</td>
+<td><code>[prof-raw]</code>, <code>[prof-phase]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_OP_PROF</code></td>
@@ -3207,7 +2949,7 @@ variables override individual fields on top of it.</p>
 <tr>
 <td><code>KLIO_CALL_STATS</code></td>
 <td>set</td>
-<td>Counts every interpreted function invocation by FQN over the whole run; <code>klio test</code> prints the top entries after the summary. The workload census that separates "slow per call" from "more calls than the reference would make" (missed skipping, repeated recompose, un-inlined accessors)</td>
+<td>Counts every interpreted function invocation by FQN over the whole run; <code>klio run</code> and <code>klio test</code> print the top entries after the program. The workload census that separates "slow per call" from "more calls than the reference would make" (missed skipping, repeated recompose, un-inlined accessors)</td>
 <td><code>[call-stats]</code></td>
 </tr>
 <tr>
@@ -3218,14 +2960,166 @@ variables override individual fields on top of it.</p>
 </tr>
 <tr>
 <td><code>KLIO_DUMP_FN</code></td>
-<td><code>&lt;name&gt;</code> or a numeric FuncId</td>
-<td>Prints the named function's lowered instruction stream the first time it runs (and its block table at startup) — the only way to see what an emit path produced for a body inside a baked pack</td>
-<td><code>[dumpfn]</code></td>
+<td>a simple name, a qualified name, or <code>#&lt;FuncId&gt;</code> (the frame and fill censuses print ids)</td>
+<td>Prints the named function's lowered instructions the first time it runs, every operand (<code>rN</code> registers, <code>bN</code> blocks) with each block's catch and finally handlers and its terminator's targets — the only way to see what an emit path produced for a body inside a baked base</td>
+<td><code>[dump-fn]</code></td>
 </tr>
 </tbody>
 </table>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">KLIO_PROF</span><span class="o">=</span><span class="m">500</span><span class="w"> </span><span class="nv">KLIO_PROF_CALLERS</span><span class="o">=</span>append<span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>bench.kt
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nv">KLIO_PROF</span><span class="o">=</span><span class="m">500</span><span class="w"> </span><span class="nv">KLIO_PROF_CALLERS</span><span class="o">=</span>append<span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>bench.kt
 </code></pre></div>
+<h2 id="the-jit">The JIT<a class="headerlink" href="#the-jit" title="Permanent link">&para;</a></h2>
+<p>The baseline JIT (<code>plans/jit.md</code>, <code>src/ir/eval/baseline.zig</code>) and its
+optimizing loop tier (<code>plans/jit-opt.md</code>) are on for <code>klio run</code> and bundled
+apps, on AArch64 and x86-64, and off for every other command (<code>klio test</code>,
+the harness's in-process runs) unless <code>KLIO_JIT</code> turns them on; <code>KLIO_JIT=0</code>
+or <code>KLIO_JIT_OPT=0</code> turns them off anywhere. <code>zig build</code> forwards <code>KLIO_JIT</code>,
+<code>KLIO_JIT_THRESHOLD</code>, <code>KLIO_JIT_MIN_NATIVE</code>, <code>KLIO_JIT_INLINE</code> and
+<code>KLIO_OPT</code> to the itests.</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Values</th>
+<th>What it shows/does</th>
+<th>Output tag</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>KLIO_JIT</code></td>
+<td><code>0</code> off, anything else on (default on for <code>klio run</code> and bundled apps, off otherwise)</td>
+<td>Compiles a function once its entries and loop edges reach the threshold</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_THRESHOLD</code></td>
+<td>number (default 10000)</td>
+<td>Entries plus back edges before a function compiles; <code>0</code> compiles every function at its first entry, as the JIT gate runs</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_MIN_NATIVE</code></td>
+<td>percent (default 70)</td>
+<td>A function whose ops (its loops' ops, when it has loops) compile natively below this share is declined; <code>0</code> compiles every function</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_INLINE</code></td>
+<td><code>0</code> off (default on)</td>
+<td>Callees compiled in place into their callers</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_INLINE_WORDS</code></td>
+<td>number (default 250)</td>
+<td>The largest callee, in stream words, compiled in place</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_EXITS</code></td>
+<td>number (default 1000), <code>0</code> never</td>
+<td>Runs of one exit from a callee compiled in place (an op the callee does not run there, which gives the callee and its callers' callees their frames) after which that callee is called rather than compiled in place anywhere, and the function the code was compiled from compiles again with it as a call. <code>KLIO_JIT_STATS</code> counts the callees (<code>exits_hot=</code>) and <code>KLIO_JIT_CENSUS</code> names the calls (<code>leaves often</code>); <code>0</code> keeps every callee in place however often it leaves, for A/B timing</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_KINDS</code></td>
+<td><code>0</code> off</td>
+<td>Compiled code checks every register's tag, as though no register's kind were known (bisect a wrong kind)</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_PINS</code></td>
+<td><code>0</code> off</td>
+<td>No loop keeps registers in machine registers (bisect a wrong pin); <code>KLIO_JIT_STATS</code> counts the registers kept (<code>pinned=</code>)</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_NATIVE</code></td>
+<td><code>0</code> off</td>
+<td>Every op compiles as a call of its handler (bisect a native op against its handler)</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_DIRECT</code></td>
+<td><code>0</code>, <code>shared</code></td>
+<td>By default a call compiled code does not run in place, to a callee its site keeps (a virtual call's behind a check of the receiver's class), opens the callee's frame and goes on in its code with no call handler between: in shared code (<code>directCall</code>), or for a function's call of itself, at its direct entry, the same work compiled with the function (<code>direct=</code> in <code>KLIO_JIT_STATS</code> counts the sites). <code>shared</code> gives no function a direct entry; <code>0</code> sends every such call through the call's handler. Both are for A/B timing and for bisecting a fault to a path</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_ENTRIES</code></td>
+<td><code>0</code> off</td>
+<td>Only loop edges count toward compiling</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_SKIP</code></td>
+<td>op names, comma-separated</td>
+<td>Those ops compile as their handlers (bisect one op)</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_ONLY</code></td>
+<td><code>lo-hi</code></td>
+<td>Only functions whose id (the <code>#</code> <code>KLIO_JIT_LOG</code> prints) is in that range compile (bisect one function)</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_STATS</code></td>
+<td>set</td>
+<td>At exit: compiled, recompiled, declined and failed functions, callees in place, code bytes and compile time; the loops the optimizing tier compiled, refused, and kept values of in stack slots</td>
+<td><code>[jit]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_LOG</code></td>
+<td>set</td>
+<td>Every function as it compiles, and the callees it compiles in place</td>
+<td><code>[jit]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_DUMP</code></td>
+<td>a function id</td>
+<td>That function's streams as it compiles</td>
+<td><code>[jit]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_DUMP_CODE</code></td>
+<td>set, with <code>KLIO_JIT_DUMP</code></td>
+<td>That function's machine code as hex, 32 bytes a line at its offset, and each op's offset in it, which <code>scripts/jit-disasm.py</code> disassembles</td>
+<td><code>[jit-code]</code>, <code>[jit-op]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_MAP</code></td>
+<td>set</td>
+<td>One line per op's entry address in each compiled function, then where each op's own code starts (<code>slow:at:&lt;op&gt;</code>), where each op of a callee compiled in place starts, named by the callee (<code>slow:in:&lt;op&gt;</code>), each way out of the code (<code>slow:handler:</code>, <code>slow:exit:</code>, <code>slow:stale:</code>, <code>slow:fill:</code> by the op it leaves at), and the function's direct entry (<code>slow:direct:</code>), to attribute samples of compiled code to the op that ran</td>
+<td><code>[jitmap]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_OPT</code></td>
+<td><code>0</code> off, anything else on (default on where the JIT is on by default)</td>
+<td>A compiled function's innermost loops compile a second time over values in machine registers (<code>plans/jit-opt.md</code>), where the tier takes every op of the loop and of the callees it takes in place; <code>KLIO_JIT_LOG</code> names each loop taken or refused and why</td>
+<td><code>[opt]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_OPT_DUMP</code></td>
+<td>set</td>
+<td>Each compiled function's innermost loops as the optimizing tier's graphs, or why each was refused</td>
+<td><code>[opt]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_OPT_EXITS</code></td>
+<td>set</td>
+<td>At exit (with <code>KLIO_JIT_STATS</code>): per optimized loop, how often each of its exits ran and how often its entry checks failed, by the op each exit resumes at</td>
+<td><code>[opt-exit]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_JIT_CENSUS</code></td>
+<td>set, or <code>all</code></td>
+<td>At exit: the ops left to their handlers in compiled and declined functions, what kept callees from compiling in place, and, counted as they run, the calls, host functions and instruction arms compiled code still reaches and why; the busiest 60 sites, or every one with <code>all</code></td>
+<td><code>[jit-census]</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="memory-gc-allocators-and-leak-tracking">Memory: GC, allocators, and leak tracking<a class="headerlink" href="#memory-gc-allocators-and-leak-tracking" title="Permanent link">&para;</a></h2>
 <p>The <code>KLIO_GC_*</code> family, <code>KLIO_GC_ALLOC</code>, <code>KLIO_LEAK_BY_FQN</code>, and the
 slab tracers take effect only when the run uses the tracing GC
@@ -3243,8 +3137,44 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <tr>
 <td><code>KLIO_GC_DEBUG</code></td>
 <td>set; <code>0</code>/empty off</td>
-<td>One summary line per collection: epoch, kind (minor/major), marked, live bytes, freed</td>
-<td><code>[kgc]</code></td>
+<td>One line per collection: epoch, kind (<code>minor</code>, <code>major</code>, and for a spanning major <code>initial</code>, <code>slice</code>, <code>remark</code>), cells marked, live, freed, and the phase times (<code>mark_us</code>, <code>sweep_us</code>, <code>stop_us</code> for the rendezvous, <code>pause_us</code> from the raise to the release), the other mutators stopped, where the sweep ran (<code>sweep=pause</code> or <code>sweeper</code>), and a minor mark's split: <code>roots_us</code>, <code>rem_us</code> for retracing the remembered set, and what it retraced (<code>rem_whole</code> cells whole, <code>rem_spans</code> index ranges over <code>rem_span_len</code> elements), then for a spanning major the cells it traced in this stop (<code>slice</code>, <code>slice_us</code>) and the stops it has spanned (<code>major_stops</code>). A sweep the sweeper thread ran reports its freed cells and time on its own line</td>
+<td><code>[kgc]</code>, <code>[kgc-sweep]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_GC_REGION</code></td>
+<td><code>1</code> on (default), <code>0</code> off</td>
+<td>Whether a mutator's cells are bumped out of region blocks (<code>src/runtime/region.zig</code>) or allocated one slab cell each. Off, every cell is on the collector's lists as before, for an A/B in one binary or to rule the region heap out. <code>KLIO_GC_VERIFY</code>, <code>KLIO_GC_POISON</code>, <code>KLIO_GC_HIST</code> and <code>KLIO_GC_NOFREE</code> turn it off. With <code>KLIO_GC_DEBUG</code> each sweep of region blocks reports the blocks read, the ones left free, the free lines and the blocks mapped</td>
+<td><code>[kgc-region]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_GC_SWEEP</code></td>
+<td><code>pause</code></td>
+<td>Keeps every sweep inside its collection's stop instead of handing it to the sweeper thread, to compare pause times or to rule the sweeper out. <code>KLIO_GC_NOFREE</code>, <code>KLIO_GC_HIST</code>, and a post-sweep audit sweep in the stop too</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_LOCKFREE_READS</code></td>
+<td><code>1</code> on (default where the program runs on the slab heap), <code>0</code> off</td>
+<td>Whether a list's element reads and a map's lookups take no lock, checked against the cell's write sequence (<code>ObjRef.readAtMoving</code>, <code>lookupNoLock</code>); off, they take the shared lock as before, for an A/B in one binary or to rule them out</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_GC_MAJOR</code></td>
+<td><code>concurrent</code> (default), <code>slices</code>, <code>stop</code></td>
+<td>How a major marks: <code>concurrent</code> spans it across stops, beginning in a minor's stop, with the marking thread tracing it while the mutators run and running the remark itself; <code>slices</code> spans it the same way but traces a slice at each minor's stop; <code>stop</code> marks it whole in one stop. Spanning needs generational collection</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_GC_SLICE</code></td>
+<td>number (default 10000)</td>
+<td>Cells a spanning major traces per stop beyond what the stop's minor handed it</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_GC_MAJOR_EVERY</code></td>
+<td>number (<code>0</code> off)</td>
+<td>Makes every Nth collection a major, to exercise majors in a short run</td>
+<td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_GC_GEN</code></td>
@@ -3265,10 +3195,28 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <td>none</td>
 </tr>
 <tr>
+<td><code>KLIO_GC_VERIFY</code></td>
+<td>set</td>
+<td>After each minor mark, traces every tenured cell and reports a child that is an unmarked nursery cell: a store that skipped the write barrier. After a major's mark it traces every marked cell and reports an unmarked child, and after each slice of a spanning major it does the same for every marked cell not due a retrace (not grey, not remembered since): a store into a traced cell that no barrier recorded, or a child a tracer skipped (<code>major:</code> in the line). Names the class and field for an instance, and dumps the frame chain on the first report; pair with <code>KLIO_GC_STRESS=1</code> so the report lands right after the store. A tenured cell that is already unreachable can also report, so confirm the holder is live</td>
+<td><code>[gc-verify]</code></td>
+</tr>
+<tr>
 <td><code>KLIO_GC_REMEMBER_TRACE</code></td>
 <td>set</td>
 <td>Logs, with a native stack, any remembered-set cell as it is swept</td>
 <td><code>[gc-freed-remembered]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_GC_REM_TOP</code></td>
+<td>set (with <code>KLIO_GC_DEBUG</code>)</td>
+<td>A collection whose retrace of whole remembered cells takes over a millisecond prints the payload types that took it: cells, time, children shaded and the slowest cell. A cell whose retrace took over 200 µs is watched, and the next whole-cell barrier on it prints the native stack of the store, which names the path that remembers a large cell whole</td>
+<td><code>[kgc-rem]</code>, <code>[kgc-rem-store]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_GC_LATE</code></td>
+<td>milliseconds</td>
+<td>A rendezvous still short after this long has every other mutator print its native stack: a parked thread shows the park, a late one what it runs without reaching a safe point (a yield loop outside a blocking-safe bracket, a long native). The reports themselves slow the stop, so read the stacks, not the pause they land in</td>
+<td><code>[gc-late]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_GC_HIST</code></td>
@@ -3289,10 +3237,40 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <td><code>[ctor-default]</code></td>
 </tr>
 <tr>
-<td><code>KLIO_TOPPROP_TRACE</code></td>
+<td><code>KLIO_PARSE_JOBS</code></td>
+<td>count</td>
+<td>Caps the threads that lex and parse the stdlib and pack sources at load (default: one per CPU); <code>1</code> parses serially, every file whole, which is the reference for the pool's piecewise parse of the largest files</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_STDLIB_IMAGE_SHIPPED</code></td>
+<td><code>0</code></td>
+<td>Ignores the base image the build installed under <code>share/klio/cache</code>, so a run with an empty data home bakes as a cold run would</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_PARSE_CHECK</code></td>
 <td>set</td>
-<td>A top-level property initializer that deferred to on-access during the startup pass, with its error tag</td>
-<td><code>[topprop-defer]</code></td>
+<td>Prints where each large source was cut into pieces for the parse pool, parses each such file whole again and reports the first declaration the piecewise parse got differently, and checks every declaration name is a slice of its source</td>
+<td><code>[parse-check]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_TRACE_FILES</code></td>
+<td>set</td>
+<td>The FileId each stdlib source registers under, for reading a <code>fN:offset</code> span in a trace</td>
+<td><code>[file]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_RESOLVE_THREADS</code></td>
+<td>count</td>
+<td>Caps the threads the resolver's second pass uses over the files of a module (default: one per CPU); <code>1</code> resolves serially, the reference</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_TRACE_RUN</code></td>
+<td>set</td>
+<td>Wall time of the run's own steps: VM init, the pre-execution trim with the slab's mapped bytes before and after it, <code>main</code>, teardown, and the startup/prepare/execute split with the resident set</td>
+<td><code>[run]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_BOX_FILTER</code> / <code>KLIO_BOX_JOBS</code> / <code>KLIO_BOX_TIMEOUT_MS</code></td>
@@ -3311,6 +3289,18 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <td>number (<code>0</code> off)</td>
 <td>Collects every N safe points (cheaper sampled stress)</td>
 <td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_FRAME_AUDIT</code></td>
+<td><code>1</code>, <code>2</code></td>
+<td>At every collection, checks each frame at the position it recorded against its function's frame map (<code>src/ir/core/framemap.zig</code>): every register the collector traces there (those live there) must hold a tag a value can have, which garbage an earlier frame left in the window seldom does, so a register the map calls live that nothing wrote, or a safe point reached without the frame recording where it stands, reports. <code>2</code> also poisons every register not live there (<code>CoroutineSuspended</code>), so a read the map missed fails where the register is read. Prints each finding and, at the end of the run, frames audited, unmapped (filled whole), bad positions, live registers holding garbage and registers poisoned. Pair with <code>KLIO_GC_STRESS_EVERY</code> for coverage</td>
+<td><code>[frame-audit]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_FRAME_AUDIT_FN</code></td>
+<td>a function's simple name, or <code>*</code></td>
+<td>With <code>KLIO_FRAME_AUDIT</code>, prints every audited frame of that function (or every frame): its position, its live registers, and <code>~rN</code> for each one poisoned</td>
+<td><code>[frame-audit]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_GC_THRESHOLD_KB</code></td>
@@ -3381,26 +3371,56 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 <tr>
 <td><code>KLIO_SLAB_STAT</code></td>
 <td>set</td>
-<td>Total bytes currently mapped from the OS, printed at exit</td>
+<td>Total bytes currently mapped from the OS with the count of map and unmap calls, printed at exit, and at the pre-execution trim the per-size-class occupancy: partial spans, their free and dormant cells, parked spares, the uncarved slab reserve, the parked large blocks, and what that leaves live</td>
 <td><code>[slab]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLAB_MAPS</code></td>
+<td>set</td>
+<td>Every map call by the site that made it, live or not, with counts and bytes, printed at exit: a list that grows through a chain of maps and copies shows as a site with a count where the live tracer sees only its last size</td>
+<td><code>[slabmaps]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLAB_CENSUS</code></td>
+<td>set; <code>churn</code>; <code>shapes</code></td>
+<td>Every slab allocation from process start charged to its calling site and credited back on free, with the byte size of each AST, token and IR shape first; printed at exit by bytes still live (<code>churn</code>: by bytes allocated over the run; <code>shapes</code> adds the variant and field sizes behind the largest unions and structs), so a cold run answers who holds what at <code>main</code> and who turns memory over. The tracing costs seconds; <code>scripts/slab_census.py</code> groups the report by phase, file and site</td>
+<td><code>[census]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLAB_CENSUS_AT</code></td>
+<td>a <code>KLIO_SEMA_TIMING</code> step (<code>bake: lower</code>, <code>bodies</code>, ...)</td>
+<td>With <code>KLIO_SLAB_CENSUS</code>, prints the census when that step ends as well as at exit: what is live then by site, before a bake drops its heap and takes its sites with it</td>
+<td><code>[census]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_SLAB_TRACE</code></td>
 <td>set</td>
-<td>Capture stacks of every live slab/large mmap, dumped at exit or on SIGTERM/SIGINT</td>
+<td>Capture stacks of every live slab/large mmap made after the program started, dumped at exit or on SIGTERM/SIGINT; a span is attributed to the allocation that mapped it</td>
 <td><code>[slabtrace]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_SLAB_TRACE_ALL</code></td>
+<td>set (with <code>KLIO_SLAB_TRACE</code>)</td>
+<td>Traces the build-phase mmaps too, so a SIGTERM during <code>main</code> attributes everything a cold run still holds</td>
+<td><code>[slabtrace]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_ARENA_GUARD</code></td>
+<td>set</td>
+<td>A run's build memory (<code>LargeArena</code>) keeps each freed allocation of 64 KB or more mapped with no access instead of unmapping it, and the scratch sema and lowering work in (<code>sema.Scratch</code>) does the same with every chunk it empties instead of reusing it, so a reader of freed memory faults at once rather than reading whatever reuses the address; the check for code that frees from the build's arena or keeps a pointer into scratch</td>
+<td>none</td>
+</tr>
+<tr>
+<td><code>KLIO_SLAB_POISON</code></td>
+<td>set</td>
+<td>Overwrites every freed slab cell with <code>0xAA</code>, so a reader of freed memory sees garbage at once; the check to run the corpus and the sweep under after anything that frees build-phase trees</td>
+<td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_CELL_TRACE</code></td>
 <td>set</td>
 <td>Sampled tracking of live small slab cells with their allocation stacks</td>
 <td><code>[slabtrace]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_DECODE_STATS</code></td>
-<td>set</td>
-<td>Per-type decoded bytes/nodes while loading a stdlib/module image, top 25 by bytes</td>
-<td><code>[decode-stats]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_RSS_CAP_KB</code></td>
@@ -3416,7 +3436,7 @@ backend (the default for <code>fast</code>/<code>safe</code>).</p>
 </tr>
 </tbody>
 </table>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">KLIO_GC_ALLOC</span><span class="o">=</span>leaktrack<span class="w"> </span><span class="nv">KLIO_LEAK_BY_FQN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>leaky.kt
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">KLIO_GC_ALLOC</span><span class="o">=</span>leaktrack<span class="w"> </span><span class="nv">KLIO_LEAK_BY_FQN</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>leaky.kt
 </code></pre></div>
 <h2 id="stdlib-packs-and-bundles">Stdlib, packs, and bundles<a class="headerlink" href="#stdlib-packs-and-bundles" title="Permanent link">&para;</a></h2>
 <p>The stdlib pack resolution order and the image cache are described
@@ -3445,22 +3465,16 @@ overrides and traces.</p>
 <td>none</td>
 </tr>
 <tr>
-<td><code>KLIO_STDLIB_IMAGE</code></td>
-<td><code>0</code> disables</td>
-<td>The stdlib image cache; disabled, every run lowers the full dependency set</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_STDLIB_IMAGE</code></td>
-<td>set; <code>0</code>/empty off</td>
-<td>One <code>hit</code>/<code>baked</code>/<code>fallback</code> line per run with the cache key and timing</td>
-<td><code>[stdlib-image]</code></td>
-</tr>
-<tr>
 <td><code>KLIO_PACK_DIAG</code></td>
 <td>set</td>
-<td>Disables the image cache so the legacy loader runs, and turns on its diagnostics (per-source lex/parse error dumps)</td>
+<td>Per-source lex/parse error dumps while the stdlib and pack sources load</td>
 <td><code>[embed lex err]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_PACK_TRACE</code></td>
+<td>set</td>
+<td>One line per installed pack a run or <code>klio sema</code> loads, with its path</td>
+<td><code>[pack-load]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_AST_REBASE_TRACE</code></td>
@@ -3475,21 +3489,9 @@ overrides and traces.</p>
 <td>manifest listing</td>
 </tr>
 <tr>
-<td><code>KLIO_BUNDLE_PROGRAM_IMAGE</code></td>
-<td><code>0</code> disables (default on)</td>
-<td>Whether bundling attempts the whole-program image bake; <code>0</code> forces the program-source boot path</td>
-<td>none</td>
-</tr>
-<tr>
 <td><code>KLIO_STUB_DIR</code></td>
 <td>directory</td>
 <td>Local source for cross-target runtime stubs and Skia shims (<code>&lt;dir&gt;/&lt;target&gt;/&lt;name&gt;</code>), checked before the download cache</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_STDLIB_CHECK</code></td>
-<td><code>0</code> disables</td>
-<td>Checking the stdlib base's own sources while an image is built (publishes extern decls and eager call resolutions for the checker)</td>
 <td>none</td>
 </tr>
 <tr>
@@ -3512,16 +3514,10 @@ overrides and traces.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>KLIO_TRACE_HTTP</code></td>
+<td><code>KLIO_NET_TRACE</code></td>
 <td>set</td>
-<td>Logs each outbound ktor HTTP request (method + URL) before the transport runs</td>
-<td><code>[HTTP]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_SERVE_MAX</code></td>
-<td>number (<code>0</code>/unset unlimited)</td>
-<td>Caps the embedded ktor server to N requests so a leak-checking run reaches its exit report</td>
-<td>none</td>
+<td>One line as each ktor-network selector <code>poll</code> starts and one as it returns: the thread, how many polls are in flight across threads, the timeout and the descriptors. A poll that never returns names a selector that was never closed</td>
+<td><code>[kknet]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_DOLLAR_TRACE</code></td>
@@ -3550,8 +3546,9 @@ overrides and traces.</p>
 </tbody>
 </table>
 <h2 id="test-harness-and-dev-tooling">Test harness and dev tooling<a class="headerlink" href="#test-harness-and-dev-tooling" title="Permanent link">&para;</a></h2>
-<p>These are honored by the itest binaries, the parity harness, and
-the scripts, not by <code>klio run</code> itself.</p>
+<p>These are honored by the itest binaries, the kotlinc oracle
+(<code>src/itests/kotlinc_support.zig</code>), and the scripts, not by <code>klio run</code>
+itself.</p>
 <table>
 <thead>
 <tr>
@@ -3569,16 +3566,16 @@ the scripts, not by <code>klio run</code> itself.</p>
 <td>none</td>
 </tr>
 <tr>
+<td><code>KLIO_ITEST_HOME</code></td>
+<td>directory</td>
+<td>The data home the program-running suites run in; <code>zig build</code> names <code>zig-out/klio-test-home</code>, where the <code>klio-test-home</code> step installs every shipped pack once per tree and harness. Unset, a suite installs the packs into <code>/tmp/klio_itest_home</code> on first use</td>
+<td>none</td>
+</tr>
+<tr>
 <td><code>KLIO_ITEST_VERBOSE</code></td>
 <td>set</td>
 <td>Surfaces the differential itest's otherwise-suppressed progress lines</td>
 <td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_TEST_FILE_TRACE</code></td>
-<td>set</td>
-<td><code>klio test</code> prints each selected file's path-to-FileId mapping</td>
-<td><code>[test-file]</code></td>
 </tr>
 <tr>
 <td><code>KLIO_COMMONTEST_SHARD</code></td>
@@ -3599,30 +3596,6 @@ the scripts, not by <code>klio run</code> itself.</p>
 <td>none</td>
 </tr>
 <tr>
-<td><code>KLIO_E2E_TRACE</code></td>
-<td>set</td>
-<td>One line per e2e program as it runs, with the JIT state</td>
-<td><code>e2e RUN</code></td>
-</tr>
-<tr>
-<td><code>KLIO_TRACE_STDLIB_BASE</code></td>
-<td>set; <code>0</code>/empty off (Linux)</td>
-<td>One <code>fast</code>/<code>fallback</code> line per program: was the baked dependency base reused or rebuilt</td>
-<td><code>[stdlib-base]</code></td>
-</tr>
-<tr>
-<td><code>KLIO_PARITY_BASE_IMAGES</code></td>
-<td>directory</td>
-<td>Where the parity/e2e/bench harness loads the baked base images from (<code>zig-out/parity-base</code> when running an itest binary by hand)</td>
-<td>none</td>
-</tr>
-<tr>
-<td><code>KLIO_PARITY_JOBS</code></td>
-<td>number (default: CPU count, cap 6)</td>
-<td>Parity sweep worker count</td>
-<td>none</td>
-</tr>
-<tr>
 <td><code>KLIO_PARITY_JAVA_XMX_MB</code></td>
 <td>MB (default 2048)</td>
 <td>JVM heap ceiling for the kotlinc oracle</td>
@@ -3637,7 +3610,7 @@ the scripts, not by <code>klio run</code> itself.</p>
 <tr>
 <td><code>KLIO_KOTLINC_JVM_HOME</code></td>
 <td>path</td>
-<td>Existing JVM kotlinc distribution (or binary) for the parity oracle</td>
+<td>Existing JVM kotlinc distribution (or binary) for the kotlinc oracle</td>
 <td>none</td>
 </tr>
 <tr>
@@ -3649,19 +3622,19 @@ the scripts, not by <code>klio run</code> itself.</p>
 <tr>
 <td><code>KONAN_DATA_DIR</code></td>
 <td>path (default <code>~/.konan</code>)</td>
-<td>Where the parity harness looks for Kotlin/Native distributions</td>
+<td>Where the kotlinc oracle looks for Kotlin/Native distributions</td>
 <td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_NO_AUTO_INSTALL_KOTLINC</code></td>
 <td><code>1</code> (<code>0</code> off)</td>
-<td>Never auto-install kotlinc; parity tests skip when none is found</td>
+<td>Never auto-install kotlinc; the kotlinc comparisons skip when none is found</td>
 <td>none</td>
 </tr>
 <tr>
 <td><code>KLIO_SKIP_KOTLINC_PARITY</code></td>
 <td><code>1</code> (<code>0</code> off)</td>
-<td>Skips the kotlinc leg of parity/differential checks entirely</td>
+<td>Skips the kotlinc leg of the fuzzer's checks entirely</td>
 <td>none</td>
 </tr>
 <tr>
@@ -3708,11 +3681,6 @@ the scripts, not by <code>klio run</code> itself.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>KLIO_ITEST_WALL_CAP</code></td>
-<td>seconds (default 60; <code>0</code> off)</td>
-<td>Per-program wall cap for the in-process itest harnesses; a spinning program fails "test wall-clock deadline exceeded" and names itself instead of hanging the binary</td>
-</tr>
-<tr>
 <td><code>KLIO_ENVONCE_SELFTEST_A</code> / <code>KLIO_ENVONCE_SELFTEST_B</code></td>
 <td>never set</td>
 <td>Sentinel names the <code>envOnce</code> unit tests probe to prove distinct cache slots and unset-miss behavior</td>
@@ -3728,55 +3696,47 @@ the scripts, not by <code>klio run</code> itself.</p>
 <p><strong>Tracing a coroutine hang.</strong> Turn on the pump and resume traces,
 cap <code>runTest</code> so the hang fails fast, and add a spin dump in case
 the hang is a busy loop rather than a parked pump:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nv">KLIO_PUMP_DIAG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_RESUME_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_SPIN_TRACE</span><span class="o">=</span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nv">kotlinx_coroutines_test_default_timeout</span><span class="o">=</span>10s<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>kotlin-klio/klio-kotlinx-coroutines<span class="w"> </span>--filter<span class="w"> </span>FlowTest
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">KLIO_PUMP_DIAG</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_RESUME_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_SPIN_TRACE</span><span class="o">=</span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nv">kotlinx_coroutines_test_default_timeout</span><span class="o">=</span>10s<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span><span class="nb">test</span><span class="w"> </span>kotlin-klio/klio-kotlinx-coroutines<span class="w"> </span>--filter<span class="w"> </span>FlowTest
 </code></pre></div>
 <p>Read the <code>[tok]</code> lifecycle to see which continuation parked and was
 never taken; <code>[resume-frame]</code> lines show every frame each resume
 re-ran and by which route.</p>
 <p><strong>Tracing a wrong overload pick.</strong> Pair the static and dynamic
 views for the one name that misbehaves:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nv">KLIO_BARE_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="nv">KLIO_MISS_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="nv">KLIO_NU_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nv">KLIO_BARE_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="nv">KLIO_MISS_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nv">KLIO_NU_TRACE</span><span class="o">=</span>encodeToString<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
 </code></pre></div>
-<p><code>[bare]</code> shows what lowering bound (or <code>NONE</code>); the <code>[extfb]</code> /
+<p><code>[bare]</code> shows what the module's tables bound (or <code>NONE</code>); the <code>[extfb]</code> /
 <code>[member-miss]</code> tail shows which runtime candidates were skipped and
 why; <code>[strictext]</code> / <code>[mev]</code> add visibility detail. Add
 <code>KLIO_CMG_TRACE=&lt;name&gt;</code> for the dispatch preconditions at the call
 instruction.</p>
 <p><strong>Root-causing an exception.</strong> When a failure surfaces as a bare
 error with no trace, or a teardown masks the original throw:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nv">KLIO_ERR_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_THROW_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_THROW_STACK</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nv">KLIO_ERR_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_THROW_TRACE</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="nv">KLIO_THROW_STACK</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>repro.kt
 </code></pre></div>
 <p><code>[throw-trace]</code> names every throw as it happens (first one is
 usually the root cause), <code>[errtrace]</code> dumps the frame chain, and in
 <code>klio test</code> the failure detail becomes the fully rendered throwable.</p>
-<p><strong>Bisecting the compose plugin.</strong> The plugin always runs; bisect its two
-emissions:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">                                </span><span class="c1"># plugin (always on)</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">KLIO_COMPOSE_SKIP</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">            </span><span class="c1"># no skip calculus</span>
-</code></pre></div>
-<p>Rebuild any baked pack between flips (the flag is part of the pack
-cache key), and add <code>KLIO_COMPOSE_DBG=1</code> to confirm the pass
-activated.</p>
 <h2 id="per-thread-state-and-the-owner-fast-path">Per-thread state and the owner fast path<a class="headerlink" href="#per-thread-state-and-the-owner-fast-path" title="Permanent link">&para;</a></h2>
 <p>Darwin resolves every <code>threadlocal</code> access through a <code>_tlv_get_addr</code> CALL rather
 than a register-relative load, and LLVM can only hoist that call within a
 function — so in an interpreter the cost lands on every hot helper. It measured
-25% of samples on a member-call loop, with the JIT on and off alike.</p>
+25% of samples on a member-call loop.</p>
 <p><code>src/runtime/tls_fast.zig</code> answers it: the thread that calls <code>claimOwner()</code> at
-process entry reads the hot per-thread structures (the fused walker's banks,
-<code>host_fields</code>' caches, the keepalive stack) from ordinary globals, and every
+process entry reads the hot per-thread structures (the evaluator's state,
+the keepalive stack) from ordinary globals, and every
 other thread keeps its threadlocal. The owner never changes, so no state
 migrates between the two storages — a thread reads the same object for the
 process's life. A binary that never claims an owner (the test harnesses) behaves
 exactly as before.</p>
 <p>Two things to know before extending it:</p>
 <ul>
-<li>It is NOT a win everywhere. The evaluator's own <code>EvalTls</code> is read on the JIT's
+<li>It is NOT a win everywhere. The evaluator's own <code>EvalTls</code> is read on the
   per-call seam, where the compare that replaces the call costs more than the
   call did; it is deliberately left a plain threadlocal, and the comment at its
   declaration says so with the numbers.</li>

@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1510,17 +1630,15 @@ shape of the system and the load-bearing design decisions.</p>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>  ▼  span        (SourceMap, FileId, Span)
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>  ▼  lexer       (token stream, trivia preserved)
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>  ▼  parser      (AST + diagnostics)
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>  ▼  ir          (AST → register IR lowering; applicability = the
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>  │               shared overload-resolution engine; jit_loop = the
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>  │               native compiler over the IR)
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>  ▼  interp_ir   (the Vm: executes IR; JIT tiers compile hot code)
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>  ▼  sema        (symbols, headers and bodies: every name bound)
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>  ▼  ir          (bridge: sema's symbols → IR ids; lower/sema: sema's
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>  │               records → register IR)
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>  ▼  interp_ir   (the Vm: executes IR)
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>  ▼  cli         (binary: run / test / check / lex / parse / dump-ir /
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>                  bake / repl / pack)
 </code></pre></div>
 <p><code>resolver</code> and <code>typeck</code> (backed by <code>types</code> and <code>cfa</code>) serve the
-<code>klio check</code> diagnostics path, and under <code>KLIO_EAGER=1</code> they run
-ahead of lowering on the run path so lowering consumes type-derived
-resolution answers. <code>runtime</code> owns the <code>Value</code> model, the <code>ObjRef</code>
+<code>klio check</code> diagnostics path. <code>runtime</code> owns the <code>Value</code> model, the <code>ObjRef</code>
 cell protocol, the tracing GC, and the perf profiles; <code>stdlib</code> owns
 the native intrinsics and symbol index; <code>pack</code> / <code>stdlib_pack</code> own
 the <code>.klio-pack</code> format and the embedded stdlib.</p>

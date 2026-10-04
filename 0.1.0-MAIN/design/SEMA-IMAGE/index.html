@@ -10,7 +10,7 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/development/resolution-paths/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/SEMA-IMAGE/">
       
       
       
@@ -23,7 +23,7 @@
     
     
       
-        <title>The two resolution paths, and which one your runner uses - Klio</title>
+        <title>The sema image - Klio</title>
       
     
     
@@ -66,7 +66,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#the-two-resolution-paths-and-which-one-your-runner-uses" class="md-skip">
+        <a href="#the-sema-image" class="md-skip">
           Skip to content
         </a>
       
@@ -106,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              The two resolution paths, and which one your runner uses
+              The sema image
             
           </span>
         </div>
@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1281,7 +1345,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../workspace/" class="md-nav__link">
+      <a href="../../development/workspace/" class="md-nav__link">
         
   
   
@@ -1309,7 +1373,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../testing/" class="md-nav__link">
+      <a href="../../development/testing/" class="md-nav__link">
         
   
   
@@ -1337,7 +1401,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../debugging/" class="md-nav__link">
+      <a href="../../development/debugging/" class="md-nav__link">
         
   
   
@@ -1365,7 +1429,63 @@
   
   
     <li class="md-nav__item">
-      <a href="../contributing/" class="md-nav__link">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/contributing/" class="md-nav__link">
         
   
   
@@ -1420,10 +1540,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-mechanisms" class="md-nav__link">
+  <a href="#what-the-image-carries" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The mechanisms
+        What the image carries
       
     </span>
   </a>
@@ -1431,10 +1551,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#who-builds-the-eager-map" class="md-nav__link">
+  <a href="#a-run" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Who builds the eager map
+        A run
       
     </span>
   </a>
@@ -1442,32 +1562,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#measured-divergence" class="md-nav__link">
+  <a href="#verifying" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Measured divergence
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#the-coverage-asymmetry" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The coverage asymmetry
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#practical-rules" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Practical rules
+        Verifying
       
     </span>
   </a>
@@ -1491,7 +1589,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/development/resolution-paths.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/SEMA-IMAGE.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1499,99 +1597,106 @@
   
 
 
-<h1 id="the-two-resolution-paths-and-which-one-your-runner-uses">The two resolution paths, and which one your runner uses<a class="headerlink" href="#the-two-resolution-paths-and-which-one-your-runner-uses" title="Permanent link">&para;</a></h1>
-<p>klio resolves a bare call through two mechanisms, and which are available
-depends on <strong>how the program was launched</strong>. This page states the
-precedence, the measured divergence, and the coverage asymmetry that falls
-out of it — because a bug once passed under <code>klio run</code> and failed in the
-in-process harness on the same source, and the reason was not in the
-program.</p>
-<h2 id="the-mechanisms">The mechanisms<a class="headerlink" href="#the-mechanisms" title="Permanent link">&para;</a></h2>
-<p><strong>The eager typeck map.</strong> Before lowering, the checker walks the program
-and records a resolved target per call site (<code>ir.pending_eager_calls</code>,
-keyed by span). At the lowering site it is <em>consumed</em> in preference to the
-lazy answer: it is type-derived and overload-precise where the lazy engine
-is shape-based, and it pins the pick against runtime value-typed re-picks
-(<code>res_final.target_final = true</code>).</p>
-<p><strong>The lazy resolution engine.</strong> Candidate scoring at lowering time from
-argument shapes, receiver heads, and scope tiers. Always present.</p>
-<p>Precedence is defined, not ambiguous: <strong>where the eager map has an entry,
-it wins.</strong> The one exception is guarded in <code>expr.zig</code> — a pick that
-resolves the call back to the ENCLOSING declaration is distrusted, because
-stdlib overload families delegate to same-name siblings and a mis-picked
-self-target recurses forever.</p>
-<h2 id="who-builds-the-eager-map">Who builds the eager map<a class="headerlink" href="#who-builds-the-eager-map" title="Permanent link">&para;</a></h2>
-<p><code>pending_eager_calls</code> is populated <strong>only under <code>src/cli/</code></strong> —
-<code>commands.zig</code> (run/check), <code>bundle.zig</code>, <code>bundle_boot.zig</code>,
-<code>stdlib_image.zig</code>. Grep is unambiguous: <code>src/parity/parity.zig</code> never
-builds it.</p>
+<h1 id="the-sema-image">The sema image<a class="headerlink" href="#the-sema-image" title="Permanent link">&para;</a></h1>
+<p>A run analyzes and lowers only its program. What it knows about the base (the
+stdlib, klio's actuals and the program's packs) comes from the base image: the
+bridge and the lowered module, and sema's own state for the base. A run over a
+cached image reads no base source and builds no base AST.</p>
+<h2 id="what-the-image-carries">What the image carries<a class="headerlink" href="#what-the-image-carries" title="Permanent link">&para;</a></h2>
+<p>The image (<code>src/lower_driver/base_image.zig</code>) is one file in three parts.</p>
+<ul>
+<li><strong>The front</strong> (<code>base_image.Front</code>), readable alone: each base file's path
+  and where its lines start, and the baking driver's own record of the base
+  (for <code>klio run</code>, the packs' meta-serializable annotation names). A run
+  registers the files in its source map before its program's, with no text,
+  so the base's spans name the same files and a frame in a base function still
+  names its line.</li>
+<li><strong>Sema</strong> (<code>src/lower_driver/base_sema.zig</code>): every symbol of the bake with
+  its per-kind info, headers resolved and return and property types inferred;
+  the member and package indexes; the type store; the names; the function
+  classes, SAM constructors and builtins. A symbol from the image has no AST:
+  its <code>Decl</code> keeps the kind of declaration and points nowhere.</li>
+<li><strong>The bridge and the module</strong>, as before: ids, layouts, dispatch tables and
+  the lowered bodies, a body decoding on its first call.</li>
+</ul>
+<p>What a program's analysis, the bridge and lowering ask about a base
+declaration beyond its header is in sema's tables, filled from the AST when
+the declaration is collected or asked about, and asked of every base
+declaration before the bake encodes (<code>base_sema.complete</code>):</p>
 <table>
 <thead>
 <tr>
-<th>runner</th>
-<th>pipeline</th>
-<th>eager map</th>
+<th>Fact</th>
+<th>Where</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>klio run</code> / <code>klio test</code> / bundles</td>
-<td>CLI</td>
-<td><strong>yes</strong></td>
+<td>Annotation classes, by site: the declaration, a property's getter or setter, a parameter's written type</td>
+<td><code>Sema.annotation_classes</code></td>
 </tr>
 <tr>
-<td><code>corpus_check.py</code></td>
-<td>spawns the CLI</td>
-<td><strong>yes</strong></td>
+<td>Deprecation level and message</td>
+<td><code>Sema.deprecations</code></td>
 </tr>
 <tr>
-<td>e2e, differential, every parity itest, the commontest censuses</td>
-<td>in-process <code>parity</code></td>
-<td><strong>no</strong></td>
+<td>Contract effects, as conditions over parameter indexes and resolved types</td>
+<td><code>Sema.contracts</code></td>
+</tr>
+<tr>
+<td>What a property writes: a getter, a setter, an initializer, an explicit backing field</td>
+<td><code>PropertyInfo.written</code></td>
+</tr>
+<tr>
+<td>A body that is <code>{}</code></td>
+<td><code>FunctionInfo.empty_body</code></td>
+</tr>
+<tr>
+<td><code>sealed</code> on an interface</td>
+<td><code>ClassInfo.sealed</code></td>
+</tr>
+<tr>
+<td><code>@IntrinsicConstEvaluation</code></td>
+<td><code>Flags.intrinsic_const</code></td>
 </tr>
 </tbody>
 </table>
-<p>So the configuration users run is not the configuration most of the test
-apparatus runs.</p>
-<h2 id="measured-divergence">Measured divergence<a class="headerlink" href="#measured-divergence" title="Permanent link">&para;</a></h2>
-<p><code>KLIO_EAGER_AUDIT=1</code> prints <code>[EAGER-AUDIT]</code> for every call where the two
-mechanisms disagree. Over 60 corpus examples:</p>
+<p>A read of a declaration's AST either answers from these tables or unwraps the
+pointer where only a declaration this build analyzes from source can arrive
+(its own body, its lazily resolved header), so a gap fails at the read.</p>
+<p>Member indexes iterate in the order names were declared, and the image
+rebuilds them in that order, so walking one walks the same members the same
+way over the image as over source. Growable lists (<code>codec.Growable</code>) decode
+with room to append, so the program's symbols extend the base's tables in
+place.</p>
+<h2 id="a-run">A run<a class="headerlink" href="#a-run" title="Permanent link">&para;</a></h2>
+<ol>
+<li>The program's files parse.</li>
+<li>The base is named before any of it parses (<code>sema_base_cache.Key</code>): the
+   binary's stamp, the image layout's version, the stdlib's and the actuals'
+   paths and texts, and each selected pack's content hash and active
+   features in load order. Packs are selected from their manifests and import
+   sections, parsing none.</li>
+<li>With a cached image of that name, the image's front registers the base's
+   files and the program joins the source map after them
+   (<code>sema_cmd.loadSources</code>, <code>LoadOptions.image</code>); <code>pipeline.buildOnImage</code>
+   decodes the base's sema, bridge and module and analyzes, bridges and lowers
+   the program over them.</li>
+<li>With none, the base parses, is analyzed and lowered, and is baked under
+   that name; the run continues from the bytes it baked, as step 3 does.</li>
+</ol>
+<p>A program the serialization pass rewrites (one writing <code>@Serializable</code>, or
+using a pack's meta-serializable annotation, which the front names) still
+parses its base: the pass generates its serializers from the packs'
+declarations as written. Its analysis runs over the image's sema all the same.</p>
+<h2 id="verifying">Verifying<a class="headerlink" href="#verifying" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>4 disagreements, all of the shape <code>eager=&lt;fid&gt; lazy=-1</code></strong> — the lazy
-  engine declined and the eager map supplied a target
-  (<code>class_factory_overload.kt</code> ×3, <code>annotated_function_types.kt</code> ×1).</li>
-<li><strong>0 cases where both answered and answered differently.</strong></li>
-</ul>
-<p>That is the reassuring half: the paths do not contradict each other. The
-eager map supplements; it does not overrule a confident lazy answer.</p>
-<p>It is also the risk. Every one of those 4 is a call that resolves under the
-CLI and has no answer without the map. That is exactly the shape of the
-<code>positional_lambda_binding</code> failure: the program ran under <code>klio run</code>
-(eager supplied the target) and failed in base mode (no map, lazy declined,
-the call fell to the value route, which bound the wrong parameter to Null).
-The bug was real and lived in the lazy scorer — the eager map had been
-hiding it.</p>
-<h2 id="the-coverage-asymmetry">The coverage asymmetry<a class="headerlink" href="#the-coverage-asymmetry" title="Permanent link">&para;</a></h2>
-<ul>
-<li>The <strong>parity path</strong> is output-pinned: e2e enforces 320 expected outputs.</li>
-<li>The <strong>CLI path</strong> is mostly exit-code-checked: <code>corpus_check.py</code> runs all
-  335 examples but compares output for only the 16 under
-  <code>tests/corpus/expected-cli/</code>.</li>
-</ul>
-<p>So the resolution configuration users actually get has the weaker
-assertions, and the configuration with the strong assertions is one users
-never run. Neither is wrong on its own; the asymmetry is worth knowing
-before trusting a green corpus as proof about <code>klio run</code>.</p>
-<h2 id="practical-rules">Practical rules<a class="headerlink" href="#practical-rules" title="Permanent link">&para;</a></h2>
-<ul>
-<li>A bug reproducing under one runner and not the other is a resolution-path
-  difference until proven otherwise. Check <code>KLIO_EAGER_AUDIT=1</code> first.</li>
-<li>A lazy-engine fix is the real fix. If a call only works because the eager
-  map supplies it, the lazy scorer has a gap that every in-process driver
-  will hit.</li>
-<li>Do not "fix" a parity failure by teaching parity to build the eager map.
-  That would hide lazy-engine gaps from the only suites that currently
-  catch them.</li>
+<li>Baking a base twice with one binary gives the same bytes; so does
+  re-encoding an image read back, its bodies decoded
+  (<code>src/lower_driver/tests/image.zig</code>).</li>
+<li>Every lowering test runs its program over the whole base, over a baked
+  base, and over a base read from its image alone (<code>expectOutputOver</code>).</li>
+<li>The corpus, the stdlib commontest sweep, the e2e suite and the gate.</li>
 </ul>
 
 

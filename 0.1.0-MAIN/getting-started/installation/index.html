@@ -1056,6 +1056,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1294,6 +1298,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1317,6 +1377,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1442,6 +1506,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1617,9 +1737,10 @@ and install the ones your programs need:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>./zig-out/bin/klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>kotlin-klio/klio-kotlinx-coroutines
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>./zig-out/bin/klio<span class="w"> </span>pack<span class="w"> </span>install<span class="w"> </span>target/packs/kotlinx.coroutines.klio-pack
 </code></pre></div>
-<p>The ktor pack is feature-gated: install it the same way
-(<code>kotlin-klio/klio-ktor</code>), then enable what a program uses per run,
-e.g. <code>klio run --feature io.ktor/client program.kt</code>. See
+<p>A multi-module pack exposes each upstream module as a feature. The
+ktor pack loads nothing by default: install it the same way
+(<code>kotlin-klio/klio-ktor</code>), then enable the modules a program uses per
+run, e.g. <code>klio run --feature io.ktor/client-cio program.kt</code>. See
 <a href="../../packs/using/">Using packs</a>.</p>
 
 

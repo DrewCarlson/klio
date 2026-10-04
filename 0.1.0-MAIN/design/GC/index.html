@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1556,7 +1676,7 @@ multi-thread / coroutine / closure / host-temporary close-out):</p>
   registry, <code>collect</code>, the epoch mark, and the KLIO_GC_STRESS / KLIO_GC_NOFREE /
   KLIO_GC_POISON oracles). The default arena path is unchanged (the collector is
   inert unless <code>gc_enabled</code>).</li>
-<li>Multi-thread STW with thread roots: <code>stop_flag</code> / <code>parked_count</code> / <code>parkForStop</code>
+<li>Multi-thread STW with thread roots: the stop word / <code>parked_count</code> / <code>parkForStop</code>
   rendezvous and <code>registerThreadRoot</code> / <code>markThreadRoots</code> bring real-threaded
   programs (Dispatchers.Default, withContext(IO), cross-dispatcher channels) under
   the collector byte-identically to the arena baseline.</li>
@@ -1571,6 +1691,93 @@ multi-thread / coroutine / closure / host-temporary close-out):</p>
 <li>Slab page-return with idle hysteresis (<code>src/runtime/slab.zig</code>): same-size cells
   grouped into slabs, <code>munmap</code> on last-free, and MAP_FIXED decommit of stably-idle
   slab pages so RSS tracks the live set.</li>
+<li>Generational collection: minors sweep the nursery and stop marking at tenured
+  cells; a store into a tenured cell puts it in the remembered set. A tenured
+  array of at least 64 elements whose stores name their index (<code>borrowMutAt</code>)
+  remembers only the index range they touched, so a minor retraces that range
+  instead of the whole array; an append remembers the indices it lands at.</li>
+<li>The sweep runs off the pause. A mark tenures every nursery cell it reaches
+  as it reaches it, so the world restarts right after marking: the collector
+  detaches the nursery (and, for a major, the tenured list) and hands them to
+  a sweeper thread, which frees the white cells and relinks the survivors
+  while the mutators run. The next collection, and anything that walks the
+  lists, waits for that sweep first. <code>KLIO_GC_SWEEP=pause</code> keeps the sweep in
+  the stop.</li>
+<li>A major can span stops (<code>KLIO_GC_MAJOR=slices</code>). It begins in a minor's
+  stop: with the minor done every live cell is tenured, and the roots
+  shaded then are the major's snapshot. Between stops the major traces
+  tenured cells only and passes over nursery cells. Every minor while it
+  runs hands the major the cells the write barrier remembered in that
+  minor's window (whole cells and index ranges) that the major has marked,
+  since one it has not reached yet is traced whole when it is, and shades
+  the survivors it promoted into the major; a slice then traces
+  <code>KLIO_GC_SLICE</code> cells beyond what the minor handed it, grey ones first
+  and then the remembered ones. When
+  none is left, the next collection is the remark: it shades the roots
+  again, retraces the marked cells remembered since the last minor and any
+  still waiting, marks the nursery with the major's epoch, and drains. A
+  nursery sweep keeps a cell by its generation, since the major re-stamps
+  a promoted survivor's mark before the sweeper reads it.</li>
+</ul>
+<p>Why the remark finds every live cell: a store into a cell the major has
+  traced goes through the write barrier, which puts a tenured cell on the
+  remembered set once per minor window, and every window's set reaches the
+  major, so each such cell is retraced with what it holds by the end. A
+  cell born during the major stays a nursery cell until a minor promotes
+  it, which shades it into the major, or the remark reaches it. Whatever
+  holds a newborn cell is a root, another nursery cell, or a tenured cell
+  stored into after the newborn existed, and that store was remembered. So
+  the remark, tracing from the roots and the remembered cells through the
+  nursery, reaches every newborn cell still live and, through it, any
+  tenured cell only it holds that the major has not traced yet.</p>
+<p><code>KLIO_GC_VERIFY</code> checks exactly this. After each slice it traces every
+  cell the major marked that is not due a retrace (not grey, not
+  remembered since) and reports an unmarked child: a store into a traced
+  cell no barrier recorded, or a child a tracer skipped. After the remark
+  it checks that the marked set is closed, so the sweep frees nothing a
+  kept cell holds. A tracer that records a frozen structure as fully traced
+  (<code>gc_quiesced</code>) does so only for a mark that <code>marksWhole</code>, never between
+  a spanning major's stops.
+- The marking thread (<code>KLIO_GC_MAJOR=concurrent</code>, the default) traces a spanning major
+  between its stops while the mutators run, 256 cells a batch. It is not a
+  mutator: it holds <code>major_lock</code> while it traces a batch, and a collection
+  takes that lock once the mutators have stopped, so the major's lists and
+  marks change hands only between batches and a stop waits at most one
+  batch for it. It reads each cell under the cell's shared lock, which no
+  stopped thread holds (<code>assertNoCellLock</code> at every safe point and blocking
+  bracket). With nothing left to trace it runs the remark as a collection of
+  its own; raising a stop sets the pending flag the mutators poll, so they
+  park at their next poll rather than at the next collection an allocation
+  asks for. Minors while it runs stay stop-the-world and report as minors.
+  Releasing a heap's memory (<code>forgetRanges</code>) ends a major in progress, which
+  frees nothing: it would go on tracing cells live when it began, and one of
+  those may hold a cell in the released memory.
+- Waiting goes through the OS. A thread waiting out a stop, and the collector
+  waiting for the mutators to park, spin briefly, yield a few times and then
+  sleep on a gate (a pthread mutex and condition with a sleeper count). The
+  thread that ends a stop, parks, or enters a blocking bracket while a stop is
+  raised wakes the gate's sleepers; waking costs one load when nobody sleeps.</p>
+<ul>
+<li>Weak references and cleaners (<code>src/runtime/weak.zig</code>), behind Kotlin/Native's
+  <code>kotlin.native.ref.WeakReference</code>, <code>createCleaner</code> and <code>kotlin.native.runtime.GC</code>.
+  A weak cell is a <code>Value.Weak</code> whose tracer skips its referent; every weak cell
+  whose referent can be swept is on a registry the collector reads after each
+  mark, with the world still stopped (<code>gc.weak_hook</code>): a live weak cell whose
+  referent <code>gc.cellDead</code> says this collection frees is cleared before the sweep,
+  and a dead one leaves the registry. A cleaner's owner holds its job; when a
+  collection finds the owner dead the job is marked again with that
+  collection's marker, so it survives the sweep, and queued for a cleaner thread
+  (a Kotlin daemon started with the first cleaner) that runs it. Weak cells are
+  cleared after the jobs are marked, so what a queued job holds stays weakly
+  reachable until it has run. Entries registered since the last collection are
+  young and every minor checks only them; a minor's survivors are tenured, so
+  their entries become old and only a major looks at them again.</li>
+<li>Native finalizers (<code>klio.ref.registerNativeFinalizer</code>): a C function and the
+  pointer it frees, registered against a Kotlin owner, which the sweeper thread
+  calls once a collection finds the owner dead, or the owner's <code>close()</code> calls
+  first (<code>runNativeFinalizer</code>); a one-shot flag runs it exactly once. No Kotlin
+  object or job is allocated per peer and nothing extra is marked. skiko's
+  <code>Managed</code> peers free their Skia objects this way.</li>
 </ul>
 <p>Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
 marking), both below. External-byte accounting is now part of the shipped
@@ -1578,8 +1785,9 @@ collector; its remaining stress hardening is described directly below.</p>
 <h2 id="external-bytes-appel-accounting-keepalive-hole-close-out">External-bytes Appel accounting + keepalive-hole close-out<a class="headerlink" href="#external-bytes-appel-accounting-keepalive-hole-close-out" title="Permanent link">&para;</a></h2>
 <p>The Appel trigger (<code>threshold = max(floor, live*2)</code>) only counts bytes on the
 sweep registry — refcounted cells. But two large allocation classes live in libc
-storage OUTSIDE the registry: frame register buffers (<code>acquireRegs</code>) and
-suspension snapshots (the <code>dupe</code>d regs/params/captures a park captures). They are
+storage OUTSIDE the registry: the value stack's segments, which hold every
+frame's registers and argument areas, and suspension snapshots (the <code>dupe</code>d
+regs/params/captures a park captures). They are
 traced through the frame chain (never swept directly), so they are sound, but
 their growth never advances the trigger. Consequence: a program that builds a
 deep suspended chain (DeepRecursive, a long generator) keeps the trigger pinned
@@ -1588,8 +1796,9 @@ observed quadratic in <code>runFrameInner</code> self-time.</p>
 <p>The fix is enabled by default (<code>external_accounting</code> in <code>gc.zig</code>, with
 <code>KLIO_GC_EXT=0</code> retained as a diagnostic override): <code>noteExternalBytes</code> /
 <code>noteExternalFreed</code> add/subtract these buffers
-at their acquire/release/pool-transition sites (<code>acquireRegs</code>, <code>releaseRegs</code>
-pool return, the snapshot <code>dupe</code>, <code>freeSnapshotBuffers</code>), and <code>external_live</code>
+where they are allocated and freed (a value-stack segment's first allocation,
+the heap block of a frame taken off the stack, the snapshot <code>dupe</code>,
+<code>freeSnapshotBuffers</code>), and <code>external_live</code>
 feeds the threshold as <code>max(floor, (live + external_live)*2)</code>. With it on,
 DeepRecursive at 150k levels dropped 33s → 17s in the original measurement.
 On the current 100k-depth upstream test, the same change reduces the JIT-off
@@ -1639,14 +1848,14 @@ hardening gate.</p>
 2. PER-THREAD GC RECORDS. Process-global gc_threads registry (intrusive, SpinMutex-guarded) of records { &amp;frame_chain, &amp;coro_stack, &amp;active_scope_stack, &amp;resuming_frames, &amp;host_keepalive, &amp;pinned_task, at_safepoint }. Threads register on entry / deregister on exit at the SAME seams that call setReclaim today (scheduler.zig:323, intrinsic_host.zig:735) and inherit process-global gc_enabled.
 3. PARKED COROUTINE SuspendStates. Per-thread coro_stack/active_scope_stack live in the thread GC record (root 2). PersistedParked.map (coroutines.zig:262) and SlotOwners.pending (coroutines.zig:181) register once in the global root list and get a mark pass (not just the existing run-boundary drain): trace every snapshot regs/params/captures/enclosing_this, every scope_delta, every pending resume Value. markSuspendState reuses the retainSnapshotValues walk shape (eval.zig:405). FIX (fatal mid-resume hole): resumeContinuation's in-flight Zig-local <code>frames</code> ArrayList (eval.zig:745) of not-yet-materialized outer FrameSnapshots is rooted via a threadlocal resuming_frames: ?</em>ArrayList(FrameSnapshot) in the thread GC record, set at resumeContinuation entry / cleared at exit / saved-restored for nesting; markValue traces frames.items[head..]. scope_delta (coroutines.zig:1263) is provably re-rooted on the registered active_scope_stack before the slice is freed.
 4. SCHEDULER + CROSS-THREAD IN-FLIGHT. Register the global Pool, the coro_reg channel registry, DriverWakeups, and SlotOwners.pending as global root providers; under each's existing mutex during STW, trace every queued Task.block + Task.seed handle set, every channel buffer/send_waiter/receive_iter_waiter Value+iter, every mailbox entry. FIX (fatal channel hole): coro_reg (kotlinx_coroutines.zig) is a separate module-global with NO Vm linkage and a synthetic-id-keyed map; it is made a first-class GC root provider with an explicit trace under coro_reg_mutex that marks channels.valueIterator() state.buffer elements, send_waiters[<em>].value, receive_iter_waiters[</em>].iter, and the iterator instances — the GC adds a MARK pass over exactly the containers the existing sweepRegistryAtRunBoundary/drainSlotOwners teardown already centrally knows. FIX (worker pop window): the per-thread GC record gains pinned_task: ?<em>Task; in Pool.workerMain (scheduler.zig:280-296) the pin is set under the pool mutex at the moment takeEligible returns the task (scheduler.zig:289), BEFORE releasing the queue mutex, and cleared only after the child Vm is registered in gc_vms; the record trace walks pinned_task.block AND pinned_task.seed handle set. The same pin covers kotlin.concurrent.thread's workerEntry args.block (intrinsic_host.zig:739).
-5. GLOBALS / PROGRAM GRAPH. The live Vm (and worker child Vms, which share cells by handle clone) registers its handle set in a global gc_vms list at vmNew, deregisters at vmDeinit. Marking is idempotent so registering all Vms is redundant-safe: Vm.globals, classes (ClassTable→ClassDef graph), prog, object_states (incl. ObjectInitState.InProgress.instance), class_default_outer, anon_methods, out_sink. FIX (fatal closure-registry leak, defeats bounded RSS): SharedClosures (interp_ir.zig:481) is NOT a strong root. It is converted from an append-only vector into a SLOT MAP WITH A FREE-LIST: each ClosureInfo carries the canonical capture cell, an IrClosure Value holds the id, and the sweep drops a ClosureInfo (and frees its slot id for reuse) when no live IrClosure references that id. To make "no live IrClosure references the id" decidable by tracing, the IrClosure's separate dup'd ValueSlice (host_call_value.zig:646) is UNIFIED with the canonical table cell: the IrClosure carries the same capture cell the table indexes (a clone, not a dup), so liveness of the captures follows liveness of the IrClosure, and the table holds only a weak id→slot mapping the sweep nulls. Concretely: SharedClosures.obj is traced WEAKLY (its entries' captures are NOT marked through the table); after mark, a sweep-time pass over the table frees any slot whose captures cell came back unmarked (white) and returns its id to the free-list; buildLambda (host_call_value.zig:634), funcValueById (host_globals.zig:563), and host_call_value.zig:660 allocate into a free slot when available. This is the only way the design's primary bounded-RSS goal is attainable.
+5. GLOBALS / PROGRAM GRAPH. The live Vm (and worker child Vms, which share cells by handle clone) registers its handle set in a global gc_vms list at vmNew, deregisters at vmDeinit. Marking is idempotent so registering all Vms is redundant-safe: the Vm's resolved run state (statics, init units, singletons) and out_sink. FIX (fatal closure-registry leak, defeats bounded RSS): SharedClosures (interp_ir.zig:481) is NOT a strong root. It is converted from an append-only vector into a SLOT MAP WITH A FREE-LIST: each ClosureInfo carries the canonical capture cell, an IrClosure Value holds the id, and the sweep drops a ClosureInfo (and frees its slot id for reuse) when no live IrClosure references that id. To make "no live IrClosure references the id" decidable by tracing, the IrClosure's separate dup'd ValueSlice (host_call_value.zig:646) is UNIFIED with the canonical table cell: the IrClosure carries the same capture cell the table indexes (a clone, not a dup), so liveness of the captures follows liveness of the IrClosure, and the table holds only a weak id→slot mapping the sweep nulls. Concretely: SharedClosures.obj is traced WEAKLY (its entries' captures are NOT marked through the table); after mark, a sweep-time pass over the table frees any slot whose captures cell came back unmarked (white) and returns its id to the free-list; buildLambda (host_call_value.zig:634), funcValueById (host_globals.zig:563), and host_call_value.zig:660 allocate into a free slot when available. This is the only way the design's primary bounded-RSS goal is attainable.
 6. HOST-OP TEMPORARIES (the design's residual — promoted from "optional fallback" to MANDATORY mechanism). A per-thread traced host_keepalive root stack (an ArrayList of Value/[]Value, in the thread GC record). The "route through a frame register" strategy is REJECTED as the primary approach: pure-host re-entry (a host op iterating a host-built slice and calling a user selector via invoke/invokeCallable/callValueRec) has NO calling frame register that holds the accumulator — the value was created by the host and lives only in the host's ArrayList. Every host op that holds a Value/MapPair local (an accumulator ArrayList, an iterableItems/snapshot slice including freshly-boxed Map MapEntry cells, a comparator's a/b/ka locals) across an invoke</em> / callValueRec call pushes its in-progress contents onto host_keepalive before the first re-entrant call and pops at host-op exit. The GC traces host_keepalive during STW. A Debug assertion verifies host_keepalive is empty at every opcode boundary reached from top-level (not mid-host-op) to catch leaked obligations; a comptime/Debug lint flags any stdlib fn containing both an accumulator local and an invoke call without a keepalive scope.</p>
 <p>NATIVE STATE (minor fix, latent UAF closed): NativeBox (class.zig:398) gains an optional gc_trace: ?<em>const fn(</em>anyopaque, *Marker) void alongside destroy. Bindings that box Values supply it; bindings with value-free payloads (the kotlinx.io.Buffer placeholder) leave it null. InstanceData.gcTrace calls native_state.data's gc_trace when present. A Debug assertion at the ensureNativeState boundary asserts a null trace implies a Value-free payload, so a future value-bearing native binding cannot silently reintroduce a UAF.</p>
 <p>PARTIAL-SINGLETON WINDOW (serious fix): the in-construction object/companion/enum shell is pinned on host_keepalive from ObjRef(InstanceData).init (host_instances.zig:2004) until it is published into ObjectInitState.InProgress.instance under the object_states writer lock, with no intervening opcode boundary; materializeInstance and the lazy-object/companion/enum_entry_arg_inits routines are audited for the create→publish gap.</p>
 <p>MAP-VIEW BACKING (fatal fix — freed-while-live source map under a live view): forEachChildCell is given a GC-mark variant (a separate visitor from retain/release) that DOES visit <code>backing</code> for List/Set and MapEntry.backing, turning the non-owning write-through view into an owning root from the GC's perspective (it cannot leak: a dropped source map means the view is the legitimate sole owner). Additionally MapBacking (value.zig:49) — today a raw a.create(MapBacking) (collections.zig:3762,3782,3806) that is neither on gc_all_cells nor traceable — is promoted to a registered ObjRef(MapBacking) cell with a gcTrace that marks backing.entries, so it is both swept and reaches the source map. The audit enumerates ALL non-cell raw *T allocations that transitively hold ObjRefs/Values (MapBacking is the one found) and registers each. The Stage-1 write barrier list is extended past the five named sites: MapEntry.setValue's write-through (host_call_member.zig:3839) and syncMapView's in-place rewrite (collections.zig:2212) are funneled through a single MapEntries.writeThrough helper that contains the barrier; raw borrowMut().get().items[i] = value on a MapEntries is forbidden from host ops.</p>
 <p>MARK &amp; SWEEP
 - MARK: tri-color with an EXPLICIT work-list (ArrayList of *GcHeader), never native recursion. Seed greys from all roots via markValue(v) driving the GC-mark forEachChildCell variant: CAS-set each child's gc_mark to current_epoch (white→grey) and push. Pop a grey, call its gc_trace thunk, shade children grey, blacken self. A cell already at current_epoch is skipped, so cycles terminate.
-- SWEEP: single pass over gc_all_cells. If gc_mark != current_epoch: unlink, run gc_finalize (the SHALLOW teardown — own buffers/bytes/HashMap spine only, NEVER child Values), then allocator.destroy(cell). Payload deinits are split: InstanceData.gcFinalize keeps fields.deinit(allocator) but DROPS the <code>for fields |f| f.value.release()</code> loop (class.zig:324) and <code>outer.release</code> and <code>class.deinit</code>; Env.gcFinalize keeps vars.deinit() drops parent.deinit() (env.zig:27); releaseValueList/releaseSliceElems/the Map last-owner element release (value.zig:580-598) are gated off — only the buffer free remains. Each cell is freed exactly once; no resurrection (no Kotlin finalizers). The weak closure-table sweep pass (root 5) runs after the cell sweep. Epoch-wrap invariant documented: every reachable cell is re-marked every collection, so wrap can only DELAY (never prevent) reclamation of an unreachable cell — a bounded leak, not a UAF — and the usize width makes it unobservable.</p>
+- SWEEP: single pass over gc_all_cells. If gc_mark != current_epoch: unlink, run gc_finalize (the SHALLOW teardown — own buffers/bytes/HashMap spine only, NEVER child Values), then allocator.destroy(cell). Payload deinits are split: InstanceData.gcFinalize keeps fields.deinit(allocator) but DROPS the <code>for fields |f| f.value.release()</code> loop (class.zig:324) and <code>outer.release</code> and <code>class.deinit</code>; Env.gcFinalize keeps vars.deinit() drops parent.deinit() (env.zig:27); releaseValueList/releaseSliceElems/the Map last-owner element release (value.zig:580-598) are gated off — only the buffer free remains. Each cell is freed exactly once; the only resurrection is a dead cleaner's job, which the weak registry's pass marks before the sweep (see Completed). The weak closure-table sweep pass (root 5) runs after the cell sweep. Epoch-wrap invariant documented: every reachable cell is re-marked every collection, so wrap can only DELAY (never prevent) reclamation of an unreachable cell — a bounded leak, not a UAF — and the usize width makes it unobservable.</p>
 <p>SAFE POINTS &amp; CONCURRENCY
 - WHEN: only at opcode boundaries — top of the while(true) block loop / before each execInst (eval.zig:891/925), beside shouldAbandon() (eval.zig:896); plus the pump loop top and the worker idle loop (scheduler.zig:279). Check: <code>if (runtime.gcPending()) runtime.gcSafePoint();</code>.
 - DEFERRED TRIGGER: initOwned bumps gc_bytes; crossing the threshold ONLY sets a threadlocal+global gc_pending flag and returns the cell — NEVER collects inline. So no safe point exists inside a host op; its in-construction temporaries are observed by a collector only AFTER they are either written into a frame register or pushed onto host_keepalive.

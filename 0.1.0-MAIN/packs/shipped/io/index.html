@@ -967,6 +967,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1102,6 +1106,17 @@
       Table of contents
     </label>
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features
+      
+    </span>
+  </a>
+  
+</li>
       
         <li class="md-nav__item">
   <a href="#surface" class="md-nav__link">
@@ -1285,6 +1300,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1308,6 +1379,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1453,6 +1528,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../development/contributing/" class="md-nav__link">
         
   
@@ -1506,6 +1637,17 @@
       Table of contents
     </label>
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Features
+      
+    </span>
+  </a>
+  
+</li>
       
         <li class="md-nav__item">
   <a href="#surface" class="md-nav__link">
@@ -1572,6 +1714,35 @@ segment-based <code>Buffer</code>, the <code>Source</code> / <code>Sink</code> /
 <code>RawSink</code> hierarchy with their extension surfaces, UTF-8 codecs, and
 the <code>ByteString</code> module (<code>ByteString</code>, <code>ByteStringBuilder</code>).
 klio-authored actuals under <code>klioMain</code> supply the platform layer.</p>
+<h2 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h2>
+<p>One feature per upstream module. <code>core</code> (kotlinx-io-core) is the default
+and is built on <code>bytestring</code> (kotlinx-io-bytestring); a consumer that only
+wants <code>ByteString</code> takes the pack with <code>default_features = false</code> and
+<code>features = ["bytestring"]</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Module</th>
+<th>Surface</th>
+<th>Requires</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bytestring</code></td>
+<td>kotlinx-io-bytestring</td>
+<td><code>ByteString</code>, <code>ByteStringBuilder</code>, Base64 / hex codecs</td>
+<td></td>
+</tr>
+<tr>
+<td><code>core</code></td>
+<td>kotlinx-io-core</td>
+<td><code>Buffer</code>, <code>Source</code> / <code>Sink</code>, UTF-8, <code>kotlinx.io.files</code></td>
+<td><code>bytestring</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="surface">Surface<a class="headerlink" href="#surface" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">kotlinx.io.Buffer</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">import</span><span class="w"> </span><span class="nn">kotlinx.io.Source</span>

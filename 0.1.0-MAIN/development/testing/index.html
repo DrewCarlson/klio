@@ -963,6 +963,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1201,6 +1205,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1226,6 +1286,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1397,10 +1461,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#3-corpus-parity-sweep" class="md-nav__link">
+  <a href="#3-corpus-parity-suites" class="md-nav__link">
     <span class="md-ellipsis">
       
-        3. Corpus + parity sweep
+        3. Corpus + parity suites
       
     </span>
   </a>
@@ -1452,10 +1516,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#harness-build-modes-and-the-shared-stdlib-base" class="md-nav__link">
+  <a href="#harness-build-modes-and-the-base-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Harness build modes and the shared stdlib base
+        Harness build modes and the base image
       
     </span>
   </a>
@@ -1497,6 +1561,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1594,10 +1714,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#3-corpus-parity-sweep" class="md-nav__link">
+  <a href="#3-corpus-parity-suites" class="md-nav__link">
     <span class="md-ellipsis">
       
-        3. Corpus + parity sweep
+        3. Corpus + parity suites
       
     </span>
   </a>
@@ -1649,10 +1769,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#harness-build-modes-and-the-shared-stdlib-base" class="md-nav__link">
+  <a href="#harness-build-modes-and-the-base-image" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Harness build modes and the shared stdlib base
+        Harness build modes and the base image
       
     </span>
   </a>
@@ -1707,9 +1827,10 @@ cases, and every diagnostic the code can emit.</p>
 <ul>
 <li><code>zig build test</code> — the fast module unit tests only (seconds). Use
   this in the inner dev loop.</li>
-<li><code>zig build itest</code> — the integration suite: it interprets whole
-  programs (the <code>parity</code> sweep, <code>e2e</code>, <code>stdlib_commontest</code>, etc.), so
-  it takes minutes. Run one in isolation with <code>zig build itest-&lt;name&gt;</code>.</li>
+<li><code>zig build itest</code> — the integration suite: it runs whole programs
+  through the harness binary (the <code>parity_*</code> suites, <code>e2e</code>,
+  <code>stdlib_commontest</code>, etc.), so it takes minutes. Run one in isolation
+  with <code>zig build itest-&lt;name&gt;</code>.</li>
 <li><code>zig build test-all</code> — both.</li>
 <li><code>-Ditest-shard=K/N</code> — run only shard K of the integration suite. The
   suites (plus <code>e2e</code> and <code>bench</code>) are packed into N weight-balanced
@@ -1718,44 +1839,51 @@ cases, and every diagnostic the code can emit.</p>
   tests as their own fast job. Keep the weights of the heavy suites
   roughly current when their cost changes materially.</li>
 </ul>
-<p>Fast resolution-audit cycle: the overload-resolution unification work
-verifies a scorer slice with
-<code>scripts/resolve_audit_sweep.py --build</code>, not the ~18-minute ReleaseSafe
-canonical. It rebuilds the fast Debug <code>klio</code> (~2s incremental) and sweeps the
-whole stdlib commonTest corpus with <code>KLIO_RESOLVE_AUDIT=1</code>, reporting every
-<code>[KLIO_RESOLVE_AUDIT] &lt;member|scorer&gt; ... divergent=1</code> line where the shared
-<code>applicable()</code> disagrees with the legacy scorer (~2 minutes, 32-way). Zero
-divergence proves the shared engine reproduces the legacy scorer before the
-flip — a stronger check than the flaky ±3 canonical count. Reserve the
-ReleaseSafe canonical (<code>zig build itest-stdlib_commontest</code>) for the flip
-milestones.</p>
 <h2 id="2-negative-tests">2. Negative tests<a class="headerlink" href="#2-negative-tests" title="Permanent link">&para;</a></h2>
 <p><code>src/itests/typeck_negative.zig</code> (fixtures under
 <code>tests/fixtures/typeck_negative/</code>) pins diagnostic wording per code.
 Removing a diagnostic or changing its phrasing fails the matching
 case.</p>
-<h2 id="3-corpus-parity-sweep">3. Corpus + parity sweep<a class="headerlink" href="#3-corpus-parity-sweep" title="Permanent link">&para;</a></h2>
-<p>The <code>parity</code> module is a primary correctness gate:</p>
+<h2 id="3-corpus-parity-suites">3. Corpus + parity suites<a class="headerlink" href="#3-corpus-parity-suites" title="Permanent link">&para;</a></h2>
+<p>Every program-running suite runs Kotlin the way a user does: through the
+harness binary (<code>KLIO_ITEST_BIN</code>) as a child <code>klio run</code>, over a data home
+with the shipped packs installed. <code>src/itests/klio_child.zig</code> is the shared
+runner. The build's <code>klio-test-home</code> step builds and installs every pack
+once into <code>zig-out/klio-test-home</code> with the harness, keyed by the harness
+binary and every pack source, and names it in <code>KLIO_ITEST_HOME</code>; a suite
+binary started by hand without it installs the packs into
+<code>/tmp/klio_itest_home</code> on first use.</p>
 <ul>
-<li>Walks every <code>.kt</code> under <code>tests/fixtures/parity_corpus/</code> and
-  <code>examples/</code>.</li>
-<li>Compiles each through <code>kotlinc</code> and through klio.</li>
-<li>Diffs stdout. Any byte difference fails the sweep.</li>
+<li>The <code>parity_*</code> suites (folded into the <code>group_parity_core</code>, <code>_types</code> and
+  <code>_shapes</code> binaries) and <code>parity_corpus_pinned</code>
+  (<code>tests/fixtures/parity_corpus/</code>) pin kotlinc's output for each program.
+  They run with <code>--virtual-time</code>, and compare stdout line by line with
+  every line newline-terminated.</li>
+<li><code>parity_threaded_litmus</code> runs <code>tests/fixtures/threaded_litmus/</code> and the
+  memory-model conformance programs on real threads.</li>
+<li><code>differential</code> runs every example and coroutine smoke program over the
+  cached base image and over a base analyzed afresh (<code>KLIO_SEMA_IMAGE=0</code>);
+  the outcomes must be identical, and independent of program order.</li>
+<li>The Compose examples have their own oracle: Compose Desktop 1.12.0 on the
+  JVM. <code>scripts/compose-oracle.py &lt;example&gt;...</code> compiles an example that
+  uses <code>KlioComposeScene</code>, the headless helper klio's ui pack defines over
+  upstream's ImageComposeScene, with kotlinc 2.4.20 and the Compose compiler
+  plugin, beside the same helper over Compose Desktop's ImageComposeScene,
+  runs it headless, runs it on klio, and diffs the two
+  outputs (pixels read back, text metrics, event sequences). <code>--jvm-only</code>
+  prints the JVM output, which is the expected output for a new example.
+  The classpath is resolved from Maven by <code>scripts/compose-oracle-fetch.py</code>
+  into <code>target/parity-cache/compose-desktop-1.12.0</code> on first use.</li>
+<li>The <code>e2e</code> module runs every <code>examples/*.kt</code> against the checked-in
+  expected output under <code>tests/corpus/expected/</code>, byte for byte, with JIT on
+  and off.</li>
 </ul>
-<p>The harness defaults to JVM <code>kotlinc</code> (fast: ~1s compile, jar run)
-and targets Kotlin 2.4.20. It auto-installs a pinned <code>kotlinc</code> if
+<p><code>src/itests/kotlinc_support.zig</code> locates or installs the reference compiler.
+It defaults to JVM <code>kotlinc</code> (fast: ~1s compile, jar run) and targets Kotlin
+2.4.20, auto-installing a pinned <code>kotlinc</code> under <code>target/parity-cache</code> if
 none is found; set <code>KLIO_KOTLINC_JVM_HOME</code> to point at an existing
-distribution, or <code>KLIO_NO_AUTO_INSTALL_KOTLINC=1</code> to disable
-auto-install (the parity tests then skip).</p>
-<p>The <code>e2e</code> module runs every <code>examples/*.kt</code> in-process against the
-checked-in expected output under <code>tests/corpus/expected/</code>, so the
-example corpus is part of <code>zig build itest</code> (it interprets programs,
-so it rides the integration suite, not the fast unit step).</p>
-<p>In-process parity/e2e execution uses the same runtime profile as the CLI:
-<code>safe</code> by default (interpreter plus tracing GC), <code>fast</code> when requested, and
-the no-GC phase arena only under the explicit <code>off</code> profile. Parsing and IR
-lowering remain arena-scoped compiler phases; VM cells use the production
-page-returning slab allocator and are collected at each program boundary.</p>
+distribution, or <code>KLIO_NO_AUTO_INSTALL_KOTLINC=1</code> to disable auto-install.
+The fuzzer diffs a failing program against it.</p>
 <p>The corpus only grows. Removing a <code>.kt</code> from it is a deliberate act
 that requires reviewer sign-off.</p>
 <h2 id="4-stdlib-commontest-suite">4. Stdlib commonTest suite<a class="headerlink" href="#4-stdlib-commontest-suite" title="Permanent link">&para;</a></h2>
@@ -1789,9 +1917,8 @@ points:</p>
 <li><code>scripts/commontest-sweep.py BIN</code> — the iteration driver: per-file
   pass counts and failed test names for any klio binary.
   <code>--filter &lt;File&gt;</code> runs one file (~16 s), <code>--passes</code> prints
-  per-file counts, and <code>--eager both</code> runs the whole corpus under
-  eager resolution OFF and ON and reports any divergence between the
-  two modes.</li>
+  per-file counts, and <code>--eager both</code> runs the whole corpus twice and
+  reports any run-to-run divergence.</li>
 </ul>
 <h2 id="4a-library-commontest-suites-project-mode">4a. Library commonTest suites (project mode)<a class="headerlink" href="#4a-library-commontest-suites-project-mode" title="Permanent link">&para;</a></h2>
 <p>Each kotlinx/ktor library is a <em>project</em> (<code>kotlin-klio/klio-*</code>) whose
@@ -1817,6 +1944,18 @@ the external sweep's ad-hoc flags:</p>
 ratchet the pass count. The migration from the per-file driver + the
 Python sweep to a single <code>klio test &lt;project&gt; --format=json</code> is
 tracked in <code>plans/open-campaigns.md</code>.</p>
+<p>A suite whose tests call a server over the network declares it as a
+<code>service</code> in its <code>commontest_support.suites</code> entry: the <code>klio</code> arguments
+that start it and the port it listens on. The census starts the
+service before the suite's children, waits until the port accepts on
+127.0.0.1 (<code>ready_ms</code>), and kills it when the suite ends. Its output
+goes to <code>klio-census-&lt;suite&gt;-service.log</code> in the temporary directory,
+and the census prints the log's tail when the service never answers or
+the suite fails. Port zero picks a free port, which the service and
+every child read from <code>KLIO_SERVICE_PORT</code>; a fixed port is for tests
+that name one (ktor's client suites call its test server at
+127.0.0.1:8080), and suites sharing a fixed port take turns on a lock
+file in the temporary directory, across worktrees too.</p>
 <h2 id="5-pack-smoke-tests">5. Pack smoke tests<a class="headerlink" href="#5-pack-smoke-tests" title="Permanent link">&para;</a></h2>
 <p>Every pack ships a smoke flow:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>./zig-out/bin/klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>kotlin-klio/klio-kotlinx-datetime
@@ -1831,53 +1970,27 @@ binding resolution and the shipped Kotlin source.</p>
 Zig module with its dependency graph wired via explicit <code>-M</code> flags —
 no <code>build.zig</code> edit, no rebuilding of unrelated modules. Pass
 <code>--build-only</code> to just compile.</p>
-<h2 id="harness-build-modes-and-the-shared-stdlib-base">Harness build modes and the shared stdlib base<a class="headerlink" href="#harness-build-modes-and-the-shared-stdlib-base" title="Permanent link">&para;</a></h2>
-<p>Two mechanisms keep the suite fast:</p>
+<h2 id="harness-build-modes-and-the-base-image">Harness build modes and the base image<a class="headerlink" href="#harness-build-modes-and-the-base-image" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Harness optimize mode.</strong> The program-running test binaries (the
-  <code>parity_*</code> itests, <code>e2e</code>, <code>bench</code>, the fuzzer, the differential, and
-  the child-spawning ktor/json gates) compile ReleaseSafe — safety
+<li><strong>Harness optimize mode.</strong> The program-running suites spawn
+  <code>zig-out/bin/klio-harness</code>, which compiles ReleaseSafe — safety
   checks stay on — via the <code>-Dharness-optimize</code> option (default
   <code>ReleaseSafe</code>). Per-module unit tests and the installed
   <code>zig-out/bin/klio</code> keep the default optimize mode, so the
   <code>testing.allocator</code> leak/UAF discipline and developer-facing
-  behavior are unchanged. The child-spawning itests run programs
-  through <code>zig-out/bin/klio-harness</code> (also buildable directly with
-  <code>zig build klio-harness</code>); set <code>KLIO_ITEST_BIN</code> to point them at a
-  different binary.</li>
-<li><strong>Once-per-process stdlib base.</strong> The in-process harness path
-  (<code>parity.runInMode</code> and everything built on it) lowers the stdlib
-  and pack sources once per (load mode, pack subset, stdlib gate) into
-  an immutable snapshot, then extends an arena-backed clone with just
-  each program's declarations. A program that redeclares a base
-  top-level name (or uses expect/actual, a base package, or a
-  function-type alias matching a base parameter type) takes the
-  original whole-program build instead, so resolution semantics are
-  never approximated. Set <code>KLIO_TRACE_STDLIB_BASE=1</code> to print one
-  <code>fast</code>/<code>fallback</code> line per program. The
-  <code>parity_stdlib_isolation</code> itest and the differential's
-  order-independence test gate cross-program contamination.</li>
-<li><strong>Build-time baked parity bases.</strong> The <code>parity-base-gen</code> build step
-  bakes the EmbeddedOnly bases (both stdlib gate variants) to
-  <code>zig-out/parity-base/embedded-gate{0,1}.klio-image</code> once per build,
-  and every parity-data run step points its processes at them via
-  <code>KLIO_PARITY_BASE_IMAGES</code>, so each test binary loads the lowered
-  stdlib instead of re-parsing and re-lowering it at startup. The
-  image bytes are declared run-step cache inputs, and any read or
-  decode failure falls back to the per-process source build. When
-  running an installed <code>zig-out/bin/itest-*</code> binary by hand, export
-  <code>KLIO_PARITY_BASE_IMAGES=zig-out/parity-base</code> to keep the fast
-  startup.</li>
-<li><strong>Baked stdlib image (the CLI's equivalent).</strong> <code>klio run</code> serializes
-  the same kind of lowered base to <code>~/.klio/cache</code> on first use and
-  loads + extends it on every later run (<code>src/interp_ir/image.zig</code>,
-  <code>src/cli/stdlib_image.zig</code>). The <code>stdlib_image</code> itest gates it: bake
-  → hit → fallback → corrupted image → stale stdlib source, each
-  byte-compared against the legacy whole-program build, plus an
-  in-process bake/load round trip over the lowered tables. The codec
-  itself (memoizing postcard variant) has unit tests in
-  <code>src/interp_ir/image.zig</code>. Set <code>KLIO_STDLIB_IMAGE=0</code> to disable and
-  <code>KLIO_TRACE_STDLIB_IMAGE=1</code> to trace.</li>
+  behavior are unchanged. <code>zig build klio-harness</code> builds it directly;
+  set <code>KLIO_ITEST_BIN</code> to point a suite at a different binary.</li>
+<li><strong>The base image.</strong> <code>klio run</code> bakes the analyzed and lowered base (the
+  stdlib and the packs a program loads) to
+  <code>$KLIO_HOME/.klio/cache/sema-base-&lt;key&gt;.klio-sema</code> on first use, keyed by
+  the binary and the base's text, and builds every later program over it.
+  The <code>stdlib_image</code> itest gates it: bake → hit, a redeclared stdlib name,
+  a corrupted image, a stale stdlib source and an installed pack, each
+  compared byte for byte against a run over a base analyzed afresh
+  (<code>KLIO_SEMA_IMAGE=0</code>). The image's own encoding is tested in the
+  <code>lower_driver</code> module (<code>src/lower_driver/tests/image.zig</code>).
+  <code>parity_stdlib_isolation</code> and the differential's order-independence
+  test gate cross-program contamination through the cached image.</li>
 </ul>
 <h2 id="the-iteration-playbook">The iteration playbook<a class="headerlink" href="#the-iteration-playbook" title="Permanent link">&para;</a></h2>
 <p>Match the check to the size of the change
@@ -1887,17 +2000,19 @@ no <code>build.zig</code> edit, no rebuilding of unrelated modules. Pass
   <code>zig build klio-harness -Dharness-optimize=Debug</code> (~16 s per
   rebuild, installs as <code>zig-out/bin/klio-harness-Debug</code>). The Debug
   interpreter runs ~4x slower — fine for single repros.</li>
-<li><strong>Targeted commontest check</strong> (one file, both eager modes):
-  <code>python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both</code></li>
+<li><strong>Targeted commontest check</strong> (one file):
+  <code>python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest</code></li>
 <li><strong>One suite</strong>: <code>zig build itest-&lt;name&gt;</code>. Never build <code>itest-bin</code>
   (all standalone itest binaries) during iteration.</li>
-<li><strong>Full gate before a commit</strong>: <code>scripts/gate.sh</code> — unit tests, the
-  litmus/e2e/examples/ktor/concurrency suites, the compose-ui gate, a
-  tree-keyed reinstall of every shipped pack into <code>.klio-local</code>
-  (<code>scripts/refresh-local-packs.sh</code>, so the CLI corpus check below runs
-  pack IR lowered from this tree, not whatever installed it last), the
-  full example corpus through the CLI, then the commontest dual eager
-  gate. <code>--no-sweep</code> skips the slow tail.</li>
+<li><strong>Full gate before a commit</strong>: <code>scripts/gate.sh</code> — the Skia shim
+  (<code>scripts/fetch-skia.sh</code>, then <code>zig build skia-lib</code>; see the verification
+  playbook), unit tests, the parity groups, the threaded litmus, e2e and the ktor/concurrency suites,
+  a tree-keyed reinstall of every shipped pack into <code>.klio-local</code>
+  (<code>scripts/refresh-local-packs.sh</code>), the compose-ui gate, the full example
+  corpus through the CLI, the sema census (<code>scripts/sema-census.py</code>: no
+  unresolved or unrecorded reference in the base, any installed pack or the
+  corpus beyond <code>tests/sema-census-open.txt</code>), then the commontest sweep.
+  <code>--no-sweep</code> skips the slow tail.</li>
 <li><strong>Cache</strong>: <code>scripts/prune-zig-cache.sh [days]</code> when <code>.zig-cache</code>
   grows unreasonably (Zig has no cache GC of its own).</li>
 </ul>

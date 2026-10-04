@@ -10,13 +10,13 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/getting-started/cli/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/development/platforms/">
       
       
-        <link rel="prev" href="../hello-world/">
+        <link rel="prev" href="../debugging/">
       
       
-        <link rel="next" href="../../testing/">
+        <link rel="next" href="../cold-start/">
       
       
         
@@ -27,7 +27,7 @@
     
     
       
-        <title>CLI Tour - Klio</title>
+        <title>Platforms - Klio</title>
       
     
     
@@ -70,7 +70,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#cli-tour" class="md-skip">
+        <a href="#platforms" class="md-skip">
           Skip to content
         </a>
       
@@ -110,7 +110,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              CLI Tour
+              Platforms
             
           </span>
         </div>
@@ -256,10 +256,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -282,11 +280,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
         
           
           <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
@@ -307,7 +305,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_2">
             <span class="md-nav__icon md-icon"></span>
             
@@ -325,7 +323,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../installation/" class="md-nav__link">
+      <a href="../../getting-started/installation/" class="md-nav__link">
         
   
   
@@ -353,7 +351,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../hello-world/" class="md-nav__link">
+      <a href="../../getting-started/hello-world/" class="md-nav__link">
         
   
   
@@ -378,37 +376,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    CLI Tour
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../getting-started/cli/" class="md-nav__link">
         
   
   
@@ -424,109 +395,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#running-and-inspecting-programs" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Running and inspecting programs
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Running and inspecting programs">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#performance-profile" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Performance profile
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#the-base-image-cache" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The base image cache
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#working-with-packs" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Working with packs
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#stdlib-resolution" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Stdlib resolution
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#environment-variables" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Environment variables
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#examples" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Examples
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1412,8 +1280,10 @@
       
   
   
+    
   
   
+  
     
     
       
@@ -1438,11 +1308,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
         
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
@@ -1463,7 +1333,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1481,7 +1351,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/workspace/" class="md-nav__link">
+      <a href="../workspace/" class="md-nav__link">
         
   
   
@@ -1509,7 +1379,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/testing/" class="md-nav__link">
+      <a href="../testing/" class="md-nav__link">
         
   
   
@@ -1537,7 +1407,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/debugging/" class="md-nav__link">
+      <a href="../debugging/" class="md-nav__link">
         
   
   
@@ -1562,10 +1432,37 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../../development/platforms/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -1581,6 +1478,70 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#what-the-platform-layer-provides" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What the platform layer provides
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-windows-does-not-have" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What Windows does not have
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-builds" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross builds
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-each-platform-is-verified" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How each platform is verified
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1593,7 +1554,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/cold-start/" class="md-nav__link">
+      <a href="../cold-start/" class="md-nav__link">
         
   
   
@@ -1621,7 +1582,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../development/contributing/" class="md-nav__link">
+      <a href="../contributing/" class="md-nav__link">
         
   
   
@@ -1676,49 +1637,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#running-and-inspecting-programs" class="md-nav__link">
+  <a href="#what-the-platform-layer-provides" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Running and inspecting programs
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Running and inspecting programs">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#performance-profile" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Performance profile
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#the-base-image-cache" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The base image cache
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#working-with-packs" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Working with packs
+        What the platform layer provides
       
     </span>
   </a>
@@ -1726,10 +1648,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#stdlib-resolution" class="md-nav__link">
+  <a href="#what-windows-does-not-have" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Stdlib resolution
+        What Windows does not have
       
     </span>
   </a>
@@ -1737,10 +1659,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#environment-variables" class="md-nav__link">
+  <a href="#cross-builds" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Environment variables
+        Cross builds
       
     </span>
   </a>
@@ -1748,10 +1670,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#examples" class="md-nav__link">
+  <a href="#how-each-platform-is-verified" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Examples
+        How each platform is verified
       
     </span>
   </a>
@@ -1775,7 +1697,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/getting-started/cli.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/development/platforms.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1783,211 +1705,141 @@
   
 
 
-<h1 id="cli-tour">CLI tour<a class="headerlink" href="#cli-tour" title="Permanent link">&para;</a></h1>
-<p><code>klio</code> exposes everything through subcommands. Run <code>klio --help</code> for
-the live list.</p>
-<h2 id="running-and-inspecting-programs">Running and inspecting programs<a class="headerlink" href="#running-and-inspecting-programs" title="Permanent link">&para;</a></h2>
+<h1 id="platforms">Platforms<a class="headerlink" href="#platforms" title="Permanent link">&para;</a></h1>
+<p>klio builds for macOS, Linux and Windows on x86_64 and aarch64
+(<code>-Dtarget=x86_64-windows-gnu</code>, <code>x86_64-linux-gnu</code>, <code>aarch64-linux-gnu</code>,
+...). The interpreter reaches the operating system in one place,
+<code>src/runtime/platform.zig</code>; the rest of the tree calls it rather than libc,
+<code>std.posix</code> or kernel32 directly.</p>
+<h2 id="what-the-platform-layer-provides">What the platform layer provides<a class="headerlink" href="#what-the-platform-layer-provides" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
-<th>Command</th>
-<th>Purpose</th>
+<th>Need</th>
+<th>macOS and Linux</th>
+<th>Windows</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>klio run &lt;files...&gt;</code></td>
-<td>Execute one or more Kotlin files as a single module.</td>
+<td>Monotonic clock</td>
+<td><code>clock_gettime(CLOCK_MONOTONIC)</code></td>
+<td><code>QueryPerformanceCounter</code></td>
 </tr>
 <tr>
-<td><code>klio test &lt;file\|dir...&gt;</code></td>
-<td>Run <code>kotlin.test</code> <code>@Test</code> functions; see <a href="../../testing/">Testing</a>.</td>
+<td>Wall clock</td>
+<td><code>clock_gettime(CLOCK_REALTIME)</code></td>
+<td><code>GetSystemTimePreciseAsFileTime</code></td>
 </tr>
 <tr>
-<td><code>klio check &lt;files...&gt;</code></td>
-<td>Resolve + type-check, emit diagnostics. Exits non-zero on error. <code>--format plain\|json\|sarif</code>; <code>--engine sema</code> analyzes as <code>klio run</code> does and names kotlinc's diagnostics.</td>
+<td>Sleep</td>
+<td><code>nanosleep</code></td>
+<td><code>Sleep</code>, with the process timer resolution raised to 1 ms (<code>timeBeginPeriod</code>)</td>
 </tr>
 <tr>
-<td><code>klio lex &lt;file&gt;</code></td>
-<td>Print the lexer's token stream.</td>
+<td>Mutex and condition variable</td>
+<td>pthread mutex and condition</td>
+<td>slim reader/writer lock and <code>CONDITION_VARIABLE</code></td>
 </tr>
 <tr>
-<td><code>klio parse &lt;file&gt;</code></td>
-<td>Print the parser's AST.</td>
+<td>Anonymous memory</td>
+<td><code>mmap</code> / <code>munmap</code></td>
+<td><code>VirtualAlloc</code> / <code>VirtualFree</code></td>
 </tr>
 <tr>
-<td><code>klio dump-ir &lt;file&gt;</code></td>
-<td>Lower a program and print its functions' IR without executing (<code>--func N</code> for one function, <code>--all</code> for the base's too); tallies DIRECT vs DYNAMIC call sites.</td>
+<td>Memory at an alignment</td>
+<td>map <code>len + alignment</code>, trim both ends</td>
+<td>find the aligned address in a probe reservation, release it, map exactly there</td>
 </tr>
 <tr>
-<td><code>klio transpile-dump &lt;file&gt;</code></td>
-<td>Print the program's functions as the bytecode streams the transpiler reads.</td>
+<td>Unmapping part of a mapping</td>
+<td><code>munmap</code> of the range</td>
+<td>decommit the range; release the reservation once none of it is committed</td>
 </tr>
 <tr>
-<td><code>klio repl</code></td>
-<td>Placeholder prompt — currently echoes input; not yet a live evaluator.</td>
+<td>Dropping pages, keeping the range</td>
+<td>a fresh <code>MAP_FIXED</code> anonymous mapping over them</td>
+<td>decommit and recommit (demand-zero pages)</td>
 </tr>
 <tr>
-<td><code>klio bake [files...]</code></td>
-<td>Pre-bake the base image cache (see below). <code>klio run</code> does this automatically on first use.</td>
+<td>Thread stacks</td>
+<td>pthread stacks, reserved and committed as they grow</td>
+<td><code>CreateThread</code> with the size as a reservation (<code>STACK_SIZE_PARAM_IS_A_RESERVATION</code>)</td>
 </tr>
 <tr>
-<td><code>klio bake-image &lt;files...&gt; -o &lt;out&gt;</code></td>
-<td>Write the programs' base (stdlib and packs) as one self-contained image, sources included.</td>
+<td>The interpreter's 256 MB stack on the calling thread</td>
+<td>the stack pointer moved onto a mapped region</td>
+<td>a fiber (<code>CreateFiberEx</code>), so the thread's recorded stack bounds move with it</td>
 </tr>
 <tr>
-<td><code>klio run-image &lt;image&gt; &lt;file&gt; [args...]</code></td>
-<td>Run a program over such an image, with no data home, pack install or checkout.</td>
+<td>The running executable's path</td>
+<td><code>/proc/self/exe</code>; <code>_NSGetExecutablePath</code> and <code>realpath</code></td>
+<td><code>GetModuleFileNameW</code></td>
 </tr>
 <tr>
-<td><code>klio bundle &lt;file\|dir&gt;</code></td>
-<td>Package a program into one self-contained executable; see <a href="../../BUNDLE/">Bundling programs</a>.</td>
+<td>Shared libraries (the Skia shim)</td>
+<td><code>dlopen</code></td>
+<td><code>LoadLibraryExW</code></td>
 </tr>
 <tr>
-<td><code>klio transpile &lt;files...&gt; [-o out.c]</code></td>
-<td>Write a C launcher (<code>out.c</code>) and the program's sema image beside it (<code>out.klio-image</code>). <code>zig cc out.c -I&lt;include&gt; -L&lt;lib&gt; -lklio_rt -lzstd</code> builds a binary that runs the program with no data home: a compiler with <code>#embed</code> builds the image in, and the program's sources are in the C. <code>--native</code> compiles the program itself to C over the same runtime.</td>
+<td>A report when the run is stopped</td>
+<td><code>SIGTERM</code> / <code>SIGINT</code> handlers</td>
+<td><code>SetConsoleCtrlHandler</code></td>
+</tr>
+<tr>
+<td>Resident memory, for the RSS watchdog</td>
+<td><code>/proc/self/statm</code>; mach task info</td>
+<td><code>K32GetProcessMemoryInfo</code></td>
+</tr>
+<tr>
+<td>Reading a bundle's own payload</td>
+<td><code>open</code>, <code>pread</code>, <code>mmap</code></td>
+<td><code>CreateFileW</code>, <code>ReadFile</code>, <code>MapViewOfFile</code></td>
 </tr>
 </tbody>
 </table>
-<p><code>klio run</code> takes <code>--virtual-time</code> (deterministic virtual time
-for coroutines) and <code>--feature &lt;pack&gt;/&lt;feature&gt;</code> (enable a
-feature-gated pack surface, repeatable); <code>klio test</code> accepts the
-same two.</p>
-<h3 id="performance-profile">Performance profile<a class="headerlink" href="#performance-profile" title="Permanent link">&para;</a></h3>
-<p>Every command accepts <code>--opt &lt;fast|safe|off&gt;</code> (equivalently the
-<code>KLIO_OPT</code> env var): <code>fast</code> enables the JIT tiers and the tracing
-GC, <code>safe</code> keeps the GC but stays on the interpreter, <code>off</code> is the
-interpreter over a never-free arena. <code>klio run</code> defaults to <code>fast</code>,
-<code>klio test</code> to <code>safe</code>. See
-<a href="../../architecture/performance/">Performance</a>.</p>
-<h3 id="the-base-image-cache">The base image cache<a class="headerlink" href="#the-base-image-cache" title="Permanent link">&para;</a></h3>
-<p>A program runs over its base: the stdlib, the sema actuals and the packs
-it imports. The first <code>klio run</code> of a base analyzes and lowers it and
-bakes the result to <code>~/.klio/cache/sema-base-&lt;key&gt;.klio-sema</code>; every
-later run over the same base loads that image and analyzes and lowers
-only the program. The key hashes the interpreter binary's identity and
-the path and text of every base file, so editing a stdlib source,
-installing a different pack or rebuilding <code>klio</code> bakes afresh; a stale
-image is never served. The build bakes the image of the base a program
-without packs runs on and installs it under <code>share/klio/cache</code> beside
-<code>bin/klio</code>; a run whose own cache misses reads that copy, so a freshly
-built klio's first run of such a program is already warm. <code>klio bake</code>
-pre-warms the cache (with files, for the base those programs run on
-together; without, for the base without packs).</p>
-<p><code>klio bake-image</code> writes a base as one self-contained file: the base
-image with the text of every base file and the pack features it was
-loaded with. <code>klio run-image</code> runs a program over it without reading
-the data home, the pack cache or a checkout; a bundle carries the same
-image.</p>
-<h2 id="working-with-packs">Working with packs<a class="headerlink" href="#working-with-packs" title="Permanent link">&para;</a></h2>
-<table>
-<thead>
-<tr>
-<th>Command</th>
-<th>Purpose</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>klio pack new &lt;dir&gt; [--id NAME]</code></td>
-<td>Scaffold a library: <code>klio.toml</code>, <code>src/main/kotlin/</code>, README.</td>
-</tr>
-<tr>
-<td><code>klio pack build &lt;dir&gt; [--out PATH]</code></td>
-<td>Build a <code>.klio-pack</code> from a directory holding a <code>klio.toml</code>. <code>--out</code> names the file.</td>
-</tr>
-<tr>
-<td><code>klio pack install &lt;pack&gt;</code></td>
-<td>Copy a pack into <code>~/.klio/packs/</code> so subsequent <code>klio run</code> calls see it.</td>
-</tr>
-<tr>
-<td><code>klio pack list</code></td>
-<td>Show every cached pack with version and dependency hints.</td>
-</tr>
-<tr>
-<td><code>klio pack remove &lt;id&gt; [--version VER]</code></td>
-<td>Delete a cached pack.</td>
-</tr>
-<tr>
-<td><code>klio pack inspect &lt;pack&gt;</code></td>
-<td>Print manifest, section sizes, and counts.</td>
-</tr>
-<tr>
-<td><code>klio pack verify &lt;pack&gt; [--smoke FILE.kt]</code></td>
-<td>Re-decode every section; with <code>--smoke</code>, run a program against it.</td>
-</tr>
-<tr>
-<td><code>klio pack stdlib --out PATH</code></td>
-<td>Rebuild the embedded stdlib pack (developer flow).</td>
-</tr>
-<tr>
-<td><code>klio pack migrate &lt;in&gt; [--out PATH]</code></td>
-<td>Migrate a pack to the current format version (passthrough at v1).</td>
-</tr>
-<tr>
-<td><code>klio pack train-dict &lt;packs...&gt; --out PATH</code></td>
-<td>Train a shared zstd dictionary from pack sections.</td>
-</tr>
-<tr>
-<td><code>klio pack publish &lt;pack&gt; [--registry DIR]</code></td>
-<td>Publish a pack into a local-filesystem registry.</td>
-</tr>
-<tr>
-<td><code>klio pack search &lt;query&gt; [--registry DIR]</code></td>
-<td>Search a registry's index by library id.</td>
-</tr>
-<tr>
-<td><code>klio pack fetch &lt;id&gt; [--version V] [--registry DIR]</code></td>
-<td>Fetch a pack from a registry into the local cache.</td>
-</tr>
-</tbody>
-</table>
-<p>The registry defaults to <code>~/.klio/registry</code>; its layout mirrors a
-Maven cache plus an <code>index.json</code>.</p>
-<h2 id="stdlib-resolution">Stdlib resolution<a class="headerlink" href="#stdlib-resolution" title="Permanent link">&para;</a></h2>
-<p>The interpreter resolves its stdlib pack in this order:</p>
-<ol>
-<li><code>KLIO_STDLIB_PACK</code> — an explicit on-disk pack override (a deliberate
-   per-run choice, so it wins over everything).</li>
-<li>The working directory's source checkout (<code>kotlin/libraries/stdlib</code>
-   plus <code>kotlin-klio/</code>), built fresh per run. This sits ahead of the
-   embedded bytes so in-repo stdlib <code>.kt</code> edits take effect without
-   rebuilding the binary.</li>
-<li>The pack bytes baked into the binary at build time — present in
-   every <code>zig build</code> binary, so <code>klio run</code> works from any directory
-   with no setup.</li>
-</ol>
-<h2 id="environment-variables">Environment variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h2>
+<p><code>std.Thread</code> commits a Windows thread's whole stack up front, which would
+charge each 64 MB worker stack against the system commit limit before the
+thread runs; the runtime's own threads (dispatcher workers, the timer
+thread, <code>thread { }</code>, the parse and check workers) start through
+<code>platform.Thread</code>. The user's klio data home is <code>%USERPROFILE%\.klio</code> on
+Windows (<code>KLIO_HOME</code> overrides it everywhere).</p>
+<p>Windows waits have millisecond granularity: a sub-millisecond sleep or
+timed wait lasts about a millisecond.</p>
+<h2 id="what-windows-does-not-have">What Windows does not have<a class="headerlink" href="#what-windows-does-not-have" title="Permanent link">&para;</a></h2>
+<p>These say so when asked for, and otherwise do nothing:</p>
 <ul>
-<li><code>KLIO_OPT=fast|safe|off</code> — the performance profile, same values as
-  <code>--opt</code>. <code>KLIO_RECLAIM</code> overrides its memory backend for diagnosis
-  (<a href="../../architecture/performance/">details</a>).</li>
-<li><code>KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack</code> — use an on-disk
-  stdlib pack instead of the checkout or the embedded bytes. Useful
-  when iterating on a pack without rebuilding the binary.</li>
-<li><code>KLIO_SEMA_IMAGE=0</code> — disable the base image cache (every run
-  analyzes and lowers its whole base).</li>
-<li><code>KLIO_STDLIB_IMAGE_SHIPPED=0</code> — ignore the base image the build
-  installed beside the binary.</li>
-<li><code>KLIO_SEMA_TIMING=1</code> — print the milliseconds each step of a run
-  takes, the base image's bake or load among them.</li>
-<li><code>KLIO_PACKS=path1:path2:...</code> — colon-separated extra packs to load
-  at startup, in addition to <code>~/.klio/packs</code>.</li>
-<li><code>HOME</code> — determines <code>~/.klio/packs</code> and <code>~/.klio/cache</code>.</li>
+<li>The sampling profilers (<code>KLIO_PROF</code>, <code>KLIO_OP_PROF</code>, <code>KLIO_FN_PROF</code>)
+  run on a <code>SIGPROF</code> interval timer.</li>
+<li><code>KLIO_GC_LATE</code>'s report signals each late thread to print its own stack
+  (<code>pthread_kill</code>).</li>
+<li><code>klio sema --each</code> analyzes each program in a forked child; on Windows it
+  analyzes them in the process and notes that a panic ends the whole run.</li>
 </ul>
-<h2 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h2>
-<p>Run a script that uses an installed kotlinx pack:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>install<span class="w"> </span>target/packs/kotlinx.atomicfu.klio-pack
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>klio<span class="w"> </span>run<span class="w"> </span>examples/atomic_counter.kt
-</code></pre></div>
-<p>Build and install a library you cloned locally:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>new<span class="w"> </span>~/projects/widgets<span class="w"> </span>--id<span class="w"> </span>com.example.widgets
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>~/projects/widgets
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>klio<span class="w"> </span>pack<span class="w"> </span>install<span class="w"> </span>target/packs/com.example.widgets.klio-pack
-</code></pre></div>
-<p>Smoke-test a pack without installing it:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>verify<span class="w"> </span>./vendor/foo.klio-pack<span class="w"> </span>--smoke<span class="w"> </span>./samples/uses_foo.kt
-</code></pre></div>
+<h2 id="cross-builds">Cross builds<a class="headerlink" href="#cross-builds" title="Permanent link">&para;</a></h2>
+<p><code>zig build -Dtarget=&lt;triple&gt;</code> builds the install step for another host.
+It runs none of the binaries it builds: the stdlib image the install ships
+under <code>share/klio/cache</code> is baked by a host klio built from the same
+sources, which names it for the target binary
+(<code>klio bake-image --stdlib-cache &lt;dir&gt; --for &lt;target klio&gt;</code>). An image's
+name keys on its binary's size and modification time, rounded to the
+100 ns NTFS keeps, and the image binds its natives by name when it loads.</p>
+<p><code>scripts/gate.sh</code> cross-builds <code>x86_64-linux-gnu</code> and <code>x86_64-windows-gnu</code>
+into <code>zig-out/cross/&lt;triple&gt;</code> as a compile-only phase; the Windows build
+also compiles the program-running harness and the census driver, since
+nothing else in the gate compiles them for Windows.</p>
+<h2 id="how-each-platform-is-verified">How each platform is verified<a class="headerlink" href="#how-each-platform-is-verified" title="Permanent link">&para;</a></h2>
+<ul>
+<li>macOS: the full gate.</li>
+<li>Linux: an aarch64 Linux container builds klio natively and runs the unit
+  tests, the threaded litmus and conformance fixtures, the stdlib
+  commontest sweep and the example corpus; an x86_64 cross build from
+  macOS compiles and links.</li>
+<li>Windows: compiled and linked by the gate's cross build. Nothing runs on
+  Windows in the gate; the platform layer's own tests
+  (<code>src/runtime/platform.zig</code>) are the first thing to run on a Windows
+  host.</li>
+</ul>
 
 
 

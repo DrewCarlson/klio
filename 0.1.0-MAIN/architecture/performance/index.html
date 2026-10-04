@@ -70,7 +70,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#performance-profiles-jit-and-gc" class="md-skip">
+        <a href="#performance-profiles-and-gc" class="md-skip">
           Skip to content
         </a>
       
@@ -779,17 +779,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-jit" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The JIT
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#the-garbage-collector" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -801,10 +790,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-stdlib-image-cache" class="md-nav__link">
+  <a href="#the-base-image-cache" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The stdlib image cache
+        The base image cache
       
     </span>
   </a>
@@ -1041,6 +1030,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1294,6 +1287,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1317,6 +1366,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1462,6 +1515,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1528,17 +1637,6 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-jit" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        The JIT
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
   <a href="#the-garbage-collector" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1550,10 +1648,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#the-stdlib-image-cache" class="md-nav__link">
+  <a href="#the-base-image-cache" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The stdlib image cache
+        The base image cache
       
     </span>
   </a>
@@ -1585,85 +1683,47 @@
   
 
 
-<h1 id="performance-profiles-jit-and-gc">Performance: profiles, JIT, and GC<a class="headerlink" href="#performance-profiles-jit-and-gc" title="Permanent link">&para;</a></h1>
+<h1 id="performance-profiles-and-gc">Performance: profiles and GC<a class="headerlink" href="#performance-profiles-and-gc" title="Permanent link">&para;</a></h1>
 <p>klio bundles its performance controls into one profile, selected with
 <code>--opt &lt;profile&gt;</code> on any command or the <code>KLIO_OPT</code> environment
 variable. The profile is resolved once at process start
-(<code>src/runtime/perf.zig</code>) and gates two independent subsystems: the
-JIT tiers and the memory backend.</p>
+(<code>src/runtime/perf.zig</code>) and picks the memory backend.</p>
 <h2 id="profiles">Profiles<a class="headerlink" href="#profiles" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
 <th>Profile</th>
-<th>Loop JIT</th>
-<th>Function JIT</th>
 <th>Memory backend</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>fast</code></td>
-<td>on</td>
-<td>on</td>
 <td>tracing GC</td>
 </tr>
 <tr>
 <td><code>safe</code></td>
-<td>off</td>
-<td>off</td>
 <td>tracing GC</td>
 </tr>
 <tr>
 <td><code>off</code></td>
-<td>off</td>
-<td>off</td>
 <td>never-free arena</td>
 </tr>
 </tbody>
 </table>
 <ul>
 <li><code>klio run</code> defaults to <code>fast</code>.</li>
-<li><code>klio test</code> defaults to <code>safe</code>: test programs are dispatch-heavy
-  rather than loop-heavy, so the JIT's per-block tracking costs more
-  than it saves there.</li>
 <li>Aliases are accepted: <code>full</code>/<code>on</code> for <code>fast</code>, <code>balanced</code> for
   <code>safe</code>, <code>none</code>/<code>interp</code> for <code>off</code>.</li>
 </ul>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>klio<span class="w"> </span>run<span class="w"> </span>--opt<span class="w"> </span>safe<span class="w"> </span>program.kt
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>klio<span class="w"> </span>run<span class="w"> </span>--opt<span class="w"> </span>off<span class="w"> </span>program.kt
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nv">KLIO_OPT</span><span class="o">=</span>off<span class="w"> </span>klio<span class="w"> </span>run<span class="w"> </span>program.kt
 </code></pre></div>
-<p>Granular environment variables override individual fields on top of
-the profile, mainly for diagnosis: <code>KLIO_JIT</code> (loop tier),
-<code>KLIO_FUNC_JIT</code> (function tier; implies the loop tier), and
-<code>KLIO_RECLAIM</code> (<code>gc</code>, <code>arena</code>, <code>smp</code>, <code>debug</code>).</p>
-<h2 id="the-jit">The JIT<a class="headerlink" href="#the-jit" title="Permanent link">&para;</a></h2>
-<p>The <code>jit</code> module (<code>src/jit/</code>) is a tiered native compiler. The
-compilation logic lives in <code>src/ir/jit_loop.zig</code> and is
-architecture-neutral: it programs a fixed-role register machine
-against an emitter API, and the backend is selected at comptime per
-target:</p>
-<ul>
-<li><strong>x86-64</strong> (<code>src/jit/jit.zig</code>) — System V calling convention.</li>
-<li><strong>AArch64</strong> (<code>src/jit/arm64.zig</code>) — mirrors the x86-64 emitter API
-  method-for-method (AAPCS64), so Apple Silicon and other ARM64
-  hosts get native code, not a fallback.</li>
-</ul>
-<p>Two tiers exist. The <strong>loop tier</strong> compiles hot loop bodies; the
-<strong>function tier</strong> compiles whole functions, including native
-recursion, and rides on the loop tier. Executable memory is managed
-W^X — pages are never writable and executable at once, using
-<code>MAP_JIT</code> and per-thread write protection on macOS.</p>
-<p>Per-function counters, compile attempts, inferred return types, and compiler
-scratch use the runtime's packed slab allocator. They must not use the OS page
-allocator: macOS rounds each small allocation to a 16 KB page, and a framework
-that first-touches thousands of cold functions would otherwise reserve several
-pages per function without producing native code. Only finalized executable
-buffers use the dedicated W^X mapping path.</p>
-<p>The JIT is strictly additive: any IR shape the compiler does not
-support falls back to the interpreter with identical semantics. The
-parity and stdlib-commontest suites are the gate that the compiled
-and interpreted paths agree.</p>
+<p><code>KLIO_RECLAIM</code> (<code>gc</code>, <code>arena</code>, <code>smp</code>, <code>debug</code>) overrides the backend on
+top of the profile, mainly for diagnosis.</p>
+<p>The arm64 function and loop JIT that once compiled the old
+interpreter's instructions is kept for reference in <code>archive/jit/</code>;
+nothing builds it.</p>
 <h2 id="the-garbage-collector">The garbage collector<a class="headerlink" href="#the-garbage-collector" title="Permanent link">&para;</a></h2>
 <p>The <code>runtime.gc</code> module (<code>src/runtime/gc.zig</code>) implements KGC: a
 precise, stop-the-world, non-moving, tracing mark-sweep collector
@@ -1691,14 +1751,19 @@ ownership and must be freed when a fallback consumes or rejects them. The
 <code>KLIO_GC_ALLOC=leaktrack</code> diagnostic can group outstanding raw allocations by
 native stack or by the active intrinsic FQN.</p>
 <p>The full design, including the root-completeness analysis, is in
-<code>docs/design/GC.md</code>; the JIT design record is <code>docs/design/JIT-DESIGN.md</code>.</p>
-<h2 id="the-stdlib-image-cache">The stdlib image cache<a class="headerlink" href="#the-stdlib-image-cache" title="Permanent link">&para;</a></h2>
-<p>Independent of the profile, <code>klio run</code> bakes the lowered stdlib (and
-selected packs) to a content-addressed image under <code>~/.klio/cache</code>
-on first use and extends it with just the user program on later
-runs, cutting startup to a few hundred milliseconds. See the
-<a href="../../getting-started/cli/">CLI tour</a> for the cache keys and
-<code>KLIO_STDLIB_IMAGE</code> / <code>KLIO_TRACE_STDLIB_IMAGE</code> controls.</p>
+<code>docs/design/GC.md</code>.</p>
+<h2 id="the-base-image-cache">The base image cache<a class="headerlink" href="#the-base-image-cache" title="Permanent link">&para;</a></h2>
+<p>Independent of the profile, <code>klio run</code> bakes the analyzed and lowered
+base (the stdlib and the program's declared packs) to a
+content-addressed image, <code>$KLIO_HOME/.klio/cache/sema-base-&lt;key&gt;.klio-sema</code>,
+on first use, and later runs analyze and lower just the program over
+it. The build bakes the stdlib-only image too, with the binary it just
+linked, and installs it under <code>share/klio/cache</code> beside <code>bin/klio</code>; a run
+whose own cache misses reads that copy, so a rebuilt klio's first run of
+an import-free program is a warm one. A program that pulls packs in keys
+its own image and bakes it on its first run. <code>KLIO_SEMA_IMAGE=0</code> turns
+the cache off; <a href="../../development/cold-start/">Cold start</a> covers what a
+cold run does and how to measure it.</p>
 
 
 

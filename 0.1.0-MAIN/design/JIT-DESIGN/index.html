@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1550,6 +1670,9 @@
 
 
 <h1 id="klio-jit-tiered-native-compiler-design">KLIO JIT — tiered native compiler (design)<a class="headerlink" href="#klio-jit-tiered-native-compiler-design" title="Permanent link">&para;</a></h1>
+<p>This JIT compiled the old interpreter's instructions and no longer builds;
+its sources are kept for reference in <code>archive/jit/</code>. What follows is the
+design record as it stood.</p>
 <p>Goal: close the remaining gap to node-class throughput. The interpreter, after
 the CPU-efficiency campaign, sits at interpreter class (~CPython, ~15× node). A
 tracing/method JIT that emits native machine code for hot IR is the only path to
@@ -1563,12 +1686,11 @@ node-class performance — no interpreter reaches V8.</p>
   loop back-edge count). Then the JIT attempts to compile it. On success, future
   entries run native code; on any unsupported IR, the compile bails and the
   function stays interpreted.</li>
-<li>On by default for the <code>klio</code> binary via the <code>fast</code> performance profile
-  (<code>--opt fast</code> / <code>KLIO_OPT=fast</code>); <code>--opt safe</code> keeps the interpreter. The
-  in-process multi-program test harness uses the conservative default profile
-  (interpreter), so a hot loop never compiles per worker. The legacy <code>KLIO_JIT</code>
-  / <code>KLIO_FUNC_JIT</code> env vars remain as per-feature overrides on top of the
-  profile. See <code>src/runtime/perf.zig</code>.</li>
+<li>On by default for <code>klio run</code> and bundled apps, with the optimizing loop tier
+  (<code>plans/jit-opt.md</code>), on AArch64 and x86-64; <code>KLIO_JIT=0</code> (or
+  <code>KLIO_JIT_OPT=0</code> for the tier alone) keeps the interpreter. Other commands
+  and the in-process multi-program test harness interpret unless <code>KLIO_JIT</code>
+  turns the JIT on, so a hot loop never compiles per worker.</li>
 </ul>
 <h2 id="stages">Stages<a class="headerlink" href="#stages" title="Permanent link">&para;</a></h2>
 <ol>

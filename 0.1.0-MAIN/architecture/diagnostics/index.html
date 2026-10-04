@@ -751,6 +751,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#semas-diagnostics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sema's diagnostics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#wording-rules" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1045,6 +1056,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1283,6 +1298,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1306,6 +1377,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1451,6 +1526,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1510,6 +1641,17 @@
     <span class="md-ellipsis">
       
         Codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#semas-diagnostics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sema's diagnostics
       
     </span>
   </a>
@@ -1599,6 +1741,18 @@ which renders to plain text, JSON, or SARIF.</p>
 </table>
 <p>The full catalog (with the source spans that emit each code) lives
 at <code>docs/design/DIAGNOSTICS.md</code> in the repository.</p>
+<h2 id="semas-diagnostics">Sema's diagnostics<a class="headerlink" href="#semas-diagnostics" title="Permanent link">&para;</a></h2>
+<p><code>klio run</code> and <code>klio check --engine sema</code> report what sema finds. Each
+diagnostic carries kotlinc's factory name as its code (<code>UNRESOLVED_REFERENCE</code>,
+<code>CONFLICTING_OVERLOADS</code>, ...) and kotlinc's severity for it; what kotlinc has
+no diagnostic for, klio names <code>KLIO_*</code> (<code>KLIO_UNSUPPORTED</code> for a construct
+klio does not model yet). <code>@Suppress("NAME")</code> on a file, a declaration or a
+lambda silences that diagnostic over what it annotates, and
+<code>@Suppress("warnings")</code> every warning there.</p>
+<p>A census site (<code>src/sema/census.zig</code>) is one diagnostic: its reason names
+the factory unless the site names its own, an error counts toward the
+census and a warning does not. <code>src/cli/sema_diagnostics.zig</code> turns the
+program's sites into <code>Diagnostic</code>s for the renderers.</p>
 <h2 id="wording-rules">Wording rules<a class="headerlink" href="#wording-rules" title="Permanent link">&para;</a></h2>
 <p>User-facing messages must not cite the Kotlin Language Specification.
 Phrase the problem and the fix in user-actionable terms:</p>

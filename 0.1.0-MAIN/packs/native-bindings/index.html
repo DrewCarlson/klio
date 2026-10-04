@@ -1100,6 +1100,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1338,6 +1342,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1361,6 +1421,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1486,6 +1550,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1764,6 +1884,10 @@ the parsed Kotlin body. This is how shim libraries work:</p>
 </code></pre></div>
 <p>The Zig binding registered as
 <code>"kotlinx.datetime.__kxdt_currentTimeMillis"</code> wins at call sites.
+Every native a Kotlin source calls, the stdlib's <code>__klio_*</code> included,
+has such a declaration with the parameter and return types the binding
+uses, visible from the call site by the ordinary Kotlin rules (the same
+package or an import); <code>klio sema</code> reports a call with none.
 The stub body only fires if the binding fails to install — useful as
 a fallback when consumers run a pack without its host module
 compiled in.</p>
@@ -1795,9 +1919,10 @@ remediation.</p>
   <code>std.ArrayList(u8)</code> via <code>native_state</code>.</li>
 <li><code>src/kotlinx_datetime/kotlinx_datetime.zig</code> — clock, tz
   conversions, RFC-3339 parsing.</li>
-<li><code>src/ktor_client/ktor_client.zig</code> — blocking HTTP on the platform
-  sockets, returning flat string arrays that the shim rebuilds into
-  <code>HttpResponse</code>.</li>
+<li><code>src/ktor_client/net.zig</code> — the socket calls behind the ktor pack's
+  ktor-network actuals: each native mirrors a POSIX call, records
+  <code>errno</code> for the Kotlin side to read back, and reads or fills a
+  <code>ByteArray</code> window in place.</li>
 </ul>
 
 

@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1365,6 +1429,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1427,6 +1547,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="The dispatched-task terminal-state contract (2026-08-18)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pool-timers-wait-on-the-timer-thread" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Pool timers wait on the timer thread
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1617,6 +1754,29 @@ required observable outcome:</p>
 </ol>
 <p>The failure-vs-cancellation pair is one <code>throw</code> apart and the two fixtures
 exist so that a change collapsing them is caught.</p>
+<h3 id="pool-timers-wait-on-the-timer-thread">Pool timers wait on the timer thread<a class="headerlink" href="#pool-timers-wait-on-the-timer-thread" title="Permanent link">&para;</a></h3>
+<p><code>Dispatchers.Default</code> and <code>Dispatchers.IO</code>, and every <code>limitedParallelism</code>
+view of them (whose <code>Delay</code> delegates to the dispatcher it views), schedule
+their delays and <code>withTimeout</code> gates on one timer thread
+(<code>kotlinx.coroutines.DefaultExecutor</code>, <code>TimerService</code> in
+<code>src/interp_ir/vm/coroutines.zig</code>), as the JVM schedules them on
+<code>DefaultExecutor</code>. The thread runs one long-lived pump; <code>__kxco_spawnTimer</code>
+posts a timer block to it from any thread, the pump takes posted blocks each
+turn and parks each on its own timer, and a fired block resumes its
+continuation, which dispatches to the pool as any resume does. A cancelled
+delay disposes its gate and the block ends at once.</p>
+<p>The invariant: <strong>a dispatched task never waits out a timer it scheduled.</strong>
+Its pump runs until nothing is ready, launched or timed, so a timer on it
+kept the task, and the task's worker, until the timer fired. A
+<code>limitedParallelism(1)</code> view has one worker, and the resume a timer or a
+completer dispatches to the view waits for that worker, so a
+<code>withTimeout { delay() }</code> or <code>withTimeout { join() }</code> on it resumed only
+after its own timeout fired. Pinned by <code>tl_limited_timeout</code>, which fails
+every case without the timer thread.</p>
+<p>The thread starts on a run's first post and stops at the run boundary,
+before the pool, dropping any timer still pending: a stopped pool never
+receives a resume a timer fires. <code>runBlocking</code>'s own dispatcher keeps its
+timers on its pump, which is the event loop they belong to.</p>
 <hr />
 <h2 id="status-2026-06-27-verified-current-state-and-remaining-work">STATUS 2026-06-27 — verified current state and remaining work<a class="headerlink" href="#status-2026-06-27-verified-current-state-and-remaining-work" title="Permanent link">&para;</a></h2>
 <p>The original framing ("eager model, no async event loop") is <strong>superseded</strong>: klio has a
@@ -1844,6 +2004,13 @@ fresh child <code>Vm</code> and runs the block via <code>runVmTask</code>/<code>
 (scheduler.zig:327-345). Cross-thread resume routes back through <code>SlotOwners</code> +
 the owning driver's mailbox, or <code>PersistedParked</code> after the driver exited
 (<code>coroutineResumeExternal</code>, coroutines.zig:1693-1747).</p>
+<p>A <code>resumeWith</code> its interceptor did not dispatch (an unconfined resume) runs
+where it is called, as on the JVM: the resumer asks the owning pump to hand
+the parked coroutine over (<code>requestSurrender</code>) and runs it on its own thread.
+A pump answers those requests when it drains its mailbox. A thread blocked in
+an inner pump (a <code>runBlocking</code> on another dispatcher) answers them for every
+pump under it before each idle wait (<code>serveOwnSurrenders</code>), so a resumer on
+the thread it waits on is not left to time out.</p>
 <p><strong>The divergence.</strong> <code>coroutineLaunch</code> (coroutines.zig:1642-1654): with an active
 pump it enqueues the child onto the pump; with <strong>no</strong> pump it runs the child
 <strong>eagerly inline</strong> via <code>invokeCallable</code>, so <code>delay</code> is a no-op and <code>await</code>

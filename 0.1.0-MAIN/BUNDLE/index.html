@@ -1161,6 +1161,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1399,6 +1403,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1422,6 +1482,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1547,6 +1611,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1846,7 +1966,7 @@ the release step.</p>
 <a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>                             windows-x64, windows-arm64
 <a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>  --ui | --headless          Force the flavor. Default: auto-detected — the
 <a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>                             pack fixpoint selecting any androidx.compose.ui*
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>                             pack (or klio.compose.ui) marks the bundle UI.
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>                             pack marks the bundle UI.
 <a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>  --include &lt;path[:mount]&gt;   Embed a file or directory into the bundle's
 <a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>                             resource table (repeatable). Mount defaults to
 <a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>                             the path relative to the source file's directory.
@@ -1871,37 +1991,35 @@ and the choice is baked into the bundle:</p>
 </code></pre></div>
 <h2 id="sizes-and-startup">Sizes and startup<a class="headerlink" href="#sizes-and-startup" title="Permanent link">&para;</a></h2>
 <p>Bundle size is dominated by the stub — a byte-for-byte copy of the
-<code>klio</code> binary doing the bundling. Measured on linux-x64 with a
-release build (<code>zig build -Doptimize=ReleaseFast</code>, stripped):</p>
+<code>klio</code> binary doing the bundling (16.6 MB). Measured on linux-arm64
+with a release build (<code>zig build -Doptimize=ReleaseFast</code>, stripped):</p>
 <table>
 <thead>
 <tr>
 <th>Bundle</th>
 <th>Size</th>
-<th>Startup</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>hello world</td>
-<td>22.3 MB</td>
-<td>20 ms (warm <code>klio run</code>: 27 ms)</td>
+<td>16.8 MB</td>
 </tr>
 <tr>
 <td>kotlinx.serialization CLI tool</td>
-<td>23.4 MB</td>
-<td>24 ms</td>
+<td>17.1 MB</td>
 </tr>
 <tr>
-<td>Compose UI app (klio.compose.ui + shim)</td>
-<td>44.3 MB</td>
-<td>119 ms first launch, 100 ms warm</td>
+<td>Compose UI app (foundation, offscreen + shim)</td>
+<td>38.2 MB</td>
 </tr>
 </tbody>
 </table>
-<p>A bundle starts faster than <code>klio run</code> runs the same file: the
-program is baked as a whole-program IR image that boot mmaps straight
-out of the executable and runs, with zero parsing or lowering.</p>
+<p>A bundle carries its base (the stdlib and the packs the program
+imports) as a sema image: the base image a run keeps in its cache,
+with the text of every base file. Boot registers those files, checks
+them against the image, and analyzes and lowers only the program,
+which is what a warm <code>klio run</code> does, without the pack-cache walk.</p>
 <p>macOS bundles are the same shape (stub-dominated); the ad-hoc code
 signature adds the CodeDirectory's page hashes (~0.8% of the file, 32
 bytes per 4 KiB) on top.</p>
@@ -1948,11 +2066,24 @@ relative to the main source's directory (basename when it is not
 under it); an explicit <code>:mount</code> overrides it. Resources are served
 straight from the executable's memory map (zstd-compressed entries
 decompress on read).</p>
-<p>Reading a path that was not bundled throws
-<code>IllegalArgumentException: no bundled resource at `path`</code>;
-calling <code>readBytes</code>/<code>readText</code> outside a bundle (for example under
-<code>klio run</code>) throws
-<code>IllegalStateException: no resources are bundled with this program</code>.</p>
+<p><code>klio run</code> takes the same <code>--include &lt;path[:mount]&gt;</code> flags, and a
+project's <code>[application] include</code>, and serves those files from disk at
+the same mount paths, so a program reads its resources the same way run
+or bundled, as a JVM program reads its classpath resources from a
+directory or from its jar:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>$<span class="w"> </span>klio<span class="w"> </span>run<span class="w"> </span>app/main.kt<span class="w"> </span>--include<span class="w"> </span>app/assets
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>args:<span class="w"> </span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>hello<span class="w"> </span>from<span class="w"> </span>a<span class="w"> </span>bundled<span class="w"> </span>resource
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="o">[</span>assets/greeting.txt<span class="o">]</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="nb">false</span>
+</code></pre></div>
+<p>Compose's resource loaders (<code>painterResource</code>, <code>useResource</code>) read
+through the same table.</p>
+<p>Reading a path no include names throws
+<code>IllegalArgumentException: no resource is included at `path`</code>;
+calling <code>readBytes</code>/<code>readText</code> in a program with no includes throws
+<code>IllegalStateException: no resources are included with this program
+(</code>--include<code>or the manifest's [application] include)</code>.</p>
 <h2 id="project-mode">Project mode<a class="headerlink" href="#project-mode" title="Permanent link">&para;</a></h2>
 <p><code>klio bundle &lt;dir&gt;</code> reads <code>&lt;dir&gt;/klio.toml</code>. The manifest's
 <code>[application]</code> table supplies <code>name</code>, <code>icon</code>, <code>include = [...]</code>, and
@@ -1960,47 +2091,47 @@ calling <code>readBytes</code>/<code>readText</code> outside a bundle (for examp
 under the project's source roots declares a top-level <code>main</code>; with
 several, the manifest must name it. The whole project source set is
 bundled, and flags override the manifest.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">[application]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"MyApp"</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">icon</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"assets/icon.png"</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="n">main</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"src/main.kt"</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="n">include</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"assets"</span><span class="p">]</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">[application]</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"MyApp"</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">icon</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"assets/icon.png"</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">main</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"src/main.kt"</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="n">include</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"assets"</span><span class="p">]</span>
 </code></pre></div>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>myproject<span class="w"> </span>-o<span class="w"> </span>myapp
-<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>bundled<span class="w"> </span>myapp<span class="w"> </span><span class="o">(</span><span class="m">22</span>.4<span class="w"> </span>MB<span class="o">)</span>:<span class="w"> </span>stdlib<span class="w"> </span>+<span class="w"> </span>klio.bundle
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>myproject<span class="w"> </span>-o<span class="w"> </span>myapp
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>bundled<span class="w"> </span>myapp<span class="w"> </span><span class="o">(</span><span class="m">22</span>.4<span class="w"> </span>MB<span class="o">)</span>:<span class="w"> </span>stdlib<span class="w"> </span>+<span class="w"> </span>klio.bundle
 </code></pre></div>
 <h2 id="inspecting-a-bundle">Inspecting a bundle<a class="headerlink" href="#inspecting-a-bundle" title="Permanent link">&para;</a></h2>
 <p><code>--dry-run</code> shows what a bundle would contain without writing it:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>app/main.kt<span class="w"> </span>--include<span class="w"> </span>app/assets<span class="w"> </span>--dry-run
-<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>bundle<span class="w"> </span><span class="o">(</span>dry<span class="w"> </span>run<span class="o">)</span>:<span class="w"> </span>main
-<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>flavor:<span class="w"> </span>headless
-<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>entry:<span class="w"> </span>main
-<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>packs:
-<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a><span class="w">  </span>klio.bundle<span class="w"> </span><span class="m">0</span>.1.0
-<a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a>sections:
-<a id="__codelineno-10-8" name="__codelineno-10-8" href="#__codelineno-10-8"></a><span class="w">  </span>manifest<span class="w"> </span><span class="m">411</span><span class="w"> </span>bytes
-<a id="__codelineno-10-9" name="__codelineno-10-9" href="#__codelineno-10-9"></a><span class="w">  </span>program-src<span class="w"> </span><span class="m">263</span><span class="w"> </span>bytes
-<a id="__codelineno-10-10" name="__codelineno-10-10" href="#__codelineno-10-10"></a><span class="w">  </span>program-image<span class="w"> </span><span class="m">8421445</span><span class="w"> </span>bytes
-<a id="__codelineno-10-11" name="__codelineno-10-11" href="#__codelineno-10-11"></a><span class="w">  </span>resources<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes
-<a id="__codelineno-10-12" name="__codelineno-10-12" href="#__codelineno-10-12"></a>projected<span class="w"> </span>size:<span class="w"> </span><span class="m">22</span>.4<span class="w"> </span>MB<span class="w"> </span><span class="o">(</span>stub<span class="w"> </span><span class="m">14</span>.4<span class="w"> </span>MB<span class="w"> </span>+<span class="w"> </span>payload<span class="w"> </span><span class="m">8</span>.1<span class="w"> </span>MB<span class="o">)</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>app/main.kt<span class="w"> </span>--include<span class="w"> </span>app/assets<span class="w"> </span>--dry-run
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>bundle<span class="w"> </span><span class="o">(</span>dry<span class="w"> </span>run<span class="o">)</span>:<span class="w"> </span>main
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>flavor:<span class="w"> </span>headless
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>entry:<span class="w"> </span>program-src
+<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>packs:
+<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="w">  </span>klio.bundle<span class="w"> </span><span class="m">0</span>.1.0
+<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a>sections:
+<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a><span class="w">  </span>manifest<span class="w"> </span><span class="m">411</span><span class="w"> </span>bytes
+<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span>sema-image<span class="w"> </span><span class="m">951552</span><span class="w"> </span>bytes
+<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">  </span>program-src<span class="w"> </span><span class="m">263</span><span class="w"> </span>bytes
+<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a><span class="w">  </span>resources<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes
+<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a>projected<span class="w"> </span>size:<span class="w"> </span><span class="m">15</span>.3<span class="w"> </span>MB<span class="w"> </span><span class="o">(</span>stub<span class="w"> </span><span class="m">14</span>.4<span class="w"> </span>MB<span class="w"> </span>+<span class="w"> </span>payload<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span>MB<span class="o">)</span>
 </code></pre></div>
 <p><code>KLIO_BUNDLE_INSPECT=1 ./myapp</code> prints the same manifest from a
 finished bundle (versions, packs, sections, resources) and exits —
 the only bundle-mode CLI affordance:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>$<span class="w"> </span><span class="nv">KLIO_BUNDLE_INSPECT</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./resapp
-<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>bundle:<span class="w"> </span>resapp
-<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>klio:<span class="w"> </span><span class="m">0</span>.1.0<span class="w"> </span><span class="o">(</span>image<span class="w"> </span>format<span class="w"> </span><span class="m">21</span><span class="o">)</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>flavor:<span class="w"> </span>headless
-<a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a>entry:<span class="w"> </span>main
-<a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>packs:
-<a id="__codelineno-11-7" name="__codelineno-11-7" href="#__codelineno-11-7"></a><span class="w">  </span>klio.bundle<span class="w"> </span><span class="m">0</span>.1.0
-<a id="__codelineno-11-8" name="__codelineno-11-8" href="#__codelineno-11-8"></a>sections:
-<a id="__codelineno-11-9" name="__codelineno-11-9" href="#__codelineno-11-9"></a><span class="w">  </span>manifest<span class="w"> </span><span class="m">413</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">413</span><span class="w"> </span>uncompressed<span class="o">)</span>
-<a id="__codelineno-11-10" name="__codelineno-11-10" href="#__codelineno-11-10"></a><span class="w">  </span>program-src<span class="w"> </span><span class="m">263</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">263</span><span class="w"> </span>uncompressed<span class="o">)</span>
-<a id="__codelineno-11-11" name="__codelineno-11-11" href="#__codelineno-11-11"></a><span class="w">  </span>program-image<span class="w"> </span><span class="m">8421445</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">8421445</span><span class="w"> </span>uncompressed<span class="o">)</span>
-<a id="__codelineno-11-12" name="__codelineno-11-12" href="#__codelineno-11-12"></a><span class="w">  </span>resources<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">30</span><span class="w"> </span>uncompressed<span class="o">)</span>
-<a id="__codelineno-11-13" name="__codelineno-11-13" href="#__codelineno-11-13"></a>resources:
-<a id="__codelineno-11-14" name="__codelineno-11-14" href="#__codelineno-11-14"></a><span class="w">  </span>assets/greeting.txt<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span><span class="nv">KLIO_BUNDLE_INSPECT</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>./resapp
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>bundle:<span class="w"> </span>resapp
+<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>klio:<span class="w"> </span><span class="m">0</span>.1.0<span class="w"> </span><span class="o">(</span>image<span class="w"> </span>format<span class="w"> </span><span class="m">1000001</span><span class="o">)</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a>flavor:<span class="w"> </span>headless
+<a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a>entry:<span class="w"> </span>program-src
+<a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a>packs:
+<a id="__codelineno-12-7" name="__codelineno-12-7" href="#__codelineno-12-7"></a><span class="w">  </span>klio.bundle<span class="w"> </span><span class="m">0</span>.1.0
+<a id="__codelineno-12-8" name="__codelineno-12-8" href="#__codelineno-12-8"></a>sections:
+<a id="__codelineno-12-9" name="__codelineno-12-9" href="#__codelineno-12-9"></a><span class="w">  </span>manifest<span class="w"> </span><span class="m">413</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">413</span><span class="w"> </span>uncompressed<span class="o">)</span>
+<a id="__codelineno-12-10" name="__codelineno-12-10" href="#__codelineno-12-10"></a><span class="w">  </span>sema-image<span class="w"> </span><span class="m">951552</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">951552</span><span class="w"> </span>uncompressed<span class="o">)</span>
+<a id="__codelineno-12-11" name="__codelineno-12-11" href="#__codelineno-12-11"></a><span class="w">  </span>program-src<span class="w"> </span><span class="m">263</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">263</span><span class="w"> </span>uncompressed<span class="o">)</span>
+<a id="__codelineno-12-12" name="__codelineno-12-12" href="#__codelineno-12-12"></a><span class="w">  </span>resources<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes<span class="w"> </span><span class="o">(</span><span class="m">30</span><span class="w"> </span>uncompressed<span class="o">)</span>
+<a id="__codelineno-12-13" name="__codelineno-12-13" href="#__codelineno-12-13"></a>resources:
+<a id="__codelineno-12-14" name="__codelineno-12-14" href="#__codelineno-12-14"></a><span class="w">  </span>assets/greeting.txt<span class="w"> </span><span class="m">30</span><span class="w"> </span>bytes
 </code></pre></div>
 <h2 id="program-surface">Program surface<a class="headerlink" href="#program-surface" title="Permanent link">&para;</a></h2>
 <ul>
@@ -2014,13 +2145,14 @@ the only bundle-mode CLI affordance:</p>
 </ul>
 <h2 id="ui-bundles">UI bundles<a class="headerlink" href="#ui-bundles" title="Permanent link">&para;</a></h2>
 <p>A program whose pack fixpoint selects any <code>androidx.compose.ui*</code> pack
-(or <code>klio.compose.ui</code>) bundles as UI automatically; <code>--ui</code> and
+bundles as UI automatically; <code>--ui</code> and
 <code>--headless</code> force it. A UI bundle embeds the Skia rendering backend
 (zstd-compressed). Bundling one requires the backend library next to
 the bundling <code>klio</code> (<code>zig build skia-lib</code>) or at <code>KLIO_SKIA_LIB</code>. The
 library name is per-OS: <code>libklio_skia.so</code> (Linux), <code>libklio_skia.dylib</code>
 (macOS), <code>klio_skia.dll</code> (Windows).</p>
-<p>A program that opens a window (<code>runApp</code>) needs a backend built with a
+<p>A program that opens a window (<code>application</code>, <code>awaitApplication</code> or
+<code>singleWindowApplication</code>) needs a backend built with a
 real windowing layer. A shim built without one — the <em>stub</em> backend,
 which still renders offscreen — cannot open a window, so such a bundle
 would launch and exit silently. Bundling catches this and fails fast:
@@ -2028,11 +2160,11 @@ the shim carries a backend marker (<code>cocoa</code>, <code>sdl</code>, <code>w
 that the bundler reads and refuses to ship a windowed program against a
 stub. Build a windowing backend with <code>zig build skia-lib -Dskia -Dcocoa
 -Dgpu</code> (macOS) or <code>-Dskia</code> with <code>libsdl2-dev</code> (Linux). Offscreen-only
-bundles (<code>uiRenderer</code> → PNG, no <code>runApp</code>) are exempt — the stub renders
+bundles (<code>renderComposeToPng</code>, no window) are exempt — the stub renders
 them fine.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>counter.kt<span class="w"> </span>-o<span class="w"> </span>counter
-<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>bundled<span class="w"> </span>counter<span class="w"> </span><span class="o">(</span><span class="m">42</span>.3<span class="w"> </span>MB,<span class="w"> </span>ui<span class="o">)</span>:<span class="w"> </span>stdlib<span class="w"> </span>+<span class="w"> </span>androidx.collection<span class="w"> </span>+<span class="w"> </span>androidx.compose.runtime<span class="w"> </span>+<span class="w"> </span>klio.compose.ui<span class="w"> </span>+<span class="w"> </span>kotlinx.atomicfu<span class="w"> </span>+<span class="w"> </span>kotlinx.coroutines<span class="w"> </span>+<span class="w"> </span>skia<span class="w"> </span>backend
-<a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>$<span class="w"> </span>./counter<span class="w">     </span><span class="c1"># opens the window; no klio and no rendering install needed</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>$<span class="w"> </span>klio<span class="w"> </span>bundle<span class="w"> </span>compose_window.kt<span class="w"> </span>-o<span class="w"> </span>compose_window
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>bundled<span class="w"> </span>compose_window<span class="w"> </span><span class="o">(</span><span class="m">39</span>.4<span class="w"> </span>MB,<span class="w"> </span>ui<span class="o">)</span>:<span class="w"> </span>stdlib<span class="w"> </span>+<span class="w"> </span>androidx.annotation<span class="w"> </span>+<span class="w"> </span>androidx.collection<span class="w"> </span>+<span class="w"> </span>androidx.compose.animation<span class="w"> </span>+<span class="w"> </span>androidx.compose.animation.core<span class="w"> </span>+<span class="w"> </span>androidx.compose.foundation<span class="w"> </span>+<span class="w"> </span>androidx.compose.foundation.layout<span class="w"> </span>+<span class="w"> </span>androidx.compose.material.ripple<span class="w"> </span>+<span class="w"> </span>androidx.compose.material3<span class="w"> </span>+<span class="w"> </span>androidx.compose.runtime<span class="w"> </span>+<span class="w"> </span>androidx.compose.runtime.saveable<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.backhandler<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.geometry<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.graphics<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.text<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.unit<span class="w"> </span>+<span class="w"> </span>androidx.compose.ui.util<span class="w"> </span>+<span class="w"> </span>androidx.graphics.shapes<span class="w"> </span>+<span class="w"> </span>androidx.lifecycle<span class="w"> </span>+<span class="w"> </span>androidx.navigationevent<span class="w"> </span>+<span class="w"> </span>androidx.navigationevent.compose<span class="w"> </span>+<span class="w"> </span>androidx.savedstate<span class="w"> </span>+<span class="w"> </span>kotlinx.atomicfu<span class="w"> </span>+<span class="w"> </span>kotlinx.coroutines<span class="w"> </span>+<span class="w"> </span>kotlinx.datetime<span class="w"> </span>+<span class="w"> </span>kotlinx.serialization<span class="w"> </span>+<span class="w"> </span>org.jetbrains.skiko<span class="w"> </span>+<span class="w"> </span>skia<span class="w"> </span>backend
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>$<span class="w"> </span>./compose_window<span class="w">     </span><span class="c1"># opens the window; no klio and no rendering install needed</span>
 </code></pre></div>
 <p>On first launch the shim is extracted to a content-addressed per-user
 cache via temp file + atomic rename — concurrent first launches are
@@ -2150,24 +2282,26 @@ payload area, and a 72-byte trailer. The trailer's position is per-OS
 re-signed Mach-O), and boot reads it from the right place for the host
 binary format.</p>
 <ul>
-<li><strong>Sections</strong>: <code>manifest</code> (encoded <code>BundleManifest</code>),
-  <code>program-image</code> (deps + program lowered as one module and baked,
-  uncompressed and 16 KiB-aligned so boot mmaps it straight out of
-  the file and runs with zero parsing or lowering), <code>program-src</code>
-  (the user sources), <code>resources</code> (zstd per entry), <code>skia-shim</code> (UI
-  flavor only, zstd), <code>icon</code> (raw PNG). When the program bake refuses
-  (a base outside the image codec's serializable surface) the bundle
-  instead carries <code>base-image</code> (the dependency base alone) and boots
-  by parsing <code>program-src</code> against it — the always-works path,
-  recorded in the manifest and reported by <code>--dry-run</code>; startup is
-  the only difference. <code>KLIO_BUNDLE_PROGRAM_IMAGE=0</code> at bundle time
-  forces that path.</li>
+<li><strong>Sections</strong>: <code>manifest</code> (encoded <code>BundleManifest</code>), <code>sema-image</code>
+  (the program's base as a self-contained sema image: the base image
+  with the text of every base file and the pack features, compressed
+  as a whole, stored 16 KiB-aligned; boot decompresses it out of the
+  mapped file), <code>program-src</code> (the user sources, which build over the
+  image at boot), <code>resources</code> (zstd per entry), <code>skia-shim</code> (UI flavor only,
+  zstd), <code>icon</code> (raw PNG). Bundling builds the program over the image
+  first, so a program that does not resolve, lower or declare <code>main</code>
+  is refused at bundle time with the error <code>klio run</code> would print.
+  Bundling loads the base back from the image and builds the program
+  over it before it writes anything, so an image that would not load at
+  boot is refused at bundle time.</li>
 <li><strong>Trailer</strong>: magic <code>"KBND\0KL1"</code>, payload offset/length,
   section-table offset/length, and a blake3 hash of the whole payload
   area, verified at boot before anything decodes.</li>
 <li><strong>Versioning</strong>: the manifest carries the producing klio version and
-  the image format version; a stub refuses a payload from a different
-  version with an actionable error. A bundle is only ever assembled
+  the payload format version (<code>1000001</code> for a sema image; the sema
+  image checks its own format and the base image's again at boot); a
+  stub refuses a payload from a different version with an actionable
+  error. A bundle is only ever assembled
   by the same-version binary that boots it.</li>
 <li><strong>Determinism</strong>: two <code>klio bundle</code> runs over identical inputs (same
   sources, packs, features, output name) produce byte-identical
@@ -2180,7 +2314,7 @@ binary format.</p>
 <li><code>error: this is a UI bundle but no Skia backend library was found for &lt;target&gt;; build it (zig build skia-lib) or set KLIO_SKIA_LIB</code>
   — a UI bundle needs the rendering backend to embed; build it or
   point <code>KLIO_SKIA_LIB</code> at one.</li>
-<li><code>error: this Compose UI program opens a window (runApp), but the Skia backend for &lt;target&gt; has no windowing support ...</code>
+<li><code>error: this Compose UI program opens a window, but the Skia backend for &lt;target&gt; has no windowing support ...</code>
   — the shim was built without a windowing layer (the stub backend), so
   a windowed app would open no window and exit silently. Rebuild the
   backend with <code>zig build skia-lib -Dskia -Dcocoa -Dgpu</code> (macOS) or
@@ -2189,9 +2323,10 @@ binary format.</p>
   — an arm64 macOS stub must carry the linker's ad-hoc signature (its
   <code>__TEXT</code>/<code>__LINKEDIT</code> layout is read to re-sign); the provided stub
   is not a normal <code>klio</code> binary.</li>
-<li><code>error: the program redeclares a name from its dependency base and cannot bundle; rename the declaration</code>
-  — a top-level declaration in the program collides with one in the
-  stdlib/pack base; bundling requires the extendable base.</li>
+<li><code>&lt;file&gt;:&lt;line&gt;:&lt;col&gt;: error: unresolved reference ...</code> (or another
+  program diagnostic), <code>error: no main function found</code>
+  — the program does not build over its base; the same errors
+  <code>klio run</code> reports, at bundle time.</li>
 <li><code>error: no cached stub for &lt;target&gt; (klio &lt;version&gt;); connect once to fetch it, or pass --stub &lt;path&gt;</code>
   — cross-target bundling could not resolve the target's stub (see
   the resolution order above).</li>
@@ -2215,14 +2350,14 @@ binary format.</p>
   <code>error: bundle carries no manifest; rebundle</code> — the payload
   structure does not decode; the file was damaged or assembled by a
   broken tool.</li>
-<li><code>error: bundle program image rejected (&lt;reason&gt;); rebundle</code>,
-  <code>error: bundle names an entry but carries no program image; rebundle</code>
-  — the whole-program image is missing or fails to load.</li>
-<li><code>error: bundle carries no base image; rebundle</code>,
+<li><code>error: bundle carries no sema image; rebundle</code>,
   <code>error: bundle carries no program sources; rebundle</code>,
-  <code>error: embedded program sources fail to parse; rebundle</code>,
-  <code>error: embedded program cannot extend the bundle base; rebundle</code>
-  — the program-src boot path is incomplete or inconsistent.</li>
+  <code>error: bundle program sources are malformed; rebundle</code>
+  — the payload is incomplete.</li>
+<li><code>error: base image rejected (&lt;reason&gt;); rebake it with this klio</code>,
+  <code>error: the base image was baked by another klio or from another base; rebake it</code>
+  — the sema image does not decode, or its base does not match the
+  image inside it: a damaged file or a different klio. Rebundle.</li>
 </ul>
 <p>Boot-time warnings (UI bundles; the program continues headless):</p>
 <ul>

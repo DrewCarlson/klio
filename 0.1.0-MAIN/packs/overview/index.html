@@ -1067,6 +1067,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1305,6 +1309,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1328,6 +1388,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1453,6 +1517,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1656,9 +1776,9 @@ without re-running the parser or typechecker.</p>
 <td>Built from <code>kotlin-klio/</code>; <code>klio pack install</code>.</td>
 </tr>
 <tr>
-<td>Feature-gated</td>
+<td>Multi-module</td>
 <td><code>io.ktor.klio-pack</code></td>
-<td>Same flow; gated surfaces load per run via <code>--feature</code>.</td>
+<td>Same flow; each upstream module is a feature, loaded per run via <code>--feature</code>.</td>
 </tr>
 <tr>
 <td>Third-party</td>
@@ -1678,9 +1798,9 @@ content and the install flow differ.</p>
   serialised into the <code>bindings</code> section so the loader can resolve
   each FQN against a host's <code>HostBindings</code> registry.</li>
 <li><strong>Manifest.</strong> Library id, version, ABI version, dependencies,
-  implicit packages, and any feature definitions (named source
-  subsets a consumer opts into with <code>--feature &lt;id&gt;/&lt;name&gt;</code>; see
-  <a href="../using/">Using packs</a>).</li>
+  implicit packages, and the feature table (one feature per upstream
+  module, with its defaults; a consumer opts into a module with
+  <code>--feature &lt;id&gt;/&lt;name&gt;</code>; see <a href="../using/">Using packs</a>).</li>
 </ul>
 <h2 id="what-does-not-go-in-a-pack">What does not go in a pack<a class="headerlink" href="#what-does-not-go-in-a-pack" title="Permanent link">&para;</a></h2>
 <ul>
@@ -1697,7 +1817,7 @@ content and the install flow differ.</p>
 <li>The embedded stdlib pack is decoded and installed.</li>
 <li>Every file matching <code>~/.klio/packs/*.klio-pack</code> and
    <code>$KLIO_PACKS</code> is enumerated.</li>
-<li>Packs are topologically sorted by <code>[[deps]]</code> and installed in
+<li>Packs are topologically sorted by <code>[deps]</code> and installed in
    order.</li>
 <li>For each pack:<ul>
 <li><code>manifest.abi_version</code> is checked against

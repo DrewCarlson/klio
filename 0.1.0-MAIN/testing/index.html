@@ -1073,6 +1073,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1311,6 +1315,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1334,6 +1394,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1459,6 +1523,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1682,8 +1802,10 @@ sources into <strong>one module</strong> and runs them. Whole-module composition
 cross-file references correctly — running the same files individually breaks
 cross-file resolution and mis-counts. <code>[[test]]</code> sets can be feature-scoped;
 <code>--all</code> (default) runs core + every feature module, <code>--feature &lt;name&gt;</code> narrows
-to core + the named feature(s). See <a href="../packs/authoring/">Authoring a pack</a> for
-the <code>[[test]]</code> manifest schema.</p>
+to core + the named feature(s). The project's <code>[deps]</code> scope which packs the
+tests resolve against, plus <code>kotlin.test</code> itself, which every <code>klio test</code> run
+declares. See <a href="../packs/authoring/">Authoring a pack</a> for the <code>[[test]]</code>
+manifest schema.</p>
 <h3 id="runner-options">Runner options<a class="headerlink" href="#runner-options" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>--filter &lt;substring&gt;</code> — run only tests whose <code>Class</code>, <code>Class.method</code>, or

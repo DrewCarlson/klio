@@ -947,10 +947,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#feature-gated-surfaces" class="md-nav__link">
+  <a href="#features-one-per-upstream-module" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Feature-gated surfaces
+        Features: one per upstream module
       
     </span>
   </a>
@@ -1085,6 +1085,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1338,6 +1342,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1361,6 +1421,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1506,6 +1570,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../development/contributing/" class="md-nav__link">
         
   
@@ -1583,10 +1703,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#feature-gated-surfaces" class="md-nav__link">
+  <a href="#features-one-per-upstream-module" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Feature-gated surfaces
+        Features: one per upstream module
       
     </span>
   </a>
@@ -1684,15 +1804,16 @@ them from your Kotlin programs.</p>
 </code></pre></div>
 <p>Verify it landed:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>$<span class="w"> </span>klio<span class="w"> </span>pack<span class="w"> </span>list
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>androidx.collection<span class="w">               </span><span class="m">1</span>.12.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.atomicfu
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>androidx.compose.runtime<span class="w">          </span><span class="m">1</span>.12.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.coroutines,<span class="w"> </span>androidx.collection
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>io.ktor<span class="w">                           </span><span class="m">3</span>.5.2<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.coroutines,<span class="w"> </span>kotlinx.atomicfu,<span class="w"> </span>kotlinx.io
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>kotlin.test<span class="w">                       </span><span class="m">2</span>.4.20<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>kotlinx.atomicfu<span class="w">                  </span><span class="m">0</span>.33.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>kotlinx.coroutines<span class="w">                </span><span class="m">1</span>.11.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
-<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>kotlinx.datetime<span class="w">                  </span><span class="m">0</span>.8.0<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.serialization
-<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>kotlinx.io<span class="w">                        </span><span class="m">0</span>.9.1<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>kotlinx.serialization<span class="w">             </span><span class="m">1</span>.11.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>androidx.annotation<span class="w">               </span><span class="m">1</span>.8.1<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>androidx.collection<span class="w">               </span><span class="m">1</span>.12.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>androidx.annotation,<span class="w"> </span>kotlinx.atomicfu
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>androidx.compose.runtime<span class="w">          </span><span class="m">1</span>.12.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>androidx.annotation,<span class="w"> </span>kotlinx.coroutines,<span class="w"> </span>androidx.collection
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>io.ktor<span class="w">                           </span><span class="m">3</span>.5.2<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.coroutines,<span class="w"> </span>kotlinx.atomicfu,<span class="w"> </span>kotlinx.io
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>kotlin.test<span class="w">                       </span><span class="m">2</span>.4.20<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>kotlinx.atomicfu<span class="w">                  </span><span class="m">0</span>.33.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>kotlinx.coroutines<span class="w">                </span><span class="m">1</span>.11.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>kotlinx.datetime<span class="w">                  </span><span class="m">0</span>.8.0<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib,<span class="w"> </span>kotlinx.serialization
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>kotlinx.io<span class="w">                        </span><span class="m">0</span>.9.1<span class="w">       </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>kotlinx.serialization<span class="w">             </span><span class="m">1</span>.11.0<span class="w">      </span>abi<span class="w"> </span><span class="m">1</span><span class="w">  </span>deps<span class="w"> </span>stdlib
 </code></pre></div>
 <h2 id="loading-from-a-one-off-path">Loading from a one-off path<a class="headerlink" href="#loading-from-a-one-off-path" title="Permanent link">&para;</a></h2>
 <p>For development you can point at a pack file without permanently
@@ -1701,22 +1822,45 @@ installing it:</p>
 </code></pre></div>
 <p><code>KLIO_PACKS</code> accepts a colon-separated list of paths. These are
 loaded after the stdlib pack and before the cached packs.</p>
-<h2 id="feature-gated-surfaces">Feature-gated surfaces<a class="headerlink" href="#feature-gated-surfaces" title="Permanent link">&para;</a></h2>
-<p>A pack can gate parts of its source behind named features
-(<code>[features]</code> in its <code>klio.toml</code>). Nothing gated loads by default;
-enable a feature per run with <code>--feature &lt;pack&gt;/&lt;feature&gt;</code>
-(repeatable, accepted by <code>klio run</code>, <code>klio test</code>, <code>klio check</code>, and
-<code>klio bundle</code> — which bakes the choice into the
-<a href="../../BUNDLE/">bundled executable</a>):</p>
+<h2 id="features-one-per-upstream-module">Features: one per upstream module<a class="headerlink" href="#features-one-per-upstream-module" title="Permanent link">&para;</a></h2>
+<p>A pack is one library; its features are that library's Gradle modules,
+named after the artifact with the library prefix stripped
+(<code>kotlinx-coroutines-test</code> is <code>kotlinx.coroutines/test</code>,
+<code>ktor-client-core</code> is <code>io.ktor/client-core</code>). Each pack's <code>default</code>
+names its primary module, so importing <code>kotlinx.coroutines.*</code> loads
+<code>core</code> with nothing to enable; every other module is opt-in per run
+with <code>--feature &lt;pack&gt;/&lt;feature&gt;</code> (repeatable, or one value naming
+several of a pack's features with commas; accepted by <code>klio run</code>,
+<code>klio test</code>, <code>klio check</code>, and <code>klio bundle</code>, which bakes the choice
+into the <a href="../../BUNDLE/">bundled executable</a>):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>kotlinx.serialization/json<span class="w"> </span>app.kt
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>io.ktor/client<span class="w"> </span>fetch.kt
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>kotlinx.coroutines/test<span class="w"> </span>scheduler_test.kt
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>io.ktor/client-cio<span class="w"> </span>fetch.kt
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>io.ktor/server-content-negotiation,serialization-kotlinx-json<span class="w"> </span>api.kt
 </code></pre></div>
-<p>Features can require other features (enabling <code>io.ktor/client</code>
-transitively pulls <code>http</code>, <code>utils</code>, <code>io</code>, and <code>events</code>) and can pull
-features of dependency packs (the ktor <code>*-serialization</code> features
-enable <code>kotlinx.serialization/json</code>). The shipped feature tables are
-on each pack's page, e.g. <a href="../shipped/ktor/">io.ktor</a> and
-<a href="../shipped/serialization/">kotlinx.serialization</a>.</p>
+<p>A feature carries its module's upstream dependencies: <code>requires</code> pulls
+the pack's own modules it is built on (<code>io.ktor/client-core</code> activates
+<code>http</code>, <code>http-cio</code>, <code>utils</code>, <code>io</code>, <code>events</code>, <code>sse</code>,
+<code>websocket-serialization</code>, <code>serialization</code>, and <code>websockets</code>), and <code>deps</code> pulls features of other packs
+(<code>io.ktor/serialization-kotlinx-json</code> enables
+<code>kotlinx.serialization/json-io</code>, which enables <code>json</code> and loads the
+<code>kotlinx.io</code> pack). A program's <code>klio.toml</code> asks for the same thing
+durably: <code>"kotlinx.serialization" = { features = ["json"] }</code> under
+<code>[deps]</code>, with <code>default_features = false</code> to take only what it names.</p>
+<p>An import that lands in a module that is not active prints a note
+naming the feature to enable. A pack with no <code>[features]</code> table is a
+single module and loads whole.</p>
+<p>A program's dependencies belong in its <code>klio.toml</code>: <code>[deps]</code> names the
+packs and the features of each, and that is the whole load set. A file
+run without a manifest still selects packs by matching its imports
+against installed pack ids; that path exists for one-off scripts and is
+being retired in favour of declared dependencies. Either way, a loaded
+pack brings the packs its own <code>[deps]</code> name, as a classpath would, so
+its code may reach them by qualified name with no import;
+<code>KLIO_PACK_TRACE=1</code> prints each pack a run loads. The shipped feature
+tables are on each pack's page: <a href="../shipped/coroutines/">kotlinx.coroutines</a>,
+<a href="../shipped/serialization/">kotlinx.serialization</a>,
+<a href="../shipped/io/">kotlinx.io</a>, and <a href="../shipped/ktor/">io.ktor</a>.</p>
 <h2 id="removing-a-pack">Removing a pack<a class="headerlink" href="#removing-a-pack" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>klio<span class="w"> </span>pack<span class="w"> </span>remove<span class="w"> </span>kotlinx.atomicfu
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>klio<span class="w"> </span>pack<span class="w"> </span>remove<span class="w"> </span>kotlinx.atomicfu<span class="w"> </span>--version<span class="w"> </span><span class="m">0</span>.33.0<span class="w">   </span><span class="c1"># exact match</span>

@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1345,6 +1409,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1616,12 +1736,19 @@ step does. A long <code>switch</code> over an opcode or AST tag is the exception
 each arm is short.</p>
 <h3 id="zig">Zig<a class="headerlink" href="#zig" title="Permanent link">&para;</a></h3>
 <p>Target 0.16: <code>std.ArrayList</code> (unmanaged) over <code>std.ArrayListUnmanaged</code>,
-labeled <code>switch</code> with <code>continue :label</code> for interpreter dispatch loops,
-<code>@branchHint</code> on cold paths, arena allocators for phase-scoped data.</p>
+labeled <code>switch</code> with <code>continue :label</code> for small dispatch loops,
+<code>@branchHint</code> on cold paths, arena allocators for phase-scoped data. The
+IR interpreter's stream loop (<code>src/ir/eval/stream.zig</code>) is instead a
+function per op tail-calling the next (<code>@call(.always_tail, ...)</code>): in one
+large <code>switch</code> every value the loop carries competes for registers in every
+arm, and an edit to one arm moves the others' code. Its handlers keep calls
+off their fast paths (slow paths are handlers of their own, reached through
+a table the optimizer cannot fold), since one call anywhere in a handler
+makes every run of it save registers.</p>
 <h2 id="splits-landed">Splits landed<a class="headerlink" href="#splits-landed" title="Permanent link">&para;</a></h2>
-<p>Eleven files over 5000 lines were split along real seams. Each parent keeps
-its public surface and re-exports it, so no call site outside the file
-changed.</p>
+<p>Files over 5000 lines were split along real seams. Each parent keeps its
+public surface and re-exports it, so no call site outside the file changed.
+The ones still in the tree:</p>
 <table>
 <thead>
 <tr>
@@ -1634,25 +1761,11 @@ changed.</p>
 </thead>
 <tbody>
 <tr>
-<td><code>ir/lower/expr.zig</code></td>
-<td>27008</td>
-<td><code>ir/lower/expr/</code></td>
-<td>24</td>
-<td>2229</td>
-</tr>
-<tr>
 <td><code>ir/ir.zig</code></td>
 <td>17236</td>
 <td><code>ir/core/</code></td>
 <td>18</td>
 <td>2365</td>
-</tr>
-<tr>
-<td><code>interp_ir/vm/host_call_member.zig</code></td>
-<td>16968</td>
-<td><code>.../host_call_member/</code></td>
-<td>16</td>
-<td>2112</td>
 </tr>
 <tr>
 <td><code>ir/eval.zig</code></td>
@@ -1674,41 +1787,6 @@ changed.</p>
 <td><code>cli/cgen/</code></td>
 <td>8</td>
 <td>1848</td>
-</tr>
-<tr>
-<td><code>ir/jit_loop.zig</code></td>
-<td>7304</td>
-<td><code>ir/jit_loop/</code></td>
-<td>10</td>
-<td>1561</td>
-</tr>
-<tr>
-<td><code>interp_ir/build.zig</code></td>
-<td>6495</td>
-<td><code>interp_ir/build/</code></td>
-<td>7</td>
-<td>2988</td>
-</tr>
-<tr>
-<td><code>interp_ir/vm/host_instances.zig</code></td>
-<td>6150</td>
-<td><code>.../host_instances/</code></td>
-<td>8</td>
-<td>1399</td>
-</tr>
-<tr>
-<td><code>interp_ir/vm/host_fields.zig</code></td>
-<td>5826</td>
-<td><code>.../host_fields/</code></td>
-<td>10</td>
-<td>1572</td>
-</tr>
-<tr>
-<td><code>compose_pass/compose_pass.zig</code></td>
-<td>5294</td>
-<td><code>compose_pass/pass/</code></td>
-<td>9</td>
-<td>1829</td>
 </tr>
 </tbody>
 </table>
@@ -1746,8 +1824,8 @@ routine. Either it was one of N identical copies collapsing into a shared
 helper, in which case prove the collapse is byte-identical at every call
 site, or it is a dropped condition.</p>
 <p>Where the code generates something, compare the generated artifact
-directly: the emitted C, the synthesized Kotlin, the JIT's gate-decision
-trace under <code>KLIO_JIT_DEBUG=1</code>. That is stronger than any test.</p>
+directly: the emitted C, the synthesized Kotlin. That is stronger than any
+test.</p>
 <h3 id="the-labelled-block-trap">The labelled-block trap<a class="headerlink" href="#the-labelled-block-trap" title="Permanent link">&para;</a></h3>
 <p><code>label: { ... break :label; ... }</code> followed by more rungs means "this rung
 does not apply, carry on". Converting that <code>break</code> to <code>return null</code> is

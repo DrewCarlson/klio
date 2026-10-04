@@ -967,6 +967,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1296,6 +1300,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1319,6 +1379,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1444,6 +1508,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1598,10 +1718,44 @@ interpreter derives a class's serial descriptor and read/write logic
 from its declaration at runtime, so <code>@Serializable</code> classes work
 unmodified.</p>
 <h2 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h2>
-<p>The core is always loaded with the pack. The JSON format
-(<code>kotlinx-serialization-json</code>: <code>Json</code>, <code>encodeToString</code>,
-<code>decodeFromString</code>) is opt-in:</p>
+<p>One feature per upstream module. <code>core</code> is the default and loads with
+the pack; the formats are opt-in.</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Module</th>
+<th>Surface</th>
+<th>Requires</th>
+<th>Other packs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>core</code></td>
+<td>kotlinx-serialization-core</td>
+<td>annotations, <code>KSerializer</code>, descriptors, encoding, modules</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td><code>json</code></td>
+<td>kotlinx-serialization-json</td>
+<td><code>Json</code>, <code>encodeToString</code> / <code>decodeFromString</code>, <code>JsonElement</code></td>
+<td><code>core</code></td>
+<td></td>
+</tr>
+<tr>
+<td><code>json-io</code></td>
+<td>kotlinx-serialization-json-io</td>
+<td><code>Json.encodeToSink</code> / <code>decodeFromSource</code> over kotlinx.io</td>
+<td><code>json</code></td>
+<td><code>kotlinx.io</code></td>
+</tr>
+</tbody>
+</table>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>kotlinx.serialization/json<span class="w"> </span>app.kt
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>klio<span class="w"> </span>run<span class="w"> </span>--feature<span class="w"> </span>kotlinx.serialization/json-io<span class="w"> </span>stream.kt
 </code></pre></div>
 <h2 id="surface">Surface<a class="headerlink" href="#surface" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">kotlinx.serialization.Serializable</span>
@@ -1621,8 +1775,8 @@ unmodified.</p>
 </code></pre></div>
 <p>Nested <code>@Serializable</code> classes, collections, maps, nullable fields,
 and default values round-trip. The ktor pack's <code>ContentNegotiation</code>
-/ <code>json()</code> features build on this pack (its <code>*-serialization</code>
-features pull <code>kotlinx.serialization/json</code> in automatically); the
+/ <code>json()</code> features build on this pack (<code>io.ktor/serialization-kotlinx-json</code>
+pulls <code>kotlinx.serialization/json-io</code> in automatically); the
 kotlinx.datetime pack depends on it so its value types stay
 <code>@Serializable</code>.</p>
 <h2 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h2>

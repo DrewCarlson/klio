@@ -959,6 +959,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1197,6 +1201,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1220,6 +1280,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1365,6 +1429,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../contributing/" class="md-nav__link">
         
   
@@ -1431,6 +1551,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#a-dual-compute-audit-needs-stderr-and-its-own-control" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A dual-compute audit needs stderr, and its own control
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#steps-by-scope" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1464,10 +1595,54 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#the-skia-shim" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The Skia shim
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-measured-row" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The measured row
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#standing-rules-and-traps" class="md-nav__link">
     <span class="md-ellipsis">
       
         Standing rules and traps
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-sema-census" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The sema census
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#diagnostics-against-kotlinc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Diagnostics against kotlinc
       
     </span>
   </a>
@@ -1518,6 +1693,21 @@ per stage, not per edit.</p>
 <li>Non-ReleaseSafe harness builds get their own names so they can never
   shadow the sweep binary.</li>
 </ul>
+<h2 id="a-dual-compute-audit-needs-stderr-and-its-own-control">A dual-compute audit needs stderr, and its own control<a class="headerlink" href="#a-dual-compute-audit-needs-stderr-and-its-own-control" title="Permanent link">&para;</a></h2>
+<p>Two ways an audit sweep reads clean while finding nothing:</p>
+<ul>
+<li><strong>The harness drops the channel.</strong> Audits print to stderr;
+  <code>scripts/corpus_check.py</code> compares stdout and used to discard stderr
+  entirely. Pass <code>--grep-stderr &lt;substring&gt;</code> to echo matching lines, and
+  <code>KLIO_SWEEP_GREP=&lt;regex&gt;</code> for <code>scripts/commontest-sweep.py</code>. Without one of
+  those, an audit sweep over either corpus measures nothing.</li>
+<li><strong>The comparator asks the wrong question.</strong> Comparing two heap values by
+  identity is right for a claim about a CELL and wrong for one about a CALL:
+  an accessor that builds its answer (<code>get() = NodeKind(...)</code>) returns a
+  different object every time, and both are correct. Run the discovery path
+  TWICE first; where it disagrees with itself the read is not idempotent and
+  the comparison is meaningless, so skip it rather than report it.</li>
+</ul>
 <h2 id="steps-by-scope">Steps by scope<a class="headerlink" href="#steps-by-scope" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1534,8 +1724,8 @@ per stage, not per edit.</p>
 <td>seconds</td>
 </tr>
 <tr>
-<td>One stdlib commontest file, both eager modes</td>
-<td><code>python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest --eager both</code></td>
+<td>One stdlib commontest file</td>
+<td><code>python3 scripts/commontest-sweep.py zig-out/bin/klio-harness --filter ArraysTest</code></td>
 <td>~15 s</td>
 </tr>
 <tr>
@@ -1560,7 +1750,7 @@ per stage, not per edit.</p>
 </tr>
 <tr>
 <td>One compose plugin class</td>
-<td><code>HOME=/tmp/klio_itest_compose_plugin_home KLIO_COMPOSE_PLUGIN=1 zig-out/bin/klio-harness test &lt;the plugin file list&gt; --filter=&lt;Class[.test]&gt;</code> (never the whole list in one process)</td>
+<td><code>zig build klio-test-home</code>, then <code>HOME=$PWD/zig-out/klio-test-home KLIO_COMPOSE_PLUGIN=1 zig-out/bin/klio-harness test &lt;the plugin file list&gt; --filter=&lt;Class[.test]&gt;</code> (never the whole list in one process)</td>
 <td>seconds</td>
 </tr>
 <tr>
@@ -1569,24 +1759,44 @@ per stage, not per edit.</p>
 <td>minutes</td>
 </tr>
 <tr>
+<td>Does a Compose example match Compose Desktop?</td>
+<td><code>KLIO_HOME=$PWD/.klio-local python3 scripts/compose-oracle.py &lt;example&gt;...</code> (<code>--jvm-only</code> prints the expected output)</td>
+<td>~30 s per example</td>
+</tr>
+<tr>
 <td>The threaded litmus set</td>
 <td><code>python3 scripts/litmus-sweep.py [harness] [--filter substr]</code></td>
 <td>~40 s</td>
 </tr>
 <tr>
-<td>The in-process e2e corpus (both JIT modes)</td>
-<td><code>zig build itest-e2e -Dharness-optimize=ReleaseSafe</code></td>
-<td>~10 min</td>
+<td>The e2e corpus (both JIT modes)</td>
+<td><code>zig build itest-e2e</code></td>
+<td>~5 min</td>
 </tr>
 <tr>
-<td>The pinned parity corpus</td>
-<td><code>zig build itest-parity_corpus_pinned -Dharness-optimize=ReleaseSafe</code></td>
-<td>minutes</td>
+<td>The parity suites</td>
+<td><code>zig build itest-group_parity_core itest-group_parity_types itest-group_parity_shapes</code> (the pinned parity corpus is in <code>core</code>)</td>
+<td>~2 min</td>
+</tr>
+<tr>
+<td>The sema census</td>
+<td><code>python3 scripts/sema-census.py --home $PWD/.klio-local</code></td>
+<td>~30 s</td>
 </tr>
 <tr>
 <td>The whole local gate</td>
 <td><code>scripts/stack.sh</code></td>
 <td>~23 min warm</td>
+</tr>
+<tr>
+<td>The done-line gate</td>
+<td><code>scripts/gate.sh [--no-sweep]</code>, with nothing else touching <code>.zig-cache</code></td>
+<td>about an hour</td>
+</tr>
+<tr>
+<td>The measured row</td>
+<td><code>python3 scripts/measure-row.py [--only micro,headline,frames,throughput,gc] [--json out.json]</code> on a quiet machine</td>
+<td>~25 min</td>
 </tr>
 <tr>
 <td>The CI shape</td>
@@ -1605,9 +1815,9 @@ library censuses (coroutines, io, androidx collection, ktor, datetime,
 serialization, serialization json, compose ui, atomicfu), the example
 corpus lowered from the tree (<code>itest-check_examples</code>), the box conformance
 census, the stdlib commontest sweep, the compose-ui gate, and the threaded
-litmus last. It does not run the in-process e2e corpus, the pinned parity
-corpus, or the CLI-route corpus check; run those three separately when a
-change touches lowering, reification, or pack loading.</p>
+litmus last. It does not run the e2e corpus, the parity suites, or the
+CLI-route corpus check; run those three separately when a change touches
+lowering, reification, or pack loading.</p>
 <p>Two suites that are not in the stdlib sweep have caught lowering
 regressions the sweep passed: the coroutines census (an inline reified
 binding) and the pinned parity corpus. A lowering change needs both.</p>
@@ -1625,13 +1835,47 @@ image format bump invalidates the installed packs.</p>
 <p><code>corpus_check.py</code> refuses an unset or shared <code>KLIO_HOME</code> unless
 <code>--allow-shared-home</code>; the shared <code>~/.klio</code> reports fake failures from
 stale packs.</p>
+<h2 id="the-skia-shim">The Skia shim<a class="headerlink" href="#the-skia-shim" title="Permanent link">&para;</a></h2>
+<p>The window and drawing examples, marked <code>// corpus: skia</code>, expect the output
+they print when the Skia shim renders. The binaries load the shim from
+<code>zig-out/lib</code> (<code>zig build skia-lib</code>), which builds only when the prebuilt Skia
+libraries sit in <code>third_party/skia/&lt;os&gt;-&lt;arch&gt;</code>. <code>scripts/fetch-skia.sh</code> puts
+them there; in a linked git worktree it links the main checkout's copy instead
+of downloading. <code>scripts/gate.sh</code> runs both before anything else. Only when
+the libraries can be neither found nor fetched does it skip the marked
+examples, naming each one (<code>corpus_check.py --no-skia</code>,
+<code>KLIO_GATE_NO_SKIA=1</code> for the compose-ui gate); a shim that fails to build is
+a red gate. CI's itest shards build the shim the same way before their suites
+(<code>.github/workflows/ci.yml</code>): the compose suites' skikoTest cases and the
+drawing examples need it. An example marked <code>// corpus: tray</code> also needs the platform's tray
+icon, which macOS and Windows have and an X display has only while a system
+tray runs on it; elsewhere <code>corpus_check.py</code> skips it, naming it, unless
+<code>KLIO_TRAY_HOST=1</code> says the display has one.</p>
+<h2 id="the-measured-row">The measured row<a class="headerlink" href="#the-measured-row" title="Permanent link">&para;</a></h2>
+<p><code>scripts/measure-row.py</code> takes every number the done line of
+<code>plans/resolved-interpreter.md</code> asks for, the way its before row was taken:
+fib, bench_oo, bench_fn and benchRecompose (<code>tests/bench</code>) for user CPU, the
+headline costs, benchRecompose's activations and machine instructions per
+frame, the compose runtime's three throughput-bound tests on <code>runTest</code>'s own
+timeout, and <code>KLIO_GC_DEBUG</code>'s pause table on validatePotentialDeadlock and on
+the fleet. It builds both harnesses, refreshes <code>.klio-local</code>, and runs copies
+of the binaries, so a rebuild during the run cannot swap one. It prints the
+load average first; a busy machine reads high.</p>
 <h2 id="standing-rules-and-traps">Standing rules and traps<a class="headerlink" href="#standing-rules-and-traps" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Never run a full sweep or census on the Debug harness; it is four to
   five times slower per child.</li>
 <li>Never rebuild <code>zig-out/bin/klio-harness</code> (and never <code>git stash</code>) while a
   lane is using it; build to another prefix (<code>zig build klio-harness
-  --prefix &lt;dir&gt;</code>) to test an edit alongside running lanes.</li>
+  --prefix &lt;dir&gt;</code>) to test an edit alongside running lanes. The failure mode
+  is silence, not an error: a sweep execs the harness hundreds of times, so a
+  rebuild part-way through measures two different binaries and reports a
+  clean-looking number that is wrong. A candidate criterion measured 0
+  divergences and then 5 from an identical tree this way. Before a sweep that
+  has to be trusted, snapshot what you are measuring — <code>cp
+  zig-out/bin/klio-harness zig-out/lib/libklio_skia.dylib /tmp/snap/</code> and pass
+  the copy — and treat a number that moves between two runs of one tree as a
+  measurement bug, not a flake.</li>
 <li>A ratchet's <code>BASELINE</code> is the measured pass floor and <code>MAX_FAILED</code> the
   measured failure ceiling with no slack; count <code>[box-crash]</code> lines as well
   as <code>[box-fail]</code> lines when clustering a census.</li>
@@ -1651,6 +1895,35 @@ stale packs.</p>
   suite and tests; reproduce with the matching census or suite locally
   before changing anything.</li>
 </ul>
+<h2 id="the-sema-census">The sema census<a class="headerlink" href="#the-sema-census" title="Permanent link">&para;</a></h2>
+<p><code>scripts/sema-census.py</code> runs <code>klio sema</code> over the base source set
+(<code>--bodies base --lower</code>), over every pack installed in the home it is
+given with all of the pack's features (<code>--bodies all --lower</code>), and over
+the example corpus (<code>--each</code>, a multi-file example directory as one
+program). Every unresolved or unrecorded reference it finds, every body of
+the base and the packs that does not lower (<code>lower_unrecorded</code>,
+<code>lower_bridge</code>, <code>lower_lowering</code>, <code>lower_unsupported</code>) and every bodyless
+declaration no native binds (<code>lower_unbound_native</code>) must be listed in
+<code>tests/sema-census-open.txt</code>; a site not listed fails the gate, and so does
+a listed site that no longer occurs, so the list only shrinks. A body that
+does not lower produces no diagnostic when a program runs; the run fails
+later with "has no body", so this list is where those gaps show. When a fix
+closes a site, delete its line in the same commit; <code>--update-open</code> rewrites
+the file from a run.</p>
+<div class="highlight"><pre><span></span><code>python3 scripts/sema-census.py --klio zig-out/bin/klio-harness --home $PWD/.klio-local
+</code></pre></div>
+<h2 id="diagnostics-against-kotlinc">Diagnostics against kotlinc<a class="headerlink" href="#diagnostics-against-kotlinc" title="Permanent link">&para;</a></h2>
+<p><code>scripts/check-diff.py</code> runs <code>klio check</code> with the old engine and with
+<code>--engine sema</code>, and kotlinc 2.4.20 through <code>scripts/sema-oracle.sh
+--diagnostics</code>, over the examples and the fixtures, and checks what
+<code>plans/retire-typeck.md</code> requires line by line: an old diagnostic kotlinc
+also reports keeps a sema diagnostic of kotlinc's factory, every sema
+diagnostic is one kotlinc reports, with kotlinc's severity. <code>--save DIR</code>
+keeps each side's results and <code>--old</code>, <code>--sema</code>, <code>--kotlinc</code> reuse them. In
+a worktree without <code>target/parity-cache</code>, point <code>SEMA_ORACLE_KOTLINC</code> at the
+checkout's kotlinc.</p>
+<div class="highlight"><pre><span></span><code>SEMA_ORACLE_KOTLINC=../../../target/parity-cache/kotlinc-2.4.20 python3 scripts/check-diff.py --save out
+</code></pre></div>
 
 
 

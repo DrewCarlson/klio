@@ -967,6 +967,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1274,6 +1278,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1297,6 +1357,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1442,6 +1506,62 @@
   
   
     <li class="md-nav__item">
+      <a href="../../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../../development/contributing/" class="md-nav__link">
         
   
@@ -1557,8 +1677,12 @@ the matching actuals plus a small set of native helpers:</p>
 <li>ISO-8601 rendering and parsing of <code>Instant</code></li>
 <li>tz id validation</li>
 </ul>
-<p>The pack depends on <code>kotlinx.serialization</code> so the datetime value
-types stay reflectively <code>@Serializable</code>.</p>
+<p>The pack depends on <code>kotlinx.serialization</code>: <code>LocalDate</code>, <code>LocalTime</code>,
+<code>LocalDateTime</code>, <code>DateTimePeriod</code> / <code>DatePeriod</code> and the <code>DateTimeUnit</code>
+hierarchy are <code>@Serializable</code> through the upstream serializers in
+<code>kotlinx.datetime.serializers</code> (ISO strings by default, with the
+component and ISO 8601 serializers available to name explicitly).
+<code>examples/datetime_serializers.kt</code> round-trips each through JSON.</p>
 <h2 id="surface">Surface<a class="headerlink" href="#surface" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">kotlinx.datetime.Clock</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">import</span><span class="w"> </span><span class="nn">kotlinx.datetime.Instant</span>

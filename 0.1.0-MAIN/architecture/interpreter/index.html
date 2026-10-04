@@ -1089,6 +1089,10 @@
       
         
       
+        
+      
+        
+      
     
     
     
@@ -1327,6 +1331,62 @@
 
               
             
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Compose packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/xml/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    klio.xml
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
           </ul>
         </nav>
       
@@ -1350,6 +1410,10 @@
   
     
     
+      
+        
+      
+        
       
         
       
@@ -1475,6 +1539,62 @@
     
   
     Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/cold-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cold start
   
 
     
@@ -1724,11 +1844,14 @@ The claiming thread constructs and publishes into globals only after
 construction completes; other threads racing the same name wait, and
 the constructing thread's own re-entrant reads observe the in-flight
 instance (an object may reference itself during its own init). A
-throw during initialization propagates to the access site wrapped in
-<code>FileFailedToInitializeException</code> (an <code>Error</code>, not an <code>Exception</code>)
-with the user throwable as its cause; the initializer is never
-retried — every later access throws the same wrapper without the
-cause. Top-level property initializers stay eager (file order at
+failed initialization fails as JVM class initialization does: the
+first access throws <code>ExceptionInInitializerError</code> (no message, the
+user throwable as its cause), or rethrows the throwable itself when it
+is an <code>Error</code>; the initializer is never retried, and every later
+access throws <code>NoClassDefFoundError("Could not initialize object X")</code>
+(<code>file x.kt</code>, <code>enum class X</code>) caused by an <code>ExceptionInInitializerError</code>
+naming the first failure.
+Top-level property initializers stay eager (file order at
 program start), matching kotlinc's main-file semantics.</p>
 <h2 id="dispatch-and-intrinsics">Dispatch and intrinsics<a class="headerlink" href="#dispatch-and-intrinsics" title="Permanent link">&para;</a></h2>
 <p>Stdlib and pack functionality is host-bound. The Vm does not special
@@ -1741,6 +1864,20 @@ installed native binding, the loader binds the name to the intrinsic
 instead of the lowered Kotlin body. This is why shim libraries work:
 the Kotlin source documents the surface, and the native binding wins
 at dispatch. See <a href="../../packs/native-bindings/">Native Bindings</a>.</p>
+<p>A context parameter is a parameter. A call to a <code>context(T) fun</code>
+resolves each context argument where the call is lowered, from the
+innermost <code>context(...)</code> scope, implicit receiver or subject of that
+type, and hands the values over ahead of the call (<code>ContextPush</code>);
+the callee loads them from its frame by index (<code>LoadContextParam</code>).
+A lambda bound to a <code>context(T) (A) -&gt; R</code> parameter takes its
+contexts as leading parameters, so <code>context(v) { }</code> and an implicit
+invocation of such a value are ordinary value calls. A frame no
+caller served derives the value once from its enclosing chain, and
+<code>KLIO_DISPATCH_TRACE</code> reports every such frame.</p>
+<p>An inner-class instance carries the instance it was constructed in as
+its outer link. A body that reads an enclosing class's member reaches
+that instance by structure, one <code>LoadOuterThis</code> per hop from its own
+<code>this</code>, and binds the member on it as on any receiver.</p>
 <h2 id="coroutines">Coroutines<a class="headerlink" href="#coroutines" title="Permanent link">&para;</a></h2>
 <p><code>suspend</code> is implemented natively (Kotlin Language Specification §18):</p>
 <ul>
