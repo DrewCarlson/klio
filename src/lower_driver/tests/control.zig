@@ -1586,10 +1586,12 @@ test "a wall-capped program that catches its timeout gets another, so its finall
     // again rather than aborting past the `finally` that restores `inside`.
     const saved_unwind = ir.eval.wall_cap_unwind_ms.load(.monotonic);
     ir.eval.wall_cap_unwind_ms.store(50, .monotonic);
+    ir.eval.wall_cap_quiet.store(true, .monotonic);
     defer {
         ir.eval.test_wall_deadline_ms.store(0, .monotonic);
         ir.eval.wall_cap_fires.store(0, .monotonic);
         ir.eval.wall_cap_unwind_ms.store(saved_unwind, .monotonic);
+        ir.eval.wall_cap_quiet.store(false, .monotonic);
         // A hard abort would have abandoned the cohort; the next test must not inherit it.
         @import("runtime").setRunBoundaryAbandon(false);
         @import("runtime").clearAbandon();
@@ -1623,10 +1625,12 @@ test "a loop closed by its condition's branch, with forward edges inside, still 
     // do-while's compare-and-branch, and its body only jumps forward.
     const saved_unwind = ir.eval.wall_cap_unwind_ms.load(.monotonic);
     ir.eval.wall_cap_unwind_ms.store(50, .monotonic);
+    ir.eval.wall_cap_quiet.store(true, .monotonic);
     defer {
         ir.eval.test_wall_deadline_ms.store(0, .monotonic);
         ir.eval.wall_cap_fires.store(0, .monotonic);
         ir.eval.wall_cap_unwind_ms.store(saved_unwind, .monotonic);
+        ir.eval.wall_cap_quiet.store(false, .monotonic);
         @import("runtime").setRunBoundaryAbandon(false);
         @import("runtime").clearAbandon();
     }

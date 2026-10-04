@@ -72,6 +72,10 @@ pub const wall_cap_catchable_fires: u32 = 3;
 /// before the next fire.
 pub var wall_cap_unwind_ms = std.atomic.Value(i64).init(20_000);
 
+/// Set by a test that trips the wall cap on purpose: each fire throws or aborts as ever, without the
+/// hang report it otherwise prints.
+pub var wall_cap_quiet = std.atomic.Value(bool).init(false);
+
 /// `KLIO_FRAME_COUNT`: `frame_count_total` counts `runFrameExec` entries, `frame_alloc_total` register-bank acquisitions (one per real frame). A flat call re-enters its caller's frame, so entries run higher.
 pub var frame_count_total: u64 = 0;
 pub var frame_alloc_total: u64 = 0;

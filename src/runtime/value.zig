@@ -5479,10 +5479,17 @@ test "display produces an owned string" {
     try testing.expectEqualStrings("42", s);
 }
 
-test "value layout census" {
-    std.debug.print("\nValue size={d} align={d}\n", .{ @sizeOf(Value), @alignOf(Value) });
+test "a value is two words, no payload wider than one" {
+    // Every register, stack slot and collection element is a Value: one wider
+    // payload widens all of them.
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+    try testing.expectEqual(@as(usize, 16), @sizeOf(Value));
+    try testing.expectEqual(@as(usize, 8), @alignOf(Value));
     inline for (@typeInfo(Value).@"union".fields) |f| {
-        if (@sizeOf(f.type) > 8) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
+        if (@sizeOf(f.type) > 8) {
+            std.log.err("Value.{s} is {d} bytes", .{ f.name, @sizeOf(f.type) });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

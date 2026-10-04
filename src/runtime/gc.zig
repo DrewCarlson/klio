@@ -2469,6 +2469,8 @@ fn verifyOn() bool {
     return verify_on;
 }
 var verify_reports: usize = 0;
+/// Set by a test that provokes reports to count them: they are counted, not printed.
+var verify_quiet = false;
 
 /// Names what holds an unrecorded edge (a class and field), set by the
 /// runtime module that knows the payload types.
@@ -2476,7 +2478,7 @@ pub var verify_describe: ?*const fn (from: *GcHeader, to: *GcHeader) void = null
 
 fn verifyReport(from: *GcHeader, to: *GcHeader) void {
     verify_reports += 1;
-    if (verify_reports > 20) return;
+    if (verify_quiet or verify_reports > 20) return;
     std.debug.print("[gc-verify] tenured {s} ({*}, remembered={}) -> unmarked nursery {s} ({*})\n", .{ from.typeName(), from, from.gc_remembered, to.typeName(), to });
     if (verify_describe) |f| f(from, to);
     if (verify_reports == 1) trace.dumpCurrent(.{});
@@ -2496,7 +2498,7 @@ fn verifyTenured(epoch: usize) void {
 
 fn verifyReportMajor(from: *GcHeader, to: *GcHeader) void {
     verify_reports += 1;
-    if (verify_reports > 20) return;
+    if (verify_quiet or verify_reports > 20) return;
     std.debug.print("[gc-verify] major: marked {s} ({*}, gen={d}) -> unmarked {s} ({*}, gen={d})\n", .{ from.typeName(), from, from.gc_gen, to.typeName(), to, to.gc_gen });
     if (verify_describe) |f| f(from, to);
     if (verify_reports == 1) trace.dumpCurrent(.{});
@@ -3101,6 +3103,8 @@ test "the major verifier reports a store into a traced cell that no barrier reco
     const G = GraphCells;
     G.arm();
     defer G.disarm();
+    verify_quiet = true;
+    defer verify_quiet = false;
     G.beginAndSlice();
     // 0 takes 2 behind the barrier's back while 1, recorded, lets go of it:
     // the next slice finds 0 marked, not due a retrace, and holding an

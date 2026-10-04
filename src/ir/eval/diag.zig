@@ -46,16 +46,20 @@ pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
     if (parent.wall_cap_fires.fetchAdd(1, .acq_rel) < parent.wall_cap_catchable_fires) {
         const dl = parent.test_wall_deadline_ms.load(.monotonic);
         if (dl != 0) parent.test_wall_deadline_ms.store(dl + parent.wall_cap_unwind_ms.load(.monotonic), .monotonic);
-        std.debug.print("[wall-cap] test wall-clock deadline exceeded — throwing; hang location follows:\n", .{});
-        dumpFrameChainForDiagAlways();
+        if (!parent.wall_cap_quiet.load(.monotonic)) {
+            std.debug.print("[wall-cap] test wall-clock deadline exceeded — throwing; hang location follows:\n", .{});
+            dumpFrameChainForDiagAlways();
+        }
         return errResult(.{ .Throw = try Value.newException(allocator, .{
             .fqn = try runtime.strInit(allocator, "kotlin.RuntimeException"),
             .message = .from(try runtime.strInit(allocator, "test wall-clock deadline exceeded")),
             .cause = null,
         }) });
     }
-    std.debug.print("[wall-cap] deadline exceeded again during unwind — hard abort:\n", .{});
-    dumpFrameChainForDiagAlways();
+    if (!parent.wall_cap_quiet.load(.monotonic)) {
+        std.debug.print("[wall-cap] deadline exceeded again during unwind — hard abort:\n", .{});
+        dumpFrameChainForDiagAlways();
+    }
     wallCapAbandon();
     return errResult(.{ .Type = "test wall-clock deadline exceeded" });
 }
