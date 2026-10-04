@@ -1252,7 +1252,7 @@ pub fn lookupIntNoLock(entries: MapEntries, x: i32) ?Value {
     const Eq = struct {
         fn eq(want: i32, k: *const Value) ?bool {
             if (k.* == .Int) return k.Int == want;
-            return if (k.isNumeric()) false else null;
+            return if (storedNumeric(k)) false else null;
         }
     };
     return lookupNoLock(entries, MapStore.intHash(x), x, Eq.eq, false);
@@ -1275,7 +1275,17 @@ pub fn numericKeyEq(key: *const Value, k: *const Value) ?bool {
         .UByte => |x| if (k.* == .UByte) return x == k.UByte,
         else => return null,
     }
-    return if (k.isNumeric()) false else null;
+    return if (storedNumeric(k)) false else null;
+}
+
+/// Whether stored key `k`, read with no lock, is a number. A read that raced a writer
+/// may copy any bits, a freed array's or another allocation's, so its tag may be one no
+/// `Value` has: the tag is compared with each number's, never switched on.
+fn storedNumeric(k: *const Value) bool {
+    inline for (.{ .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float }) |t| {
+        if (k.* == t) return true;
+    }
+    return false;
 }
 
 /// A slice's pointer and length, each read whole.
@@ -5707,6 +5717,22 @@ test "an Int key's lookup with no lock finds its entry, not a Long's of the same
     entries.cell.lock.seq.store(1, .monotonic);
     try testing.expect(lookupIntNoLock(entries, 7) == null);
     entries.cell.lock.seq.store(0, .monotonic);
+}
+
+test "a key read with no lock compares as a number or gives up, whatever bits it holds" {
+    // What a read that raced a writer may copy: every byte alike, the fill a safe build
+    // leaves in freed memory among them. No tag is taken for a corrupt value.
+    const key: Value = .{ .Int = 7 };
+    var b: usize = 0;
+    while (b < 256) : (b += 1) {
+        var k: Value = undefined;
+        @memset(std.mem.asBytes(&k), @intCast(b));
+        _ = numericKeyEq(&key, &k);
+        _ = storedNumeric(&k);
+    }
+    try testing.expectEqual(@as(?bool, null), numericKeyEq(&key, &.{ .Bool = true }));
+    try testing.expectEqual(@as(?bool, false), numericKeyEq(&key, &.{ .Long = 7 }));
+    try testing.expectEqual(@as(?bool, true), numericKeyEq(&key, &.{ .Int = 7 }));
 }
 
 test "map lookups with no lock racing a writer that grows, rehashes and frees see only stored values" {

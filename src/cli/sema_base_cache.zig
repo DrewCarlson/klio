@@ -332,13 +332,12 @@ test "an image written as it is encoded appears at its path only once committed"
     defer a.free(got);
     try std.testing.expectEqualStrings("head1234body", got);
 
-    // An abandoned image leaves nothing behind.
+    // An abandoned image leaves nothing behind: neither its temporary file nor the image.
     const dropped = try Writing.begin(arena.allocator(), try std.fs.path.join(arena.allocator(), &.{ dir_path, "sema-base-d.klio-sema" }));
     const ds = dropped.sink();
     try ds.writeAt(ds.ctx, 0, "partial");
+    _ = try std.Io.Dir.cwd().statFile(io, dropped.tmp, .{});
     dropped.abort();
-    var it = tmp.dir.iterate();
-    var files: usize = 0;
-    while (try it.next(io)) |_| files += 1;
-    try std.testing.expectEqual(@as(usize, 1), files);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, dropped.tmp, .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "sema-base-d.klio-sema", .{}));
 }
